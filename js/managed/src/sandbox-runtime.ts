@@ -103,7 +103,29 @@ Sandbox.outbound = handleSandboxEgress;
 // Register this synthetic hostname explicitly, including its DNS interception.
 // Until trusted setup supplies per-instance params, the static handler denies it.
 Sandbox.outboundByHost = { "nanocodex-hand.internal": handleSandboxEgress };
-Sandbox.outboundHandlers = { account: handleSandboxEgress };
+Sandbox.outboundHandlers = {
+  account: handleSandboxEgress,
+  // The SDK registers this name only when mountBucket runs. The Containers
+  // constructor validates persisted routes before then, so a fresh isolate
+  // otherwise drops the route for an already-mounted, retained workspace.
+  r2EgressMount: restoreR2EgressMount,
+};
+
+function restoreR2EgressMount(
+  request: Request,
+  env: SandboxRuntimeEnv,
+  context?: Readonly<{ params?: unknown }>,
+): Promise<Response> {
+  if (new URL(request.url).hostname !== "r2.internal") {
+    return Promise.resolve(new Response("R2 mount destination is not authorized", { status: 403 }));
+  }
+  const execution = { props: { outboundByHostOverrides: {
+    "r2.internal": { method: "r2EgressMount", params: context?.params },
+  } } } as unknown as ExecutionContext;
+  // Keep the SDK's binding, prefix and read-only checks, plus our brain and
+  // cross-binding copy guards. No bucket permissions are reconstructed here.
+  return new ContainerProxy(execution, env).fetch(request);
+}
 
 /**
  * Required by the Sandbox SDK for transparent HTTP(S) interception. Sandbox
