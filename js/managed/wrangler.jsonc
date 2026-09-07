@@ -166,6 +166,7 @@
   "vars": {
     "AGENT_IDLE_TIMEOUT_MS": "30000",
     "MANAGED_AGENT_DIRECT_CREDENTIALS": "true",
+    "NANOCODEX_SANDBOX_DESKTOPS": "true",
     "MANAGED_BROWSER_PROVIDER": "cloudflare"
   },
   "env": {
