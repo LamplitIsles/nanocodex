@@ -5,6 +5,7 @@ import {
   type AccountAuthEnv,
 } from "./account-auth";
 import { bindAgentCredential } from "./credentials";
+import { readSessionCredentialSubject } from "./session-credential-ownership";
 import { fetchResponseWithDeadline } from "./deadline";
 
 const AGENT_ID =
@@ -68,23 +69,23 @@ export async function routeManagedRealtimeTransport(
     ({ callId, voiceSessionId } = validated);
   }
   const durableId = env.NANOCODEX_SESSIONS.idFromName(agentId);
-  const subject = durableId.toString();
   const ownershipHeaders = new Headers();
   forwardPrincipalAssertions(ownershipHeaders, principal);
-  let owned: boolean;
+  let owned: Awaited<ReturnType<typeof readSessionCredentialSubject>>;
   try {
     owned = await fetchResponseWithDeadline(
       env.NANOCODEX_SESSIONS.get(durableId),
-      "https://session.internal/state",
+      "https://session.internal/credential-subject",
       { headers: ownershipHeaders },
       ownershipTimeoutMs,
       "managed Realtime ownership assertion",
-      (response) => response.ok,
+      (response) => readSessionCredentialSubject(response, durableId.toString()),
     );
   } catch {
     return json({ error: "agent_ownership_unavailable" }, 503);
   }
   if (!owned) return json({ error: "not_found" }, 404);
+  const { subject, direct } = owned;
   if (!voiceSessionId || !VOICE_SESSION_ID.test(voiceSessionId)) {
     return json({ error: "invalid_voice_session" }, 400);
   }
@@ -92,7 +93,7 @@ export async function routeManagedRealtimeTransport(
   try {
     // Creation installs this mapping. Rebinding here also repairs broker state
     // that was lost independently without exposing either account credential.
-    await bindAgentCredential(env.NANOCODEX, subject, principal.userId, ownershipTimeoutMs);
+    if (!direct) await bindAgentCredential(env.NANOCODEX, subject, principal.userId, ownershipTimeoutMs);
   } catch {
     return json({ error: "credential_broker_unavailable" }, 503);
   }

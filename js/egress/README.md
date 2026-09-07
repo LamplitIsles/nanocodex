@@ -42,7 +42,8 @@ pnpm --filter nanocodex-egress-service exec wrangler secret put NANOCODEX_SPONSO
 
 Egress uses that ChatGPT credential only when the requesting account has no
 credential and the model subject is the exact 43-character browser identity.
-The 64-character identity used by durable managed agents cannot fall back to
+Neither legacy 64-character identities nor versioned `managed-session-v1_`
+identities used by durable managed agents can fall back to
 the sponsor. User-connected ChatGPT or OpenAI credentials always take
 precedence, and no sponsor token or account identifier is returned to callers.
 Each SMS account may reserve exactly three sponsored root prompt IDs. The
@@ -81,6 +82,16 @@ lifecycle, allowed operations, and migration boundary.
 unbinding, and resolution are private control operations; tombstones prevent a
 deleted subject from being rebound. Managed code retains the subject, never a
 credential or credential selector.
+
+Session-owned subjects use `managed-session-v1_<Session DO id>` and
+resolve through the optional `MANAGED_AGENT_OWNERSHIP` service binding to
+`nanocodex-durable-agent`'s private `ManagedAgentOwnership` entrypoint.
+They cannot be bound or unbound through `/subjects`; the Session's retained
+ownership and deletion tombstone are authoritative. Missing bindings, malformed
+subjects, and denied resolutions fail closed without directory fallback.
+Legacy managed and browser subjects keep the directory path. See the
+[managed bootstrap and rollback instructions](../managed/README.md#session-owned-credential-subjects)
+before enabling the binding and new-session strategy in production.
 
 Model traffic accepts only the fixed internal URLs, methods, headers, and
 credential placeholder. The broker resolves the subject, chooses that user's

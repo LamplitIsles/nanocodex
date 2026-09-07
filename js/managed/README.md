@@ -22,6 +22,39 @@ state, or tool configuration. Model and connector access crosses the private
 `NANOCODEX` Service Binding to `nanocodex-egress`, which owns credential routing
 and injection.
 
+### Session-owned credential subjects
+
+The `MANAGED_AGENT_DIRECT_CREDENTIALS=true` setting makes each new
+managed agent retain credential ownership in its existing Session DO. Its
+private egress subject is `managed-session-v1_<Session DO id>`; credentials
+remain in the broker. This removes the additional per-agent
+`AgentSubjectDirectory` creation/binding. HTTP and live creation, models,
+tools, and voice use the same retained strategy. Existing sessions keep their
+directory subjects when the setting changes.
+
+Wrangler enables this strategy in production and development. Before the first
+deployment into an environment that predates the private ownership entrypoint,
+bootstrap in this order using the existing build/deploy tooling:
+
+1. Deploy compatible managed code with direct creation disabled using
+   `--var MANAGED_AGENT_DIRECT_CREDENTIALS:false --containers-rollout none`.
+   This exposes the private `ManagedAgentOwnership` entrypoint.
+2. Deploy egress with its `MANAGED_AGENT_OWNERSHIP` service binding to
+   `nanocodex-durable-agent`, entrypoint `ManagedAgentOwnership`.
+3. Deploy managed with the checked-in setting enabled. Development uses the
+   same entrypoint through a local service binding.
+
+The normal CI order (egress before managed) works after bootstrap. Code-only
+manual deployments should use `--containers-rollout none` when the image has
+not changed. Do not deploy an older experiment checkout over newer production
+code. To stop new direct sessions, disable the setting while retaining both
+Workers' direct-subject support: reverting to code predating that support
+would break already-created sessions.
+
+The resolver reads retained ownership without constructing the agent runtime.
+Deleted, exported, or pending-import sessions deny resolution; egress never
+falls back to a directory entry after a direct-subject denial.
+
 Reusable Hosted Tools protocol, broker-state, and durable-memory policy live in
 `nanocodex-tools`. This Worker supplies their Durable Object SQL/WebSocket
 adapters and retains account scope, Connect authorization, bindings, and

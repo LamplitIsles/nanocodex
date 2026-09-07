@@ -40,6 +40,8 @@ export { UserConnectorBroker } from "./connector-broker";
 export { McpConnectionDirectory } from "./mcp-connection-owner";
 
 const SUBJECT_DIRECTORY_PREFIX = "agent-subject-v1:";
+const MANAGED_SESSION_SUBJECT_PREFIX = "managed-session-v1_";
+const MANAGED_SESSION_SUBJECT = /^managed-session-v1_[0-9a-f]{64}$/;
 const READINESS_SUBJECT_DIRECTORY_NAME = "agent-subject-readiness-v1";
 const SUBJECT = /^[A-Za-z0-9_-]{43,128}$/;
 const EPHEMERAL_BROWSER_MODEL_SUBJECT = /^[A-Za-z0-9_-]{43}$/;
@@ -197,6 +199,7 @@ export interface EgressEnv extends BrokerEnv, ConnectorBrokerEnv {
   USER_CREDENTIALS: DurableObjectNamespace<UserCredentialBroker>;
   USER_CONNECTORS: DurableObjectNamespace<UserConnectorBroker>;
   AGENT_SUBJECTS: DurableObjectNamespace<AgentSubjectDirectory>;
+  MANAGED_AGENT_OWNERSHIP?: Fetcher;
   MCP_CONNECTIONS: DurableObjectNamespace<McpConnectionDirectory>;
   CHATGPT_EGRESS?: DurableObjectNamespace;
   CODEX_RELAY_URL?: string;
@@ -1690,6 +1693,11 @@ function closeSponsoredSocket(socket: WebSocket, code: number, reason: string): 
 async function handleControl(request: Request, url: URL, env: EgressEnv): Promise<Response> {
   const subjectMatch = url.pathname.match(/^\/subjects\/([A-Za-z0-9_-]{43,128})$/);
   if (subjectMatch) {
+    // Versioned subjects are owned and revoked by their Session DO. Never
+    // create a second directory record that could override its tombstone.
+    if (subjectMatch[1]!.startsWith(MANAGED_SESSION_SUBJECT_PREFIX)) {
+      return jsonError(403, "managed_subject_owned_by_session");
+    }
     if (request.method !== "PUT" && request.method !== "DELETE") {
       return jsonError(405, "method_not_allowed");
     }
@@ -2252,11 +2260,24 @@ function validRealtimeCallId(value: string | null): value is string {
 }
 
 async function resolveSubject(env: EgressEnv, subject: string): Promise<string> {
-  const response = await subjectDirectory(env, subject).fetch("https://subjects.internal/v1/resolve", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ subject }),
-  });
+  const direct = subject.startsWith(MANAGED_SESSION_SUBJECT_PREFIX);
+  if (direct && !MANAGED_SESSION_SUBJECT.test(subject)) {
+    throw new EgressFailure(403, "agent_subject_unavailable");
+  }
+  if (direct && !env.MANAGED_AGENT_OWNERSHIP) {
+    throw new EgressFailure(503, "agent_subject_unavailable");
+  }
+  // A Session denial or transport failure is authoritative. Falling back to
+  // the legacy directory could resurrect a deleted or exported capability.
+  const response = direct
+    ? await env.MANAGED_AGENT_OWNERSHIP!.fetch(
+      `https://managed-ownership.internal/v1/resolve?subject=${subject}`,
+    )
+    : await subjectDirectory(env, subject).fetch("https://subjects.internal/v1/resolve", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ subject }),
+    });
   if (!response.ok) {
     await readBoundedText(response, MAX_BROKER_RESPONSE_BYTES);
     throw new EgressFailure(response.status === 404 ? 403 : 503, "agent_subject_unavailable");

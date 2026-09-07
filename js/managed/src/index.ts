@@ -1,4 +1,5 @@
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
+import { managedCredentialSubject, scopedManagedModelEgress, sessionCredentialOwner } from "./session-credential-ownership";
 import { remoteICE } from "./hand-remote-ice";
 import { REMOTE_VM_ASSERTION, type RemoteVMPublisher } from "./hand-remote";
 import {
@@ -358,6 +359,7 @@ export interface Env extends
   AGENT_IDLE_TIMEOUT_MS?: string;
   MANAGED_MULTIPLAYER_IO_TIMEOUT_MS?: string;
   MANAGED_OWNERSHIP_IO_TIMEOUT_MS?: string;
+  MANAGED_AGENT_DIRECT_CREDENTIALS?: string;
   MANAGED_EVENT_ARCHIVE_RECENT_EVENTS?: string;
   MANAGED_EVENT_ARCHIVE_SEGMENT_BYTES?: string;
   MANAGED_EVENT_ARCHIVE_THRESHOLD_BYTES?: string;
@@ -710,6 +712,7 @@ type CredentialBindingOwnership = Readonly<{
   session_id: string;
   state: "preparing" | "active";
   subject: string;
+  strategy?: "session_v1";
 }>;
 
 type PortableDurabilityArchive = Readonly<{
@@ -2432,6 +2435,28 @@ function createManagedNamespaceRuntime(
   return Object.freeze({ tools, capture });
 }
 
+/** Private, ownership-only capability for the credential broker. */
+export class ManagedAgentOwnership extends WorkerEntrypoint<Env> {
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    if (request.method !== "GET" || url.hostname !== "managed-ownership.internal"
+      || url.pathname !== "/v1/resolve" || request.body !== null
+      || [...url.searchParams.keys()].some((key) => key !== "subject")
+      || url.searchParams.getAll("subject").length !== 1) {
+      return json({ error: "invalid_request" }, { status: 400 });
+    }
+    const subject = url.searchParams.get("subject")!;
+    const storageId = /^managed-session-v1_([0-9a-f]{64})$/.exec(subject)?.[1];
+    if (!storageId) return json({ error: "invalid_subject" }, { status: 400 });
+    let id: DurableObjectId;
+    try { id = this.env.NANOCODEX_SESSIONS.idFromString(storageId); }
+    catch { return json({ error: "invalid_subject" }, { status: 400 }); }
+    return this.env.NANOCODEX_SESSIONS.get(id).fetch(
+      `https://session.internal/credential-owner?subject=${subject}`,
+    );
+  }
+}
+
 export class ChiefOfStaffBackend extends WorkerEntrypoint<Env> {
   async requestingAccountId(request: Request): Promise<string | null> {
     const principal = await authenticate(
@@ -2823,6 +2848,29 @@ export class DurableAgentSession extends DurableComputerSession {
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
+    if (url.pathname === "/credential-owner") {
+      if (request.method !== "GET" || request.body !== null
+        || [...url.searchParams.keys()].some((key) => key !== "subject")
+        || url.searchParams.getAll("subject").length !== 1) {
+        return json({ error: "invalid_request" }, { status: 400 });
+      }
+      // No runtime construction or outbound calls: an awaiting model/tool call
+      // can resolve its own durable owner without acquiring its runtime lock.
+      const owner = sessionCredentialOwner({
+        subject: url.searchParams.get("subject")!,
+        storageId: this.ctx.id.toString(),
+        binding: this.#credentialBinding,
+        session: this.#session(),
+        initialization: this.#initializationOwnership(),
+        deleting: this.#deleting,
+        deleted: this.#deleted,
+        exported: this.#durabilityExported,
+        importPending: this.#durabilityImportState === "pending",
+      });
+      return owner === undefined
+        ? json({ error: "agent_subject_unavailable" }, { status: 404 })
+        : json({ user_id: owner }, { headers: { "cache-control": "no-store" } });
+    }
     const ownerAssertion = request.headers.get(SESSION_OWNER_ASSERTION);
     let turnAuthorization: TurnAuthorization = { capabilities: [] };
     if (request.method === "GET" && url.pathname === "/connect-existence") {
@@ -2854,6 +2902,27 @@ export class DurableAgentSession extends DurableComputerSession {
         return json({ error: "not_found" }, { status: 404 });
       }
       turnAuthorization = asserted.authorization;
+    }
+    if (request.method === "GET" && url.pathname === "/credential-subject") {
+      // This public-worker-to-Session lookup still requires the caller's full
+      // forwarded principal assertions, just as the state route did.
+      if (ownerAssertion === null) return json({ error: "not_found" }, { status: 404 });
+      const session = this.#session();
+      if (!session || this.#deleting || this.#deleted || this.#durabilityExported
+        || this.#durabilityImportState === "pending") {
+        return json({ error: "not_found" }, { status: 404 });
+      }
+      const direct = this.#credentialBinding?.strategy === "session_v1";
+      const subject = this.#credentialSubject();
+      if (direct && sessionCredentialOwner({
+        subject, storageId: this.ctx.id.toString(), binding: this.#credentialBinding,
+        session, initialization: this.#initializationOwnership(),
+        deleting: this.#deleting, deleted: this.#deleted,
+        exported: this.#durabilityExported, importPending: false,
+      }) === undefined) return json({ error: "not_found" }, { status: 404 });
+      return json({ subject, strategy: direct ? "session_v1" : "directory_v1" }, {
+        headers: { "cache-control": "no-store" },
+      });
     }
     if (request.method === "GET" && url.pathname === "/vm-host-existence") {
       const session = this.#session();
@@ -2908,6 +2977,7 @@ export class DurableAgentSession extends DurableComputerSession {
           session_id: ownership.session_id,
           state: "preparing",
           subject: ownership.subject,
+          ...(this.env.MANAGED_AGENT_DIRECT_CREDENTIALS === "true" ? { strategy: "session_v1" as const } : {}),
         };
         await this.ctx.storage.transaction(async (transaction) => {
           await transaction.put(CREDENTIAL_BINDING_KEY, prepared);
@@ -2950,6 +3020,7 @@ export class DurableAgentSession extends DurableComputerSession {
       if (!ownership || this.#deleting || this.#deleted) {
         return new Response(null, { status: 409 });
       }
+      if (ownership.strategy === "session_v1") return new Response(null, { status: 204 });
       try {
         await this.#track(bindAgentCredential(
           this.env.NANOCODEX,
@@ -3620,6 +3691,7 @@ export class DurableAgentSession extends DurableComputerSession {
       session_id: sessionId,
       state: "active",
       subject: this.ctx.id.toString(),
+      ...(this.env.MANAGED_AGENT_DIRECT_CREDENTIALS === "true" ? { strategy: "session_v1" as const } : {}),
     };
     await this.ctx.storage.put(CREDENTIAL_BINDING_KEY, credentialBinding);
     this.#credentialBinding = credentialBinding;
@@ -6055,7 +6127,7 @@ export class DurableAgentSession extends DurableComputerSession {
     );
     if (credentialBinding) {
       await Promise.all([
-        unbindAgentCredential(
+        credentialBinding.strategy === "session_v1" ? Promise.resolve() : unbindAgentCredential(
           this.env.NANOCODEX,
           credentialBinding.subject,
           credentialBinding.owner_id,
@@ -6533,7 +6605,7 @@ export class DurableAgentSession extends DurableComputerSession {
       computer: workspace,
       ...(multiplayer ? {} : { filesystem: createBrainWorkspace(this.#brainBucket(), session.session_id) }),
       egress: this.env.NANOCODEX,
-      ...(multiplayer ? {} : { subject: this.ctx.id.toString() }),
+      ...(multiplayer ? {} : { subject: this.#credentialSubject() }),
       connectorAllowed: (connector, connectionId, context) => (
         this.#toolConnectorAllowed(connector, connectionId, context)
       ),
@@ -6602,7 +6674,7 @@ export class DurableAgentSession extends DurableComputerSession {
           ...managedAccountMcpServers(
             accountMcpConnections,
             this.env.NANOCODEX,
-            this.ctx.id.toString(),
+            this.#credentialSubject(),
             (connectionId) => this.#activeTurnMcpAllowed(connectionId),
           ),
     };
@@ -6657,7 +6729,7 @@ export class DurableAgentSession extends DurableComputerSession {
             undefined,
             () => this.#cloudflareNamespaceMounts("mounted"),
             { resourceId: session.session_id },
-            this.ctx.id.toString(),
+            this.#credentialSubject(),
           );
           sandboxToolsByMount.set(mount.id, tools);
         }
@@ -6730,11 +6802,11 @@ export class DurableAgentSession extends DurableComputerSession {
       })] : []),
       web({
         url: "https://managed-tools.internal/web-search",
-        fetch: managedWebFetch(this.env, this.ctx.id.toString()),
+        fetch: managedWebFetch(this.env, this.#credentialSubject()),
       }),
       imageGeneration({
         url: "https://managed-tools.internal/image-generation",
-        fetch: managedImageFetch(this.env, this.ctx.id.toString()),
+        fetch: managedImageFetch(this.env, this.#credentialSubject()),
         workspace: sharedBrainWorkspace,
       }),
       viewImage({ workspace: sharedBrainWorkspace }),
@@ -6843,7 +6915,14 @@ export class DurableAgentSession extends DurableComputerSession {
       } });
       Object.defineProperty(agentOptions, internalConfiguration, { value: this.#settings() });
       phaseStartedAt = performance.now();
-      agent = await CloudflareAgent.create(this, agentOptions);
+      const owner = this.#credentialBinding?.strategy === "session_v1" ? {
+        // Adapter lifecycle ownership is keyed by the exact context object.
+        ctx: this.ctx,
+        env: { NANOCODEX: scopedManagedModelEgress(
+          this.env.NANOCODEX, this.ctx.id.toString(), this.#credentialSubject(),
+        ) },
+      } : this;
+      agent = await CloudflareAgent.create(owner, agentOptions);
       cloudflareAgentMs = performance.now() - phaseStartedAt;
     } catch (error) {
       let cleanupError: unknown;
@@ -6890,6 +6969,15 @@ export class DurableAgentSession extends DurableComputerSession {
       || ownership.subject !== this.ctx.id.toString()) {
       throw new Error("credential binding ownership does not match the retained session");
     }
+    if (ownership.strategy === "session_v1") {
+      if (sessionCredentialOwner({
+        subject: this.#credentialSubject(), storageId: this.ctx.id.toString(),
+        binding: ownership, session, initialization: this.#initializationOwnership(),
+        deleting: this.#deleting, deleted: this.#deleted,
+        exported: this.#durabilityExported, importPending: this.#durabilityImportState === "pending",
+      }) === undefined) throw retryableError("agent credential ownership is not active");
+      return;
+    }
     await bindAgentCredential(
       this.env.NANOCODEX,
       ownership.subject,
@@ -6897,6 +6985,12 @@ export class DurableAgentSession extends DurableComputerSession {
       this.#ownershipIoTimeoutMs(),
     );
     if (this.#deleting) throw retryableError("agent is being deleted");
+  }
+
+  #credentialSubject(): string {
+    return this.#credentialBinding?.strategy === "session_v1"
+      ? managedCredentialSubject(this.ctx.id.toString())
+      : this.ctx.id.toString();
   }
 
   #bindingOwnershipForSession(session: SessionRow): CredentialBindingOwnership {
@@ -7218,7 +7312,7 @@ export class DurableAgentSession extends DurableComputerSession {
           this.#cloudflareNamespaceMountsForPreparation(mount.id),
           this.env.NANOCODEX_SANDBOX_LOCAL === "true",
           { resourceId: session.session_id },
-          this.ctx.id.toString(),
+          this.#credentialSubject(),
         );
         return;
       }

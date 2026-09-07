@@ -165,6 +165,7 @@
   ],
   "vars": {
     "AGENT_IDLE_TIMEOUT_MS": "30000",
+    "MANAGED_AGENT_DIRECT_CREDENTIALS": "true",
     "MANAGED_BROWSER_PROVIDER": "cloudflare"
   },
   "env": {
@@ -226,6 +227,7 @@
       },
       "vars": {
         "AGENT_IDLE_TIMEOUT_MS": "1000",
+        "MANAGED_AGENT_DIRECT_CREDENTIALS": "true",
         "ENVIRONMENT": "development",
         "MANAGED_BROWSER_PROVIDER": "cloudflare",
         "NANOCODEX_ADMIN_TOKEN": "nanocodex-local-room-signing-key",

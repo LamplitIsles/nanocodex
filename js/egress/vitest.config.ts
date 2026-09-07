@@ -68,6 +68,11 @@ export default defineConfig({
     cloudflareTest({
       wrangler: { configPath: "./wrangler.broker.jsonc" },
       miniflare: {
+        // Ownership tests provide their resolver explicitly; other tests deny
+        // direct subjects without loading the managed application's runtime.
+        serviceBindings: {
+          MANAGED_AGENT_OWNERSHIP: async () => new Response(null, { status: 503 }),
+        },
         bindings: {
           ENVIRONMENT: "test",
           CREDENTIAL_ENCRYPTION_KEY: TEST_KEY,
