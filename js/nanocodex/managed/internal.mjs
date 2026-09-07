@@ -36,6 +36,15 @@ export function startManagedRealtime(agent, voiceSessionId, operationId) {
   });
 }
 
+/** @internal Warms exact-query retrieval without admitting an Agent turn. */
+export function prefetchManagedRealtime(agent, voiceSessionId, query, signal) {
+  const { client, id } = managedAgent(agent);
+  return client.json(`${agentPath(id)}/realtime/prefetch`, {
+    method: "POST", signal,
+    body: JSON.stringify({ voice_session_id: voiceSessionId, query }),
+  });
+}
+
 /** @internal Atomically routes one Rust-formatted voice delegation on the durable Agent. */
 export function routeManagedRealtime(agent, voiceSessionId, operationId, input) {
   const { client, id } = managedAgent(agent);

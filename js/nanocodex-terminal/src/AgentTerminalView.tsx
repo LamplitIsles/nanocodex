@@ -14,6 +14,7 @@ import {
 } from "nanocodex-react/agent";
 import {
   useVoice,
+  Voice,
   type UseVoiceParameters,
   type UseVoiceReturnType,
 } from "nanocodex-react";
@@ -229,7 +230,7 @@ export function AgentTerminalView({
       composer={composer === undefined ? (
         <TerminalComposer
           controls={(voice || controls) ? <>
-            {voice ? <VoiceControl agentReady={agentStatus === "ready"} voice={voiceState} /> : null}
+            {voice ? <VoiceControl agentReady={agentStatus === "ready"} voice={voiceState} initialVoice={voiceOptions?.voice} /> : null}
             {controls?.({ agentReady: agentStatus === "ready" })}
           </> : undefined}
           draft={touchDraft}
@@ -270,11 +271,14 @@ export function AgentTerminalView({
 export function VoiceControl({
   agentReady,
   voice,
+  initialVoice,
 }: {
   agentReady: boolean;
   voice: UseVoiceReturnType;
+  initialVoice?: NonNullable<UseVoiceReturnType["voice"]> | undefined;
 }) {
   const engaged = voice.isActive || voice.isConnecting;
+  const [selectedVoice, setSelectedVoice] = useState(voice.voice ?? initialVoice ?? Voice.defaultVoice);
   const statusText = voice.statusText ?? (voice.isActive ? voice.voice : undefined);
   return <>
     <button
@@ -283,13 +287,24 @@ export function VoiceControl({
       aria-label={engaged ? "Stop voice" : "Start voice"}
       aria-pressed={engaged}
       disabled={!agentReady}
-      onClick={() => { void voice.toggle().catch(() => {}); }}
+      onClick={() => { void voice.toggle({ voice: selectedVoice }).catch(() => {}); }}
     >
       <svg aria-hidden="true" viewBox="0 0 24 24">
         <path d="M12 15a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v6a3 3 0 0 0 3 3Zm-7-3a1 1 0 1 1 2 0 5 5 0 0 0 10 0 1 1 0 1 1 2 0 7 7 0 0 1-6 6.92V21h3a1 1 0 1 1 0 2H8a1 1 0 1 1 0-2h3v-2.08A7 7 0 0 1 5 12Z" />
       </svg>
       <span className="agent-terminal-sr-only">Voice</span>
     </button>
+    <select
+      aria-label="Voice"
+      className="agent-voice-select"
+      value={selectedVoice}
+      disabled={engaged}
+      onChange={(event) => { setSelectedVoice(event.target.value as NonNullable<UseVoiceReturnType["voice"]>); }}
+    >
+      {Voice.voices.map((name) => <option key={name} value={name}>
+        {name[0]!.toUpperCase() + name.slice(1)}
+      </option>)}
+    </select>
     {voice.isActive ? (
       <button
         className="agent-voice-cancel-button"

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 
 import { agentActions } from "../actions/index.mjs";
@@ -13,6 +14,8 @@ import {
   VoiceError,
 } from "../browser/VoiceSession.mjs";
 import { createAgentClient, defineRuntime } from "../internal.mjs";
+import { Agent as ManagedAgent } from "../managed/index.mjs";
+import { initializeBrowserEngine } from "../browser/engine.mjs";
 
 test("browser voice exposes Codex's ChatGPT V3 catalog and default", () => {
   assert.deepEqual(Voice.voices, [
@@ -37,6 +40,141 @@ test("starts the call while local ICE gathering is still in progress", async () 
     assert.equal(JSON.parse(fixture.request.call_body).sdp, "v=offer");
   } finally {
     await session.close();
+    fixture.restore();
+  }
+});
+
+test("managed SDP and sideband negotiation overlap admission without admitting early speech", async () => {
+  const fixture = installBrowserVoiceFixture({ boundary: "sideband" });
+  const calls = [];
+  let admit;
+  const admission = new Promise((resolve) => { admit = resolve; });
+  const core = fakeVoiceCore(calls, {
+    parallelStartup: true,
+    async start() { await admission; calls.push(["admitted"]); },
+  });
+  const session = new BrowserVoiceSession({
+    core, voice: "cove", captureMicrophone: async () => fakeMicrophone(calls),
+    onStatus() {}, onTranscript() {}, onTerminated() {},
+  });
+  let ready = false;
+  const starting = session.start().then(() => { ready = true; });
+  try {
+    await waitFor(() => fixture.request !== undefined);
+    assert.equal(calls.some(([kind]) => kind === "admitted"), false);
+    await waitFor(() => fixture.sideband !== undefined);
+    fixture.sideband.readyState = WebSocket.OPEN;
+    fixture.sideband.emit("open", {});
+    await waitFor(() => calls.some(([kind]) => kind === "completeCall"));
+    fixture.sideband.message({ type: "turn.delta" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(ready, false);
+    assert.equal(calls.some(([kind]) => kind === "realtimeMessage"), false);
+    admit();
+    await starting;
+    await waitFor(() => calls.some(([kind]) => kind === "realtimeMessage"));
+    assert.equal(fixture.sidebandUrls.length, 1);
+    assert.ok(fixture.sideband.sent.includes('{"type":"rust.frame"}'));
+    assert.ok(calls.some(([kind]) => kind === "framesSent"));
+  } finally {
+    admit();
+    await session.close();
+    fixture.restore();
+  }
+});
+
+test("failed parallel admission closes negotiated media without publishing ready", async () => {
+  const fixture = installBrowserVoiceFixture();
+  const calls = [];
+  let deny;
+  const admission = new Promise((_, reject) => { deny = reject; });
+  const core = fakeVoiceCore(calls, {
+    parallelStartup: true, start: () => admission,
+  });
+  const session = new BrowserVoiceSession({
+    core, voice: "cove", captureMicrophone: async () => fakeMicrophone(calls),
+    onStatus() {}, onTranscript() {}, onTerminated() {},
+  });
+  const starting = session.start();
+  const rejected = assert.rejects(starting, /admission denied/);
+  try {
+    await waitFor(() => fixture.sideband?.readyState === WebSocket.OPEN);
+    deny(new Error("admission denied"));
+    await rejected;
+    assert.equal(fixture.peer.signalingState, "closed");
+    assert.equal(fixture.sideband.readyState, WebSocket.CLOSED);
+    assert.equal(calls.some(([kind]) => kind === "sidebandOpened"), false);
+  } finally {
+    await session.close();
+    fixture.restore();
+  }
+});
+
+test("a sideband lost during admission cannot publish a ready session", async () => {
+  const fixture = installBrowserVoiceFixture();
+  const calls = [];
+  let admit;
+  const admission = new Promise((resolve) => { admit = resolve; });
+  const session = new BrowserVoiceSession({
+    core: fakeVoiceCore(calls, {
+      parallelStartup: true, start: () => admission,
+    }),
+    voice: "cove", captureMicrophone: async () => fakeMicrophone(calls),
+    onStatus() {}, onTranscript() {}, onTerminated() {},
+  });
+  const rejected = assert.rejects(session.start(), /closed during admission/);
+  try {
+    await waitFor(() => fixture.sideband?.readyState === WebSocket.OPEN);
+    fixture.sideband.close();
+    admit();
+    await rejected;
+    assert.equal(fixture.peer.signalingState, "closed");
+    assert.equal(calls.some(([kind]) => kind === "sidebandOpened"), false);
+  } finally {
+    admit();
+    await session.close();
+    fixture.restore();
+  }
+});
+
+test("the public managed voice carries exact SSE cursors into Rust memory updates", async () => {
+  await initializeBrowserEngine({ module: await WebAssembly.compile(
+    await readFile(new URL("../pkg-web/nanocodex_bg.wasm", import.meta.url)),
+  ) });
+  const fixture = installBrowserVoiceFixture();
+  let events;
+  let voiceSessionId;
+  const agent = ManagedAgent.open("019d2f5d-7491-8000-8000-000000000001", {
+    baseUrl: "https://example.test",
+    fetch: async (input, init) => {
+      const path = new URL(input).pathname;
+      if (path.endsWith("/realtime/start")) {
+        voiceSessionId = JSON.parse(init.body).voice_session_id;
+        return Response.json({ context: { workspace: "/brain", history: [] } });
+      }
+      if (path.endsWith("/realtime/calls")) return globalThis.fetch(input, init);
+      if (path.endsWith("/realtime/stop")) return Response.json({ stopped: true });
+      if (path.endsWith("/events")) return new Response(new ReadableStream({
+        start(controller) { events = controller; },
+      }), { headers: { "content-type": "text/event-stream" } });
+      throw new Error(`unexpected voice request: ${path}`);
+    },
+  });
+  const voice = Voice.create(agent, { captureMicrophone: async () => fakeMicrophone([]) });
+  try {
+    await voice.start();
+    await waitFor(() => events !== undefined);
+    const cursor = "9007199254740993";
+    const event = { cursor, created_at: 1, turn_id: null, type: "event", event: {
+      type: "managed.voice.context", payload: {
+        voice_session_id: voiceSessionId, result: { operation: "delete", key: { id: 5, version: 1 } },
+      },
+    } };
+    events.enqueue(new TextEncoder().encode(`id: ${cursor}\nevent: event\ndata: ${JSON.stringify(event)}\n\n`));
+    await waitFor(() => fixture.sideband.sent.some((frame) => frame.includes("delete")));
+    assert.equal(fixture.sidebandUrls.length, 1);
+  } finally {
+    await voice.destroy();
     fixture.restore();
   }
 });

@@ -10,8 +10,10 @@ public struct VoiceConfiguration: Sendable {
     let apiKey: String
     let agentID: String
     let conversationTitle: String?
-    public init(baseURL: URL, apiKey: String, agentID: String, conversationTitle: String? = nil) {
+    public var voice: String
+    public init(baseURL: URL, apiKey: String, agentID: String, conversationTitle: String? = nil, voice: String = "cove") {
         self.baseURL = baseURL; self.apiKey = apiKey; self.agentID = agentID; self.conversationTitle = conversationTitle
+        self.voice = voice
     }
 }
 
@@ -119,6 +121,7 @@ public struct VoiceTranscript: Identifiable, Equatable, Sendable {
     private var meter: Task<Void, Never>?
     private var recovery: Task<Void, Never>?
     private var flushTask: Task<Void, Never>?
+    private var prefetchTask: Task<Void, Never>?
     private var writer: Task<Void, Never>?
     private var routing: Task<Void, Never>?
     private var delegationQueue: [ManagedVoiceDelegation] = []
@@ -159,7 +162,7 @@ public struct VoiceTranscript: Identifiable, Equatable, Sendable {
         observers.forEach(NotificationCenter.default.removeObserver)
         peer?.close()
         startup?.cancel(); startupDeadline?.cancel(); negotiation?.cancel(); eventPreparation?.cancel(); admission?.cancel()
-        incoming?.cancel(); agentEvents?.cancel(); meter?.cancel(); recovery?.cancel(); flushTask?.cancel(); writer?.cancel(); routing?.cancel()
+        incoming?.cancel(); agentEvents?.cancel(); meter?.cancel(); recovery?.cancel(); flushTask?.cancel(); prefetchTask?.cancel(); writer?.cancel(); routing?.cancel()
     }
 
     public func start(configuration: VoiceConfiguration) {
@@ -222,7 +225,7 @@ public struct VoiceTranscript: Identifiable, Equatable, Sendable {
         transport = voiceTransport
         let id = ManagedVoiceProtocol.sessionID()
         sessionID = id
-        protocolState = try ManagedVoiceProtocol()
+        protocolState = try ManagedVoiceProtocol(voice: configuration.voice)
         protocolState?.bindSession(id)
         let audio = VoicePeer(captureMicrophone: captureMicrophone) { [weak self] signal in
             Task { @MainActor in self?.receive(signal, token: token) }
@@ -237,7 +240,7 @@ public struct VoiceTranscript: Identifiable, Equatable, Sendable {
                 let sdp = try await audio.offer()
                 try self.check(token)
                 voiceTiming("call.begin")
-                let call = try await voiceTransport.call(sdp: sdp, instructions: ManagedVoiceProtocol.instructions(), sessionID: id)
+                let call = try await voiceTransport.call(sdp: sdp, instructions: ManagedVoiceProtocol.instructions(), voice: configuration.voice, sessionID: id)
                 try self.check(token)
                 voiceTiming("call.end")
                 self.startRealtimeEvents(audio, token: token)
@@ -375,9 +378,21 @@ public struct VoiceTranscript: Identifiable, Equatable, Sendable {
         receivedRealtimeTypesForTesting.insert(event["type"].string)
         #endif
         guard let update = protocolState?.realtimeMessage(event) else { return }
+        if let prefetch = update.prefetch, let transport, let sessionID {
+            prefetchTask?.cancel()
+            prefetchTask = Task { [weak self] in
+                do {
+                    try await Task.sleep(for: .milliseconds(prefetch.debounceMS))
+                    guard let self else { return }
+                    try self.check(token)
+                    try await transport.prefetch(sessionID: sessionID, query: prefetch.query)
+                } catch { /* Speculation never blocks the authoritative first turn. */ }
+            }
+        }
         apply(update.effects, token: token)
         try check(token)
         guard let delegation = update.delegation, transport != nil, sessionID != nil else { return }
+        prefetchTask?.cancel(); prefetchTask = nil
         let operation = delegationOperations[delegation.id] ?? UUID().uuidString.lowercased()
         delegationOperations[delegation.id] = operation
         guard delegationOperations.count <= 512, delegationQueue.count < 32 else { throw VoiceFailure.connection }
@@ -556,6 +571,7 @@ public struct VoiceTranscript: Identifiable, Equatable, Sendable {
         meter?.cancel(); meter = nil
         recovery?.cancel(); recovery = nil
         flushTask?.cancel(); flushTask = nil
+        prefetchTask?.cancel(); prefetchTask = nil
         writer?.cancel(); writer = nil
         let oldRouting = routing
         let pendingDelegations = delegationQueue.compactMap { delegation in

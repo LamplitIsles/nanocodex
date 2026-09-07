@@ -9,6 +9,8 @@ const entry = await readFile(new URL("../index.mjs", import.meta.url), "utf8");
 assert.equal(typeof react.NanocodexProvider, "function");
 assert.equal(typeof react.useNanocodex, "function");
 assert.equal(typeof react.useVoice, "function");
+assert.equal(react.Voice.defaultVoice, "cove");
+assert.equal(react.Voice.voices.length, 9);
 assert.equal(typeof react.useAgentEvents, "function");
 assert.equal(typeof react.useConfig, "function");
 assert.equal(typeof react.createConfig, "function");

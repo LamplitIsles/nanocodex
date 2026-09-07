@@ -535,6 +535,16 @@
 
 .agent-touch-actions button svg { width: 17px; height: 17px; stroke-width: 2; }
 .agent-touch-actions .agent-voice-button svg { fill: currentColor; }
+.agent-voice-select {
+  max-width: 90px;
+  min-height: 36px;
+  color: var(--terminal-foreground, #111);
+  background: var(--terminal-background, #fff);
+  border: 0;
+  font: inherit;
+  font-size: 12px;
+}
+.agent-voice-select:disabled { color: var(--terminal-muted, #6b6b6b); }
 .agent-touch-actions .agent-voice-button[aria-pressed="true"] { color: var(--terminal-foreground, #111); background: var(--terminal-hover, #f4f4f4); }
 .agent-touch-actions .agent-voice-cancel-button svg { width: 17px; height: 17px; }
 .agent-touch-actions button:focus-visible { background: var(--terminal-hover, #f4f4f4); outline: 1px solid var(--terminal-border, #ddd); outline-offset: -2px; }

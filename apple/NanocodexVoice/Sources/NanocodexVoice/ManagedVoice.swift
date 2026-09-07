@@ -53,6 +53,16 @@ public actor ManagedVoiceTransport {
         try checkOpen(); try await client.command(AgentCommand(agentID: agentID, turnID: turnID, kind: .stop)); try checkOpen()
     }
 
+    public func prefetch(sessionID: String, query: String) async throws {
+        try checkOpen(); try Self.validateSession(sessionID)
+        guard !query.isEmpty, query.utf8.count <= 512 else { throw ManagedError.invalidResponse }
+        let body = try JSONEncoder().encode(["voice_session_id": sessionID, "query": query])
+        var request = try http.request(path("prefetch"), method: "POST", body: body, key: credential.apiKey)
+        request.timeoutInterval = 10
+        _ = try await http.data(request)
+        try checkOpen()
+    }
+
     public func call(sdp: String, instructions: String, voice: String = "cove", sessionID: String) async throws -> ManagedVoiceCall {
         try checkOpen(); try Self.validateSession(sessionID)
         guard !sdp.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, sdp.utf8.count <= 32_768,

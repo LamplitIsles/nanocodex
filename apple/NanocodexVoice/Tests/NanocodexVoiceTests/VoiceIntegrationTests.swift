@@ -23,7 +23,7 @@ final class VoiceIntegrationTests: XCTestCase {
         let voice = VoiceSession()
         do {
             let configuration = VoiceConfiguration(baseURL: try XCTUnwrap(URL(string: credential.origin)), apiKey: key,
-                                                   agentID: agentID, conversationTitle: "Native voice validation")
+                                                   agentID: agentID, conversationTitle: "Native voice validation", voice: "spruce")
             let began = ContinuousClock.now
             voice.startReceivingForTesting(configuration: configuration)
             let deadline = began.advanced(by: .seconds(50))

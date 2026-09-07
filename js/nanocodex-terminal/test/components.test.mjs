@@ -150,7 +150,7 @@ test("ready voice control separates transport, coding-turn cancel, status, and f
   const calls = [];
   let renderer;
   const idle = voiceSnapshot({
-    toggle: async () => { calls.push("start"); },
+    toggle: async (options) => { calls.push(options.voice); },
   });
   await act(async () => {
     renderer = TestRenderer.create(React.createElement(VoiceControl, {
@@ -162,8 +162,12 @@ test("ready voice control separates transport, coding-turn cancel, status, and f
     renderer.root.findAllByType("button").map((button) => button.props["aria-label"]),
     ["Start voice"],
   );
+  const picker = renderer.root.findByProps({ "aria-label": "Voice" });
+  assert.deepEqual(picker.findAllByType("option").map((option) => option.props.value),
+    ["juniper", "maple", "spruce", "ember", "vale", "breeze", "arbor", "sol", "cove"]);
+  await act(async () => picker.props.onChange({ target: { value: "ember" } }));
   await act(async () => renderer.root.findByProps({ "aria-label": "Start voice" }).props.onClick());
-  assert.deepEqual(calls, ["start"]);
+  assert.deepEqual(calls, ["ember"]);
 
   const connecting = voiceSnapshot({
     status: "connecting",
@@ -195,7 +199,7 @@ test("ready voice control separates transport, coding-turn cancel, status, and f
   assert.equal(renderer.root.findByProps({ "aria-label": "Stop voice" }).props["aria-pressed"], true);
   await act(async () => renderer.root.findByProps({ "aria-label": "Stop voice" }).props.onClick());
   await act(async () => renderer.root.findByProps({ "aria-label": "Cancel voice turn" }).props.onClick());
-  assert.deepEqual(calls, ["start", "stop"]);
+  assert.deepEqual(calls, ["ember", "stop"]);
   assert.equal(cancelled, 1);
   assert.equal(renderer.root.findByProps({ role: "status" }).children.join(""), active.statusText);
 

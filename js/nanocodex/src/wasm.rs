@@ -2185,6 +2185,8 @@ struct WasmManagedBrowserVoiceUpdate {
     effects: BrowserVoiceEffects,
     #[serde(skip_serializing_if = "Option::is_none")]
     delegation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prefetch: Option<nanocodex_voice_protocol::VoicePrefetch>,
 }
 
 /// Standalone Rust-owned browser voice protocol for a remote managed Agent.
@@ -2196,6 +2198,7 @@ pub struct WasmManagedBrowserVoice {
     protocol: RefCell<nanocodex_voice_protocol::ManagedVoiceProtocol>,
     startup_context: RefCell<Option<String>>,
     started: Cell<bool>,
+    call_prepared: Cell<bool>,
 }
 
 #[wasm_bindgen(js_class = ManagedBrowserVoice)]
@@ -2213,6 +2216,7 @@ impl WasmManagedBrowserVoice {
             ),
             startup_context: RefCell::new(None),
             started: Cell::new(false),
+            call_prepared: Cell::new(false),
         })
     }
 
@@ -2233,6 +2237,13 @@ impl WasmManagedBrowserVoice {
             &context.workspace,
             &[],
         ));
+        if self.call_prepared.get()
+            && let Some(context) = self.startup_context.borrow().as_deref()
+        {
+            // Admission and the SDP request may finish in either order. Retain
+            // late context in the same acknowledged queue as all control frames.
+            let _ = self.protocol.borrow_mut().startup_context(context);
+        }
         self.started.set(true);
         Ok(())
     }
@@ -2241,12 +2252,10 @@ impl WasmManagedBrowserVoice {
     ///
     /// # Errors
     ///
-    /// Rejects calls before [`Self::start`], invalid session IDs, or empty SDP offers.
+    /// Rejects invalid session IDs or empty SDP offers. Admission can complete
+    /// after this request; its context is then sent over the control channel.
     #[wasm_bindgen(js_name = callBody)]
     pub fn call_body(&self, sdp: &str, managed_session_id: &str) -> Result<String, JsValue> {
-        if !self.started.get() {
-            return Err(js_error("managed browser voice has not started"));
-        }
         let session_id = managed_voice_session_id(managed_session_id)?;
         self.protocol.borrow_mut().bind_session(&session_id);
         let protocol = self.protocol.borrow();
@@ -2256,6 +2265,7 @@ impl WasmManagedBrowserVoice {
             self.startup_context.borrow().as_deref(),
         )
         .map_err(js_error)?;
+        self.call_prepared.set(true);
         serde_json::to_string(&serde_json::json!({
             "openai_alpha": "quicksilver=v2",
             "realtime_session_id": session_id,
@@ -2347,7 +2357,7 @@ impl WasmManagedBrowserVoice {
         let delegation = update
             .delegation
             .map(|delegation| nanocodex_voice_protocol::format_delegation(&delegation));
-        encode_managed_voice_update(update.effects, delegation)
+        encode_managed_voice_update(update.effects, delegation, update.prefetch)
     }
 
     /// Applies one canonical raw `AgentEvent` JSON value to the handoff stream.
@@ -2389,7 +2399,7 @@ impl WasmManagedBrowserVoice {
         let delegation = realtime_tail_delegation(&tail);
         self.started.set(false);
         self.startup_context.replace(None);
-        encode_managed_voice_update(self.protocol.borrow().close_effects(), delegation)
+        encode_managed_voice_update(self.protocol.borrow().close_effects(), delegation, None)
     }
 
     /// Selects Codex's preferred physical input from browser device labels.
@@ -2426,10 +2436,12 @@ pub fn managed_bootstrap_plan(input: &str) -> String {
 fn encode_managed_voice_update(
     effects: BrowserVoiceEffects,
     delegation: Option<String>,
+    prefetch: Option<nanocodex_voice_protocol::VoicePrefetch>,
 ) -> Result<String, JsValue> {
     serde_json::to_string(&WasmManagedBrowserVoiceUpdate {
         effects,
         delegation,
+        prefetch,
     })
     .map_err(js_error)
 }

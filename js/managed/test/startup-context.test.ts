@@ -11,7 +11,7 @@ const plan = (input: PromptInput) => Agent.bootstrapPlan(promptInputText(input))
 
 const firstPrompt = "Find the copper finch deployment preference";
 
-async function withStartup(run: (startup: ManagedStartupContext, state: DurableObjectState) => Promise<void>) {
+async function withStartup(run: (startup: ManagedStartupContext, state: DurableObjectState, session: DurableAgentSession) => Promise<void>) {
   const sessions = (env as unknown as { NANOCODEX_SESSIONS: DurableObjectNamespace<DurableAgentSession> }).NANOCODEX_SESSIONS;
   await runInDurableObject(sessions.getByName(crypto.randomUUID()), async (_session, state) => {
     state.storage.sql.exec(`INSERT INTO session_state (
@@ -19,7 +19,7 @@ async function withStartup(run: (startup: ManagedStartupContext, state: DurableO
       public_origin, runtime_profile, accepted_turns, last_active
     ) VALUES (1, ?, 'owner', 'org', 'team', 1, 'https://test.example', 'managed', 0, ?)`,
     crypto.randomUUID(), Date.now());
-    await run(new ManagedStartupContext(state.storage), state);
+    await run(new ManagedStartupContext(state.storage), state, _session);
   });
 }
 
@@ -52,6 +52,109 @@ const contextText = (state: DurableObjectState) => state.storage.sql.exec<{ cont
 ).one().content;
 
 describe("managed first-prompt bootstrap boundary", () => {
+  it("adopts in-flight exact-query reads only after admission, including their citation projection", async () => {
+    await withStartup(async (startup, state) => {
+      const search = await plan(firstPrompt);
+      let release!: () => void;
+      const waiting = new Promise<void>((resolve) => { release = resolve; });
+      const execute = vi.fn(async () => { await waiting; return { sessions: [{ session_id: "candidate" }] }; });
+      const prefetch = startup.prefetch("call", "auth", search, execute, assertActive);
+      await expect.poll(() => execute.mock.calls.length).toBe(2);
+      expect(state.storage.sql.exec("SELECT * FROM managed_prompt_startup_tools").toArray()).toEqual([]);
+      expect(state.storage.sql.exec("SELECT * FROM managed_startup_context").toArray()).toEqual([]);
+      startup.reserve("first", search, "call");
+      const fresh = vi.fn();
+      const adopt = vi.fn();
+      const preparing = startup.prepare("first", fresh, async () => undefined, assertActive, "auth", adopt);
+      release();
+      await Promise.all([prefetch, preparing]);
+      expect(fresh).not.toHaveBeenCalled();
+      expect(adopt).toHaveBeenCalledTimes(2);
+      expect(contextText(state)).toContain("candidate");
+      await startup.prepare("first", fresh, async () => undefined, assertActive, "auth", adopt);
+      expect(adopt).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  it("fences the real prefetch route by owner, authorization epoch and live call without admitting a turn", async () => {
+    await withStartup(async (_startup, state, session) => {
+      const owner = crypto.randomUUID(), organization = crypto.randomUUID(), team = crypto.randomUUID();
+      const voice = "019d2f5d-7491-7000-8000-000000000003";
+      const authorization = { capabilities: ["agents:write", "tools:use", "memory:read", "history:read"] };
+      state.storage.sql.exec("UPDATE session_state SET owner_id = ?, organization_id = ?, team_id = ?", owner, organization, team);
+      state.storage.sql.exec(`INSERT INTO managed_realtime_session (singleton, voice_session_id, authorization_json, updated_at)
+        VALUES (1, ?, ?, ?)`, voice, JSON.stringify(authorization), Date.now());
+      const headers = {
+        "content-type": "application/json", "x-nanocodex-owner-id": owner,
+        "x-nanocodex-session-organization-id": organization, "x-nanocodex-session-team-id": team,
+        "x-nanocodex-authorization-epoch": "1", "x-nanocodex-capabilities": JSON.stringify(authorization.capabilities),
+      };
+      const body = { voice_session_id: voice, query: "VOICE_PREFETCH_TEST" };
+      const request = (value: unknown = body, overrides: Record<string, string> = {}) => session.fetch(
+        new Request("https://session.internal/realtime/prefetch", { method: "POST", headers: { ...headers, ...overrides }, body: JSON.stringify(value) }),
+      );
+      const response = await request();
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({ prefetched: true });
+      expect((await request(body, { "x-nanocodex-owner-id": crypto.randomUUID() })).status).toBe(404);
+      expect((await request(body, { "x-nanocodex-authorization-epoch": "2" })).status).toBe(404);
+      expect((await request({ ...body, voice_session_id: "019d2f5d-7491-7000-8000-000000000004" })).status).toBe(409);
+      expect((await request({ ...body, query: "a".repeat(513) })).status).toBe(400);
+      expect((await request({ ...body, operation: "put" })).status).toBe(400);
+      state.storage.sql.exec("DELETE FROM managed_realtime_session");
+      expect((await request()).status).toBe(409);
+      for (const table of ["managed_turns", "managed_prompt_startup_tools", "managed_startup_context", "managed_realtime_operations", "turn_history_citations"]) {
+        expect(state.storage.sql.exec(`SELECT * FROM ${table}`).toArray()).toEqual([]);
+      }
+      expect(state.storage.sql.exec<{ accepted_turns: number }>("SELECT accepted_turns FROM session_state").one().accepted_turns).toBe(0);
+    });
+  });
+
+  it.each(["query", "authorization", "call", "expired", "failed", "stopped"])(
+    "falls back to authoritative retrieval when prefetch differs or is unavailable: %s", async (reason) => {
+      await withStartup(async (startup, state) => {
+        const search = await plan(firstPrompt);
+        await startup.prefetch("call", "auth", search, async () => {
+          if (reason === "failed") throw new Error("unavailable");
+          return { source: "speculative" };
+        }, assertActive);
+        if (reason === "stopped") startup.clearPrefetch();
+        const clock = reason === "expired" ? vi.spyOn(Date, "now").mockReturnValue(Date.now() + 30_001) : undefined;
+        try {
+          startup.reserve("first", reason === "query" ? await plan("A different question") : search,
+            reason === "call" ? "other-call" : "call");
+          const execute = vi.fn(async () => ({ source: "authoritative" }));
+          const adopt = vi.fn();
+          await startup.prepare("first", execute, async () => undefined, assertActive,
+            reason === "authorization" ? "other-auth" : "auth", adopt);
+          expect(execute).toHaveBeenCalledTimes(2);
+          expect(adopt).not.toHaveBeenCalled();
+          expect(contextText(state)).toContain("authoritative");
+          expect(contextText(state)).not.toContain("speculative");
+        } finally { clock?.mockRestore(); }
+      });
+    },
+  );
+
+  it("bounds speculative reads and rejects stale callers before they can evict the active call", async () => {
+    await withStartup(async (startup) => {
+      const execute = vi.fn(async () => ({}));
+      const search = await plan(firstPrompt);
+      await startup.prefetch("call", "auth", search, execute, assertActive);
+      await expect(startup.prefetch("old", "old-auth", search, execute, () => { throw new Error("fenced"); })).rejects.toThrow("fenced");
+      await startup.prefetch("call", "auth", search, execute, assertActive);
+      expect(execute).toHaveBeenCalledTimes(2);
+      for (let index = 0; index < 10; index++) {
+        await startup.prefetch("call", "auth", await plan(`question ${index}`), execute, assertActive);
+      }
+      expect(execute).toHaveBeenCalledTimes(16);
+      startup.reserve("first", await plan("question 6"), "call");
+      const fresh = vi.fn();
+      await startup.prepare("first", fresh, async () => undefined, assertActive, "auth");
+      expect(fresh).not.toHaveBeenCalled();
+    });
+  });
+
   it("bounds Unicode queries and excludes attachment URLs in the Rust plan", async () => {
     const long = (await plan(`  ${"😀".repeat(200)} tail`)).query;
     expect(new TextEncoder().encode(long).length).toBe(512);

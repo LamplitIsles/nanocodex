@@ -9,6 +9,7 @@ public struct NanocodexVoiceControl: View {
     private let onReturnToChat: @MainActor () -> Void
     @State private var presented = false
     @State private var returningToChat = false
+    @AppStorage("nanocodex.voice") private var selectedVoice = "cove"
 
     public init(session: VoiceSession, onReturnToChat: @escaping @MainActor () -> Void = {}, onStart: @escaping @MainActor () async throws -> VoiceConfiguration) {
         self.session = session; self.onStart = onStart; self.onReturnToChat = onReturnToChat
@@ -17,7 +18,7 @@ public struct NanocodexVoiceControl: View {
     public var body: some View {
         HStack(spacing: 0) {
             Button {
-                if !session.isEngaged { session.start(using: onStart) }
+                if !session.isEngaged { session.start(using: configuration) }
                 presented = true
             } label: {
                 Image(systemName: session.isEngaged ? "waveform.circle.fill" : "waveform")
@@ -26,6 +27,13 @@ public struct NanocodexVoiceControl: View {
             }.buttonStyle(.plain)
                 .accessibilityLabel(session.isEngaged ? "Open voice in \(session.conversationTitle ?? "conversation")" : "Start voice")
                 .accessibilityIdentifier("start-voice")
+                .contextMenu {
+                    Picker("Voice", selection: $selectedVoice) {
+                        ForEach(ManagedVoiceProtocol.voices, id: \.self) { voice in
+                            Text(voice.capitalized).tag(voice)
+                        }
+                    }
+                }
             if session.isEngaged {
                 Button { session.stop() } label: {
                     Image(systemName: "xmark").font(.system(size: 15, weight: .medium))
@@ -40,7 +48,12 @@ public struct NanocodexVoiceControl: View {
         #endif
     }
     private var panel: some View {
-        VoicePanel(session: session, onStart: onStart) { returningToChat = true }
+        VoicePanel(session: session, selectedVoice: $selectedVoice, onStart: configuration) { returningToChat = true }
+    }
+    private func configuration() async throws -> VoiceConfiguration {
+        var result = try await onStart()
+        result.voice = ManagedVoiceProtocol.voices.contains(selectedVoice) ? selectedVoice : "cove"
+        return result
     }
     private func returnToChatIfNeeded() {
         guard returningToChat else { return }
@@ -92,6 +105,7 @@ public struct NanocodexVoiceTranscript: View {
 
 private struct VoicePanel: View {
     @ObservedObject var session: VoiceSession
+    @Binding var selectedVoice: String
     let onStart: @MainActor () async throws -> VoiceConfiguration
     let onReturnToChat: @MainActor () -> Void
     @Environment(\.dismiss) private var dismiss
@@ -139,7 +153,15 @@ private struct VoicePanel: View {
                         Text("Voice").font(.subheadline.weight(.medium)).foregroundStyle(.secondary)
                             .accessibilityIdentifier("voice-panel")
                         Spacer()
-                        Color.clear.frame(width: 48, height: 48)
+                        Menu {
+                            Picker("Voice for the next call", selection: $selectedVoice) {
+                                ForEach(ManagedVoiceProtocol.voices, id: \.self) { voice in
+                                    Text(voice.capitalized).tag(voice)
+                                }
+                            }
+                        } label: {
+                            Image(systemName: "slider.horizontal.3").frame(width: 48, height: 48)
+                        }.accessibilityLabel("Choose voice").accessibilityIdentifier("choose-voice")
                     }.padding(.horizontal, 20).padding(.top, 8)
                     Spacer()
                     Text(session.status).font(.caption).foregroundStyle(.secondary)

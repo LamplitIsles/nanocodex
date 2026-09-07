@@ -14,6 +14,7 @@ pub struct ManagedVoiceProtocol {
     bootstrap_complete: bool,
     follow_up: bool,
     awaiting_first_turn_done: bool,
+    prefetch_query: String,
 }
 
 impl std::ops::Deref for ManagedVoiceProtocol {
@@ -38,6 +39,7 @@ impl ManagedVoiceProtocol {
             bootstrap_complete: false,
             follow_up: false,
             awaiting_first_turn_done: false,
+            prefetch_query: String::new(),
         })
     }
 
@@ -49,6 +51,7 @@ impl ManagedVoiceProtocol {
             self.bootstrap_complete = false;
             self.follow_up = false;
             self.awaiting_first_turn_done = false;
+            self.prefetch_query.clear();
         }
     }
 
@@ -68,6 +71,28 @@ impl ManagedVoiceProtocol {
         } else {
             None
         };
+        // A partial transcript can warm retrieval, but can never admit a turn.
+        // The host only reuses these results for an exactly matching final plan.
+        if self.bootstrap_input.is_none()
+            && utterance.is_none()
+            && update.delegation.is_none()
+            && let Some(entry) = update
+                .effects
+                .transcripts
+                .iter()
+                .rev()
+                .find(|entry| entry.speaker == "user")
+        {
+            let plan = bootstrap_plan(&entry.text);
+            let query = plan["query"].as_str().unwrap_or_default();
+            if query.len() >= 12 && query != self.prefetch_query {
+                self.prefetch_query = query.to_owned();
+                update.prefetch = Some(crate::VoicePrefetch {
+                    query: query.to_owned(),
+                    debounce_ms: 250,
+                });
+            }
+        }
         if !self.bootstrap_complete {
             update
                 .effects
@@ -191,7 +216,7 @@ impl ManagedVoiceProtocol {
             "bind" => { self.bind_session(command["session_id"].as_str().unwrap_or_default()); return Ok(Value::Null); }
             "realtime" => {
                 let update = self.realtime_message(&command["event"].to_string());
-                return Ok(json!({ "effects": update.effects, "delegation": update.delegation.map(|delegation|
+                return Ok(json!({ "effects": update.effects, "prefetch": update.prefetch, "delegation": update.delegation.map(|delegation|
                     json!({ "id": delegation.id, "formatted_input": format_delegation(&delegation) })) }));
             }
             "agent" => self.agent_event(&command["event"].to_string()),
@@ -330,6 +355,33 @@ fn memory_update(result: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn partial_speech_only_prefetches_and_final_speech_still_owns_admission() {
+        let mut voice = voice();
+        let partial =
+            r#"{"type":"input_transcript.added","item":{"text":"When is Elena's birthday?"}}"#;
+        let early = voice.realtime_message(partial);
+        assert!(early.delegation.is_none());
+        assert_eq!(
+            early.prefetch.unwrap(),
+            crate::VoicePrefetch {
+                query: "When is Elena's birthday?".to_owned(),
+                debounce_ms: 250,
+            }
+        );
+        assert!(
+            voice
+                .realtime_message(r#"{"type":"input_transcript.added","item":{"text":" "}}"#)
+                .prefetch
+                .is_none()
+        );
+        let completed = voice.realtime_message(&utterance("When is Elena's birthday?"));
+        assert!(completed.delegation.unwrap().bootstrap);
+        assert!(completed.prefetch.is_none());
+        assert!(voice.realtime_message(partial).prefetch.is_none());
+        voice.bind_session("another-call");
+        assert!(voice.realtime_message(partial).prefetch.is_some());
+    }
     fn voice() -> ManagedVoiceProtocol {
         let mut voice = ManagedVoiceProtocol::new("cove").unwrap();
         voice.bind_session("call-1");

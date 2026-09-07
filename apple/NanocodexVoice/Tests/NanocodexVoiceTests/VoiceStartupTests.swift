@@ -8,7 +8,7 @@ final class VoiceStartupTests: XCTestCase {
     private let agent = "11111111-1111-7111-8111-111111111111"
 
     private func configuration(_ origin: String) -> VoiceConfiguration {
-        .init(baseURL: URL(string: origin)!, apiKey: fixtureKey, agentID: agent)
+        .init(baseURL: URL(string: origin)!, apiKey: fixtureKey, agentID: agent, voice: "spruce")
     }
     private func receipt(_ request: FixtureRequest, delay: Double = 0) -> FixtureReply {
         .init(body: String(data: try! JSONSerialization.data(withJSONObject: [
@@ -57,6 +57,9 @@ final class VoiceStartupTests: XCTestCase {
         let stopped = expectation(description: "Failed session cleaned up")
         let fixture = try HTTPFixture { request in
             if request.path.hasSuffix("/calls") {
+                let session = request.json["session"] as? [String: Any]
+                let audio = session?["audio"] as? [String: Any]
+                XCTAssertEqual((audio?["output"] as? [String: Any])?["voice"] as? String, "spruce")
                 callStarted.fulfill()
                 return .init(status: 201, headers: ["Content-Type": "application/sdp", "x-nanocodex-realtime-location": "https://provider.invalid/v1/realtime/calls/rtc_fixture"], body: "v=0\r\nlate-answer", delay: 3)
             }

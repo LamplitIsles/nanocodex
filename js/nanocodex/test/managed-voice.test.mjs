@@ -10,6 +10,80 @@ import { Voice } from "../browser/index.mjs";
 const AGENT_ID = "019d2f5d-7491-8000-8000-000000000001";
 const UUID_V7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
+test("Rust partial speech warms retrieval without delaying final admission and stop aborts speculation", { timeout: 5000 }, async () => {
+  const module = await WebAssembly.compile(await readFile(new URL("../pkg-web/nanocodex_bg.wasm", import.meta.url)));
+  const requests = [];
+  let entered, finish;
+  const prefetched = new Promise((resolve) => { entered = resolve; });
+  const waiting = new Promise((resolve) => { finish = resolve; });
+  let prefetchSignal;
+  const agent = Agent.open(AGENT_ID, { baseUrl: "https://managed.example", fetch: async (input, init) => {
+    const path = new URL(input).pathname;
+    requests.push({ path, body: JSON.parse(init.body) });
+    if (path.endsWith("/prefetch")) {
+      prefetchSignal = init.signal; entered(); await waiting;
+      return Response.json({ prefetched: true });
+    }
+    if (path.endsWith("/delegate")) return Response.json({ route: "started", turn_id: "first" });
+    return Response.json({ context: { workspace: "/brain", history: [] } });
+  } });
+  const voice = await createManagedBrowserVoice(agent, "cove", { module });
+  try {
+    await voice.start();
+    voice.callBody("v=offer");
+    await voice.realtimeMessage(JSON.stringify({ type: "input_transcript.added", item: { text: "When is Elena's" } }));
+    await voice.realtimeMessage(JSON.stringify({ type: "input_transcript.added", item: { text: " birthday?" } }));
+    assert.equal(requests.length, 1, "partials never admit a turn");
+    await prefetched;
+    assert.equal(requests.length, 2, "successive partials debounce into one read");
+    assert.equal(requests[1].body.query, "When is Elena's birthday?");
+    await voice.realtimeMessage(JSON.stringify({ type: "turn.done", turn: { role: "user", transcript: "When is Elena's birthday?" } }));
+    assert.match(requests[2].path, /realtime\/delegate$/);
+    assert.match(requests[2].body.input, /voice_bootstrap/);
+    assert.equal(prefetchSignal.aborted, false, "an in-flight exact query can still finish for admission");
+    await voice.stop();
+    assert.equal(prefetchSignal.aborted, true);
+  } finally { finish(); voice.free(); }
+});
+
+test("managed Rust queues late startup context once while SDP is already in flight", async () => {
+  const wasm = await readFile(new URL("../pkg-web/nanocodex_bg.wasm", import.meta.url));
+  const module = await WebAssembly.compile(wasm);
+  let admit;
+  const admission = new Promise((resolve) => { admit = resolve; });
+  const agent = Agent.open(AGENT_ID, {
+    baseUrl: "https://managed.example",
+    fetch: async () => {
+      await admission;
+      return Response.json({ context: { workspace: "/brain/" + "nested/".repeat(1000), history: Array.from({ length: 4 }, () => ({
+        type: "message", role: "user", content: [{ type: "input_text", text: "The current project is Juniper. " + "Retained detail. ".repeat(900) }],
+      })) } });
+    },
+  });
+  const voice = await createManagedBrowserVoice(agent, "cove", { module });
+  try {
+    const starting = voice.start();
+    const call = JSON.parse(voice.callBody("v=offer"));
+    assert.equal(voice.parallelStartup, true);
+    assert.doesNotMatch(JSON.parse(call.call_body).session.instructions, /current project is Juniper/);
+    admit();
+    await starting;
+    const context = JSON.parse(voice.sidebandOpened());
+    assert.match(context.frames.join(""), /current project is Juniper/);
+    const texts = context.frames.map((frame) => JSON.parse(frame).content[0].text);
+    assert.ok(texts.join("").length > 8192, "late admission preserves the full startup budget");
+    assert.ok(texts.every((text) => new TextEncoder().encode(text).length <= 500));
+    assert.equal(context.playback_enabled, false, "background context cannot release first-response playback");
+    assert.ok(context.frames.every((frame) => JSON.parse(frame).type === "session.context.append"));
+    assert.deepEqual(JSON.parse(voice.sidebandOpened()).frames, context.frames, "lost control acknowledgements replay context");
+    voice.framesSent(context.frames.length);
+    assert.deepEqual(JSON.parse(voice.sidebandOpened()).frames, []);
+  } finally {
+    admit();
+    voice.free();
+  }
+});
+
 test("managed browser voice gives a UUIDv8 durable Agent a distinct UUIDv7 realtime session", async () => {
   const wasm = await readFile(new URL("../pkg-web/nanocodex_bg.wasm", import.meta.url));
   const module = await WebAssembly.compile(wasm);

@@ -5,10 +5,39 @@ import InboxCore
 final class ManagedVoiceTests: XCTestCase {
     private let agent = "019d2f5d-7491-8000-8000-000000000001"
 
+    func testPrefetchUsesTheBoundedReadEndpointWithoutTurnAdmission() async throws {
+        let session = ManagedVoiceProtocol.sessionID()
+        var requests: [FixtureRequest] = []
+        let fixture = try HTTPFixture { request in
+            requests.append(request)
+            return .init(body: #"{"prefetched":true}"#)
+        }
+        defer { fixture.close() }
+        let transport = try ManagedVoiceTransport(credential: .init(origin: fixture.origin, apiKey: fixtureKey), agentID: agent, configuration: fixture.configuration)
+        try await transport.prefetch(sessionID: session, query: "When is Elena's birthday?")
+        XCTAssertEqual(requests.count, 1)
+        XCTAssertEqual(requests[0].path, "/v1/agents/\(agent)/realtime/prefetch")
+        XCTAssertEqual(requests[0].method, "POST")
+        XCTAssertEqual(requests[0].json["voice_session_id"] as? String, session)
+        XCTAssertEqual(requests[0].json["query"] as? String, "When is Elena's birthday?")
+        do {
+            try await transport.prefetch(sessionID: session, query: String(repeating: "x", count: 513))
+            XCTFail("Oversized speculative queries must be rejected before network I/O")
+        } catch {}
+        XCTAssertEqual(requests.count, 1)
+        await transport.close()
+    }
+
     func testFirstUtteranceUsesRustBootstrapAndGatesPlayback() throws {
         let voice = try ManagedVoiceProtocol()
         voice.bindSession("call-1")
         XCTAssertEqual(voice.sidebandOpened().playbackEnabled, false)
+        let partial = voice.realtimeMessage(.object(["type": .string("input_transcript.added"), "item": .object([
+            "text": .string("When is Elena's birthday?")
+        ])]))
+        XCTAssertNil(partial.delegation)
+        XCTAssertEqual(partial.prefetch?.query, "When is Elena's birthday?")
+        XCTAssertEqual(partial.prefetch?.debounceMS, 250)
         let first = voice.realtimeMessage(.object(["type": .string("turn.done"), "turn": .object([
             "role": .string("user"), "transcript": .string("When is Elena's birthday?")
         ])]))

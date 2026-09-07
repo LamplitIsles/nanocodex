@@ -5,6 +5,7 @@ import type { AccountInfo } from "./account-info";
 
 type StartupToolName = "find_session" | "memory";
 type StartupCall = {
+  scope: string;
   name: StartupToolName;
   turn_id: string;
   input_json: string;
@@ -21,6 +22,7 @@ export type StartupEnvironment = Readonly<{
 }>;
 
 type ContextRow = { content: string; injected: number };
+type LookupResult = { result: unknown; success: boolean; durationNS: number };
 type DeveloperSession = {
   context(): Promise<AgentSessionContext>;
   appendDeveloperMessage(text: string): Promise<AgentSessionContext>;
@@ -28,6 +30,9 @@ type DeveloperSession = {
 
 /** The first admitted prompt owns two bounded, replayable retrieval calls. */
 export class ManagedStartupContext {
+  private prefetchKey = "";
+  private prefetchCalls = 0;
+  private readonly prefetched = new Map<string, { expiresAt: number; pending: Promise<LookupResult> }>();
   constructor(private readonly storage: DurableObjectStorage) {
     storage.sql.exec(`CREATE TABLE IF NOT EXISTS managed_startup_tools (
       name TEXT PRIMARY KEY CHECK (name IN ('find_session', 'memory')),
@@ -47,6 +52,30 @@ export class ManagedStartupContext {
     )`);
   }
 
+  /** Speculative reads have no turn or durable receipt until an exact plan adopts them. */
+  async prefetch(
+    voiceSessionId: string, authorizationKey: string, plan: Agent.BootstrapPlan,
+    execute: (name: StartupToolName, args: unknown, signal: AbortSignal) => Promise<unknown>,
+    assertActive: () => void,
+  ): Promise<void> {
+    assertActive();
+    const key = `voice:${voiceSessionId}\n${authorizationKey}`;
+    if (this.prefetchKey !== key) { this.clearPrefetch(); this.prefetchKey = key; }
+    await Promise.all(plan.calls.map(async (call) => {
+      const input = JSON.stringify(call.arguments);
+      const callKey = `${call.name}:${input}`;
+      if (this.prefetched.has(callKey) || this.prefetchCalls >= 16) return;
+      assertActive();
+      this.prefetchCalls += 1;
+      if (this.prefetched.size >= 8) this.prefetched.delete(this.prefetched.keys().next().value!);
+      const pending = lookup(call.name, input, execute).then((result) => { assertActive(); return result; });
+      this.prefetched.set(callKey, { expiresAt: Date.now() + 30_000, pending });
+      await pending;
+    }));
+  }
+
+  clearPrefetch(): void { this.prefetched.clear(); this.prefetchKey = ""; this.prefetchCalls = 0; }
+
   /** Called inside admission; Rust supplied the query and exact tool plan. */
   reserve(turnId: string, plan: Agent.BootstrapPlan, voiceSessionId?: string): void {
     const scope = voiceSessionId === undefined ? "session" : `voice:${voiceSessionId}`;
@@ -63,29 +92,24 @@ export class ManagedStartupContext {
     execute: (name: StartupToolName, args: unknown, signal: AbortSignal) => Promise<unknown>,
     environment: () => Promise<StartupEnvironment | undefined>,
     assertActive: () => void,
+    authorizationKey?: string,
+    adopt?: (name: StartupToolName, result: unknown) => void,
   ): Promise<void> {
     const calls = this.calls(turnId);
     if (calls.length === 0 || this.context(turnId)) return;
     const [resolvedEnvironment] = await Promise.all([environment(), Promise.all(calls.map(async (call) => {
       if (call.result_json !== null) return;
       assertActive();
-      const started = performance.now();
-      let result: unknown;
-      let success = true;
-      try {
-        result = await withHardDeadline(`startup ${call.name}`, 10_000,
-          (signal) => execute(call.name, JSON.parse(call.input_json), signal));
-      } catch (error) {
-        success = false;
-        // Do not copy internal fetch errors, URLs, or credentials into context.
-        result = { error: (error as { code?: unknown } | null)?.code === "forbidden"
-          ? "forbidden" : "unavailable", message: `Initial ${call.name} lookup did not succeed. No context was retrieved.` };
-      }
+      const cached = this.prefetchKey === `${call.scope}\n${authorizationKey}`
+        ? this.prefetched.get(`${call.name}:${call.input_json}`) : undefined;
+      const prepared = cached && cached.expiresAt > Date.now() ? await cached.pending.catch(() => undefined) : undefined;
+      const { result, success, durationNS } = prepared?.success ? prepared : await lookup(call.name, call.input_json, execute);
       assertActive();
+      if (prepared?.success) adopt?.(call.name, result);
       this.storage.sql.exec(`UPDATE managed_prompt_startup_tools
         SET result_json = ?, success = ?, duration_ns = ?
         WHERE name = ? AND turn_id = ? AND result_json IS NULL`,
-      JSON.stringify(result), Number(success), Math.round((performance.now() - started) * 1_000_000), call.name, turnId);
+      JSON.stringify(result), Number(success), durationNS, call.name, turnId);
     }))]);
     assertActive();
     const results = this.calls(turnId).map((call) => ({
@@ -144,4 +168,21 @@ export class ManagedStartupContext {
       "SELECT * FROM managed_prompt_startup_tools WHERE turn_id = ? ORDER BY name", turnId,
     ).toArray();
   }
+}
+
+async function lookup(name: StartupToolName, input: string,
+  execute: (name: StartupToolName, args: unknown, signal: AbortSignal) => Promise<unknown>): Promise<LookupResult> {
+  const started = performance.now();
+  let result: unknown;
+  let success = true;
+  try {
+    result = await withHardDeadline(`startup ${name}`, 10_000,
+      (signal) => execute(name, JSON.parse(input), signal));
+  } catch (error) {
+    success = false;
+    // Internal errors, URLs, and credentials never become retrieved context.
+    result = { error: (error as { code?: unknown } | null)?.code === "forbidden" ? "forbidden" : "unavailable",
+      message: `Initial ${name} lookup did not succeed. No context was retrieved.` };
+  }
+  return { result, success, durationNS: Math.round((performance.now() - started) * 1_000_000) };
 }

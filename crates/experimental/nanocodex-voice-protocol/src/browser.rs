@@ -225,6 +225,13 @@ pub struct BrowserVoiceDelegation {
 pub struct BrowserVoiceUpdate {
     pub effects: BrowserVoiceEffects,
     pub delegation: Option<BrowserVoiceDelegation>,
+    pub prefetch: Option<VoicePrefetch>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct VoicePrefetch {
+    pub query: String,
+    pub debounce_ms: u32,
 }
 
 pub struct BrowserVoiceProtocol {
@@ -546,7 +553,18 @@ impl BrowserVoiceProtocol {
     /// consuming the transcript or changing the active delegation.
     #[must_use]
     pub fn context(&mut self, text: &str) -> BrowserVoiceEffects {
-        if text.is_empty() || text.len() > 8 * 1024 {
+        self.queue_context(text, 8 * 1024)
+    }
+
+    /// Startup has the same token budget whether it travels in the call body
+    /// or arrives later through the acknowledged control queue.
+    #[must_use]
+    pub fn startup_context(&mut self, text: &str) -> BrowserVoiceEffects {
+        self.queue_context(text, TOTAL_BUDGET * APPROX_BYTES_PER_TOKEN)
+    }
+
+    fn queue_context(&mut self, text: &str, maximum_bytes: usize) -> BrowserVoiceEffects {
+        if text.is_empty() || text.len() > maximum_bytes {
             return BrowserVoiceEffects::default();
         }
         let chunks = context_append_chunks(text);

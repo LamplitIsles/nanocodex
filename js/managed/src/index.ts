@@ -250,6 +250,7 @@ import {
   mergeHistoryCitations,
   parseHistoryFindSessionsInput,
   parseHistoryReadSessionInput,
+  type FindSessionsToolResult,
   type HistoryCitation,
   type HistoryFindSessionsInput,
   type HistoryFindSessionsResponse,
@@ -2062,7 +2063,7 @@ async function managedFetch(
         headers,
       });
     }
-    const realtimeMatch = resource.match(/^realtime\/(start|delegate|stop)$/);
+    const realtimeMatch = resource.match(/^realtime\/(start|delegate|stop|prefetch)$/);
     if (realtimeMatch) {
       if (request.method !== "POST")
         return json({ error: "method_not_allowed" }, { status: 405 });
@@ -3205,13 +3206,14 @@ export class DurableAgentSession extends DurableComputerSession {
     if (request.method === "GET" && url.pathname === "/device-host")
       return this.#upgradeDeviceHost();
     const realtimeRoute = url.pathname.match(
-      /^\/realtime\/(start|delegate|stop)$/,
+      /^\/realtime\/(start|delegate|stop|prefetch)$/,
     );
     if (realtimeRoute) {
       if (ownerAssertion === null)
         return json({ error: "not_found" }, { status: 404 });
       if (request.method !== "POST")
         return json({ error: "method_not_allowed" }, { status: 405 });
+      if (realtimeRoute[1] === "prefetch") return this.#prefetchRealtimeContext(request, turnAuthorization);
       return this.#managedRealtime(
         realtimeRoute[1] as ManagedRealtimeKind,
         request,
@@ -4601,6 +4603,41 @@ export class DurableAgentSession extends DurableComputerSession {
     }
   }
 
+  async #prefetchRealtimeContext(request: Request, authorization: TurnAuthorization): Promise<Response> {
+    try {
+      const encoded = await readBoundedRequestText(request, 2_048);
+      let body;
+      try { body = JSON.parse(encoded); }
+      catch { return json({ error: "invalid_json" }, { status: 400 }); }
+      if (!body || typeof body !== "object" || Array.isArray(body)
+        || Object.keys(body).some((key) => key !== "voice_session_id" && key !== "query")
+        || typeof body.voice_session_id !== "string" || !REALTIME_ID.test(body.voice_session_id)
+        || typeof body.query !== "string" || body.query.trim() === "" || encoder.encode(body.query).length > 512) {
+        return json({ error: "invalid_request" }, { status: 400 });
+      }
+      const epoch = this.#session()?.authorization_epoch;
+      const assertActive = () => {
+        this.#assertRealtimeRouteAvailable();
+        const active = this.#managedRealtimeSession();
+        if (!active || this.#session()?.authorization_epoch !== epoch || active.voice_session_id !== body.voice_session_id) {
+          throw new ManagedRequestError(409, "voice_session_inactive", "voice prefetch no longer owns this session");
+        }
+        this.#requireRealtimeAuthorization(active, authorization);
+      };
+      assertActive();
+      const plan = await CloudflareAgent.bootstrapPlan(body.query);
+      const tools = this.#memoryTools({ id: `voice-prefetch:${body.voice_session_id}`, authorization_json: JSON.stringify(authorization) }, false);
+      await this.#startupContext.prefetch(body.voice_session_id, canonicalJson([epoch, authorization]), plan,
+        async (name, args, signal) => tools.find((tool) => tool.name === name)!.handler(args, {
+          callId: `prefetch_${name}`, parentCallId: "", sessionId: this.#session()!.session_id,
+          model: this.#settings().model, signal,
+        }), assertActive);
+      return json({ prefetched: true });
+    } catch (error) {
+      return managedErrorResponse(error);
+    }
+  }
+
   async #managedRealtime(
     kind: ManagedRealtimeKind,
     request: Request,
@@ -5000,7 +5037,8 @@ export class DurableAgentSession extends DurableComputerSession {
           async (name, args, signal) => tools.find((tool) => tool.name === name)!.handler(args, {
             callId: `startup_${id}_${name}`, parentCallId: "", sessionId: agent.sessionId,
             model: this.#settings().model, signal,
-          }), async () => undefined, assertActive);
+          }), async () => undefined, assertActive, canonicalJson([epoch, authorization]),
+          (name, result) => this.#adoptStartupResult(id, name, result));
         input = promptInputText(this.#startupContext.enrich(id, input));
         assertActive();
       }
@@ -5664,6 +5702,8 @@ export class DurableAgentSession extends DurableComputerSession {
             };
           },
           assertActive,
+          canonicalJson([epoch, parseTurnAuthorization(row.authorization_json)]),
+          (name, result) => this.#adoptStartupResult(row.id, name, result),
         );
       // Drain construction even if bootstrap fails, so its admission-queue
       // publication cannot race the failure cleanup below.
@@ -6865,7 +6905,15 @@ export class DurableAgentSession extends DurableComputerSession {
     };
   }
 
-  #memoryTools(startupTurn?: Pick<ManagedTurnRow, "id" | "authorization_json">): readonly NamedTool[] {
+  #adoptStartupResult(turnId: string, name: string, result: unknown): void {
+    if (name !== "find_session") return;
+    const citations = groupHistoryCitations((result as FindSessionsToolResult).sessions.map((session) => ({
+      thread_id: session.session_id, title: session.title, turn_id: session.turn_id, cursor: session.cursor,
+    })));
+    if (citations.length > 0) this.#recordHistoryCitations(turnId, citations);
+  }
+
+  #memoryTools(startupTurn?: Pick<ManagedTurnRow, "id" | "authorization_json">, publishCitations = true): readonly NamedTool[] {
     return memorySessionTools({
       findSessions: (input) => this.#findSessions(input),
       readSession: (input) => this.#readHistorySession(input),
@@ -6885,6 +6933,7 @@ export class DurableAgentSession extends DurableComputerSession {
         }
       },
       recordCitations: (citations) => {
+        if (!publishCitations) return;
         const turnId = startupTurn?.id ?? this.#eventTurnId;
         if (turnId !== undefined && citations.length > 0) this.#recordHistoryCitations(turnId, citations);
       },
@@ -8747,6 +8796,7 @@ export class DurableAgentSession extends DurableComputerSession {
     agent: CloudflareAgent.Agent,
     voiceSessionId: string,
   ): Promise<AgentSessionContext> {
+    this.#startupContext.clearPrefetch();
     const context = await agent.session.realtime.end();
     assertBoundedRealtimeContext(context);
     this.ctx.storage.sql.exec(

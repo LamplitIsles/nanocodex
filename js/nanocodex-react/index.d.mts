@@ -8,6 +8,7 @@ import type {
   VoiceName,
 } from "nanocodex/browser/voice";
 import type { ReactNode } from "react";
+export * as Voice from "nanocodex/browser/voice";
 
 export {
   createConfig,

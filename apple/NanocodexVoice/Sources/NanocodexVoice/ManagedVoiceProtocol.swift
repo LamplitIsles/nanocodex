@@ -28,7 +28,12 @@ public struct ManagedVoiceDelegation: Equatable, Sendable {
 public struct ManagedVoiceUpdate: Equatable, Sendable {
     public var effects = ManagedVoiceEffects()
     public var delegation: ManagedVoiceDelegation?
+    public var prefetch: ManagedVoicePrefetch?
     public init() {}
+}
+public struct ManagedVoicePrefetch: Equatable, Sendable {
+    public let query: String
+    public let debounceMS: Int
 }
 
 /// Thin native binding to the same Rust core used by WASM.
@@ -68,6 +73,10 @@ public final class ManagedVoiceProtocol: @unchecked Sendable {
         do {
             let value = try command(["op": .string("realtime"), "event": event])
             var update = ManagedVoiceUpdate(); update.effects = try effects(value["effects"])
+            if value["prefetch"] != .null {
+                update.prefetch = .init(query: value["prefetch"]["query"].string,
+                                        debounceMS: Int(value["prefetch"]["debounce_ms"].number))
+            }
             if value["delegation"] != .null {
                 update.delegation = .init(id: value["delegation"]["id"].string, formattedInput: value["delegation"]["formatted_input"].string)
             }

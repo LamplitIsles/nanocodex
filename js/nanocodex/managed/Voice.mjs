@@ -2,6 +2,7 @@ import { ManagedBrowserVoice } from "../pkg-web/nanocodex.js";
 import { initializeBrowserEngine } from "../browser/engine.mjs";
 import {
   cancelManagedTurn,
+  prefetchManagedRealtime,
   routeManagedRealtime,
   startManagedRealtime,
   stopManagedRealtime,
@@ -20,6 +21,8 @@ export async function createManagedBrowserVoice(agent, voice, options = {}) {
   let activeTurnId;
   let routePending = false;
   let pendingEvents = [];
+  let prefetchTimer;
+  const prefetchAbort = new AbortController();
 
   function observe(value) {
     if (value?.turnId !== activeTurnId) return undefined;
@@ -41,6 +44,7 @@ export async function createManagedBrowserVoice(agent, voice, options = {}) {
   }
 
   return {
+    parallelStartup: true,
     async start() {
       const started = await startManagedRealtime(agent, voiceSessionId, startOperationId);
       raw.start(JSON.stringify(started.context));
@@ -63,7 +67,15 @@ export async function createManagedBrowserVoice(agent, voice, options = {}) {
     requiresAgentAdmission: (payload) => raw.requiresAgentAdmission(payload),
     async realtimeMessage(payload) {
       const update = JSON.parse(raw.realtimeMessage(payload));
+      if (update.prefetch) {
+        clearTimeout(prefetchTimer);
+        prefetchTimer = setTimeout(() => {
+          void prefetchManagedRealtime(agent, voiceSessionId, update.prefetch.query,
+            AbortSignal.any([prefetchAbort.signal, AbortSignal.timeout(10_000)])).catch(() => {});
+        }, update.prefetch.debounce_ms);
+      }
       if (typeof update.delegation === "string" && update.delegation.trim()) {
+        clearTimeout(prefetchTimer);
         const delegationId = managedDelegationId(payload);
         let operationId = delegationId && delegationOperations.get(delegationId);
         if (!operationId) {
@@ -99,6 +111,8 @@ export async function createManagedBrowserVoice(agent, voice, options = {}) {
     },
     flush: (finalChunk) => raw.flush(finalChunk),
     async stop() {
+      clearTimeout(prefetchTimer);
+      prefetchAbort.abort();
       const update = JSON.parse(raw.stop());
       let routeFailure;
       if (typeof update.delegation === "string" && update.delegation.trim()) {
@@ -134,7 +148,7 @@ export async function createManagedBrowserVoice(agent, voice, options = {}) {
       return true;
     },
     preferredPhysicalInput: (current, labels) => raw.preferredPhysicalInput(current, labels),
-    free: () => raw.free(),
+    free: () => { clearTimeout(prefetchTimer); prefetchAbort.abort(); raw.free(); },
   };
 }
 

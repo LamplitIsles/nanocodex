@@ -72,8 +72,8 @@ export function create(agent, options = {}) {
 
   function observeAgentEvents(active) {
     if (managed) {
-      releaseEvents = observeManagedAgentEvents(agent, ({ event, turnId }) => (
-        active.observe({ type: "event", target, event, turnId })
+      releaseEvents = observeManagedAgentEvents(agent, ({ event, turnId, cursor }) => (
+        active.observe({ type: "event", target, event, turnId, cursor })
       ));
       return;
     }

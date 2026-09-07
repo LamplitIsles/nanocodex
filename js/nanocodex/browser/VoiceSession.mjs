@@ -72,6 +72,7 @@ export class SpeakerPlayback {
 export class BrowserVoiceSession {
   #options;
   #core;
+  #admission;
   #peer;
   #channel;
   #sideband;
@@ -118,29 +119,39 @@ export class BrowserVoiceSession {
       else this.#microphone = microphone;
       return microphone;
     });
-    // Admission/WASM and browser negotiation are independent until callBody.
-    // Observe both immediately so a denied microphone cannot reject unhandled
-    // while a slow controller or agent admission is still pending.
-    const coreStartup = Promise.resolve(this.#options.core).then(async (core) => {
+    const coreReady = Promise.resolve(this.#options.core).then(async (core) => {
       if (this.#closed || this.#closing.signal.aborted) { core.free(); return; }
       this.#core = core;
       await this.#options.beforeAgentTurn?.();
       if (this.#closed || this.#closing.signal.aborted) return;
-      await core.start();
       return core;
     });
-    let core, media;
+    // Managed Rust can deliver authoritative context after SDP negotiation.
+    // Start both immediately, but fence incoming control events on admission.
+    const coreStartup = coreReady.then(async (core) => {
+      await core?.start();
+      return core;
+    });
+    this.#admission = coreStartup;
+    const connection = this.#connect(coreReady, coreStartup, microphoneCapture);
     try {
-      [core, media] = await Promise.all([coreStartup, this.#prepareMedia(microphoneCapture)]);
+      await Promise.all([coreStartup, connection]);
     } catch (cause) {
       this.#closing.abort();
       this.#stopBrowserIo();
-      // A late admission must settle before stop/free can touch its controller.
-      await coreStartup.catch(() => {});
+      // Neither late admission nor negotiation can revive disposed resources.
+      await Promise.allSettled([coreStartup, connection]);
       if (this.#closed) return;
       throw cause;
     }
-    if (this.#closed || !core || !media) return;
+  }
+
+  async #connect(coreReady, coreStartup, microphoneCapture) {
+    const [core, media] = await Promise.all([
+      coreReady.then((core) => core?.parallelStartup ? core : coreStartup),
+      this.#prepareMedia(microphoneCapture),
+    ]);
+    if (this.#closed || this.#closing.signal.aborted || !core || !media) return;
     const { peer, sdp } = media;
 
     const call = new AbortController();
@@ -377,6 +388,8 @@ export class BrowserVoiceSession {
     sideband.addEventListener("message", (event) => {
       if (!this.#closed && generation === this.#sidebandGeneration) {
         this.#applyLive(async () => {
+          await this.#admission;
+          if (this.#closed || generation !== this.#sidebandGeneration) return;
           if (await this.#core.requiresAgentAdmission(event.data)) {
             // Only delegations wait for durable admission. Speech deltas and
             // agent output must continue while that independent request waits.
@@ -395,11 +408,12 @@ export class BrowserVoiceSession {
       const connectedMs = Math.max(0, Date.now() - this.#sidebandOpenedAt);
       this.#applyLive(() => this.#core.sidebandClosed(Math.min(connectedMs, 0xffff_ffff)));
     });
-    await waitForWebSocket(sideband, this.#closing.signal);
+    await Promise.all([waitForWebSocket(sideband, this.#closing.signal), this.#admission]);
     if (this.#closed || generation !== this.#sidebandGeneration) {
       sideband.close();
       return;
     }
+    if (sideband.readyState !== WebSocket.OPEN) throw new Error("voice control connection closed during admission");
     opened = true;
     this.#sidebandOpenedAt = Date.now();
     await this.#applyLive(() => this.#core.sidebandOpened());

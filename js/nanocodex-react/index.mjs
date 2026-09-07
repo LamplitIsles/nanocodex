@@ -14,6 +14,7 @@ import {
 import { Actions } from "nanocodex/browser";
 
 export { createConfig } from "nanocodex/browser";
+export * as Voice from "nanocodex/browser/voice";
 
 const NanocodexContext = createContext(null);
 const IDLE_AGENT_SNAPSHOT = Object.freeze({
