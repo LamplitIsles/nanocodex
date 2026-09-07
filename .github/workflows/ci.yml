@@ -182,6 +182,7 @@ jobs:
         run: |
           pnpm --filter @nanocodex/x-api run typecheck
           pnpm --filter @nanocodex/x-api run test
+          pnpm --filter nanocodex-managed-service run prepare:code-evaluator
           pnpm --filter nanocodex-managed-service exec vitest run test/account-info.test.ts test/default-mcp.test.ts test/startup-context.test.ts
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
