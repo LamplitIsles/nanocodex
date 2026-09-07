@@ -1,25 +1,37 @@
 import Foundation
 
-public struct AgentCard: Identifiable, Sendable {
+public struct AgentCard: Identifiable, Equatable, Sendable {
     public let id: String
     public var title: String
     public var updatedAt: Double
     public var turnCount: Int
+    /// False only when the service knows this conversation has no schedules.
+    public var mayHaveScheduledJobs: Bool
     public var activeTurns: [String] = []
     public var stateCursor: Cursor = .zero
     public var latestCursor: Cursor = .zero
     public var status = "Checking"
     public var model = ""
     private var previewCursor: Cursor = .zero
-    public var preview = "Loading the latest update…"
+    public var preview = ""
+    /// Keep the visible exchange together while the focused transcript reloads.
+    /// Retain at most the latest user message and reply, not every card's history.
+    public private(set) var previewRows: [TranscriptRow] = []
     public var checked = false
     public var error: String?
-    public init(id: String, title: String, updatedAt: Double = 0, turnCount: Int = 0) {
+    public init(id: String, title: String, updatedAt: Double = 0, turnCount: Int = 0, mayHaveScheduledJobs: Bool = true) {
         self.id = id; self.title = title; self.updatedAt = updatedAt; self.turnCount = turnCount
+        self.mayHaveScheduledJobs = mayHaveScheduledJobs
     }
     public var isRunning: Bool { !activeTurns.isEmpty }
     public func needsAttention(seen: Cursor?) -> Bool {
         checked && !isRunning && latestCursor > (seen ?? .zero) && (status == "Ready" || status == "Failed")
+    }
+    public func isInInbox(seen: Cursor?, deferred: Cursor?) -> Bool {
+        if let deferred, latestCursor <= deferred { return false }
+        // A roster entry alone is not an inbox update. Keep failed initial
+        // reads reachable so the user can retry instead of hiding the error.
+        return isRunning || (!checked && error != nil) || latestCursor > (seen ?? .zero)
     }
     public mutating func apply(state: JSON) throws {
         guard let cursor = Cursor(rawValue: state["latest_event_cursor"].string), state["agent_id"].string == id,
@@ -32,7 +44,7 @@ public struct AgentCard: Identifiable, Sendable {
         if isRunning { status = "Running" }
         else if status == "Running" || status == "Checking" { status = "Idle" }
     }
-    public mutating func apply(events: [AgentEvent]) {
+    public mutating func apply(events: [AgentEvent], transcriptRows: [TranscriptRow]? = nil) {
         for event in events {
             latestCursor = max(latestCursor, event.cursor)
             // A state read may already include these events. It owns active-turn
@@ -47,9 +59,16 @@ public struct AgentCard: Identifiable, Sendable {
             }
         }
         if isRunning { status = "Running" }
-        if let position = events.last?.cursor, position >= previewCursor,
-           let row = transcript(events).last(where: { $0.role != "You" && !$0.text.isEmpty }) {
-            previewCursor = position; preview = String(row.text.suffix(1400))
+        if let position = events.last?.cursor, position >= previewCursor {
+            let rows = transcriptRows ?? transcript(events)
+            let user = rows.lastIndex(where: { $0.role == "You" })
+            let reply = rows.dropFirst(user.map { $0 + 1 } ?? 0)
+                .last(where: { $0.role == "Agent" && $0.phase != "commentary" && $0.agentID == nil && !$0.text.isEmpty })
+            previewRows = [user.map { rows[$0] }, reply].compactMap { $0 }
+            previewCursor = position
+            // A partial history page may contain only internal activity.
+            // Use the same user-facing reply policy as the full card.
+            preview = reply.map { String($0.text.suffix(1400)) } ?? ""
         }
     }
 }

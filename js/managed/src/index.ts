@@ -220,6 +220,7 @@ import {
   isUserId,
   listAgents,
   recordAgentActivity,
+  recordAgentCronPresence,
   requireSameOriginMutation,
   routeAccountRequest,
   type AccountAuthEnv,
@@ -1331,6 +1332,32 @@ async function managedFetch(
         new Request(request, { headers }),
       );
     }
+    if (url.pathname === "/v1/account/hands") {
+      if (url.search !== "") return json({ error: "invalid_request" }, { status: 400 });
+      if (request.method !== "GET") return json({ error: "method_not_allowed" }, { status: 405 });
+      const principal = trustedAgentPrincipal ?? await authenticate(request, env, url);
+      if (!principal) return json({ error: "unauthorized" }, { status: 401 });
+      if (principal.connectGrant || !principal.capabilities.includes("agents:read")
+        || !principal.capabilities.includes("tools:use")) {
+        return json({ error: "forbidden" }, { status: 403 });
+      }
+      const response = await env.NANOCODEX_ACCOUNT_TOOLS.getByName(principal.userId).fetch(
+        "https://account-tools.internal/snapshot", {
+          method: "POST", body: JSON.stringify({ owner_id: principal.userId }),
+        },
+      );
+      if (response.status === 404) return json({ data: [] }, { headers: { "cache-control": "no-store" } });
+      if (!response.ok) return json({ error: "hands_unavailable" }, { status: 503 });
+      const snapshot = await response.json<{ machines: Array<{ machine: {
+        id: string; name: string; capabilities: readonly string[];
+      } }> }>();
+      // Expose only the public machine projection, never routing tokens, tool
+      // credentials, or the host's physical workspace path.
+      return json({ data: snapshot.machines.map(({ machine }) => ({
+        id: machine.id, name: machine.name, workspace: machineMountRoot(machine.id),
+        capabilities: machine.capabilities,
+      })) }, { headers: { "cache-control": "no-store" } });
+    }
     if (request.method === "GET" && url.pathname === "/v1/agents") {
       const principal = trustedAgentPrincipal ?? await authenticate(request, env, url);
       if (!principal) return json({ error: "unauthorized" }, { status: 401 });
@@ -1343,6 +1370,7 @@ async function managedFetch(
           created_at: summary.createdAt,
           updated_at: summary.updatedAt,
           turn_count: summary.turnCount,
+          ...(principal.connectGrant ? {} : { may_have_scheduled_jobs: summary.mayHaveScheduledJobs }),
         }])),
       });
     }
@@ -2497,9 +2525,10 @@ export class DurableAgentSession extends DurableComputerSession {
   #realtimeEventBuffer?: AgentEvent[];
   #realtimeRouteTail: Promise<void> = Promise.resolve();
   readonly #cronTriggers: CronTriggers;
+  #cronPresencePublished?: boolean;
   readonly #startupContext: ManagedStartupContext;
-  #attachments?: SessionAttachments;
   #settingsMutationTail: Promise<void> = Promise.resolve();
+  #attachments?: SessionAttachments;
   readonly #settingsRequests = new Set<Promise<Response>>();
   #recoveryTask?: Promise<void>;
   #recoveryRequested = false;
@@ -2905,6 +2934,7 @@ export class DurableAgentSession extends DurableComputerSession {
           ownership.owner_id,
           ownership.session_id,
           this.#ownershipIoTimeoutMs(),
+          this.#cronTriggers.list().length > 0,
         ));
       } catch {
         return new Response(null, { status: 503 });
@@ -3564,6 +3594,7 @@ export class DurableAgentSession extends DurableComputerSession {
       asserted.ownerId,
       sessionId,
       this.#ownershipIoTimeoutMs(),
+      this.#cronTriggers.list().length > 0,
     ));
     this.ctx.waitUntil(registration.catch((error) => {
       console.warn({
@@ -4230,7 +4261,13 @@ export class DurableAgentSession extends DurableComputerSession {
     const id = path === "/triggers" ? undefined : path.slice("/triggers/".length);
     if (id !== undefined && !CRON_TRIGGER_ID.test(id)) return json({ error: "invalid_trigger_id" }, { status: 400 });
     if (request.method === "GET") {
-      if (id === undefined) return json({ data: this.#cronTriggers.list().map((row) => cronTriggerView(row, session.session_id)) });
+      if (id === undefined) {
+        const rows = this.#cronTriggers.list();
+        // Lazy backfill for pre-index agents. Failure leaves them candidates, so
+        // discovery stays correct and schedule reads remain available.
+        try { await this.#publishCronPresence(rows.length > 0); } catch { /* retry on the next read */ }
+        return json({ data: rows.map((row) => cronTriggerView(row, session.session_id)) });
+      }
       const row = this.#cronTriggers.get(id);
       return row ? json(cronTriggerView(row, session.session_id)) : json({ error: "not_found" }, { status: 404 });
     }
@@ -4263,6 +4300,16 @@ export class DurableAgentSession extends DurableComputerSession {
     return authorization;
   }
 
+  async #publishCronPresence(present: boolean): Promise<void> {
+    if (this.#cronPresencePublished === true || this.#cronPresencePublished === present) return;
+    const session = this.#session();
+    if (!session) throw new Error("cron discovery requires an initialized agent");
+    await recordAgentCronPresence(this.env, session.owner_id, session.session_id, present);
+    // An empty backfill may finish after a create. Neither side may demote true.
+    if (present) this.#cronPresencePublished = true;
+    else this.#cronPresencePublished ??= false;
+  }
+
   async #saveCronTrigger(
     id: string,
     config: CronTriggerConfig,
@@ -4275,6 +4322,9 @@ export class DurableAgentSession extends DurableComputerSession {
     }
     const encodedAuthorization = JSON.stringify(authorization);
     const hash = await hashManagedInput(config.input);
+    // Publish before persisting: a failed write may leave an extra candidate,
+    // but a committed schedule can never be omitted from account discovery.
+    await this.#publishCronPresence(true);
     this.#assertDurabilityAdmissionActive();
     if (this.#deleting || this.#deleted) {
       throw new ManagedRequestError(409, "agent_deleting", "agent is being deleted");

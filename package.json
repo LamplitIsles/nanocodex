@@ -21,7 +21,8 @@
     "deploy:chief-of-staff": "pnpm --filter @nanocodex/chief-of-staff run deploy",
     "deploy:connect-playground": "turbo run build --filter=@nanocodex/connect-playground && pnpm --filter @nanocodex/connect-playground run deploy",
     "deploy:account": "turbo run build --filter=nanocodex-web && pnpm --filter nanocodex-web run deploy",
-    "build:macos": "pnpm --filter @nanocodex/desktop-runtime run build && xcodebuild -project macos/Nanocodex.xcodeproj -scheme Nanocodex -configuration Release -derivedDataPath macos/build build"
+    "build:macos": "pnpm build:voice-core && pnpm --filter @nanocodex/desktop-runtime run build && xcodebuild -project macos/Nanocodex.xcodeproj -scheme Nanocodex -configuration Release -derivedDataPath macos/build build",
+    "build:voice-core": "bash apple/NanocodexVoice/scripts/build-core.sh"
   },
   "devDependencies": {
     "portless": "0.15.6",

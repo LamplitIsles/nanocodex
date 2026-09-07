@@ -25,12 +25,29 @@ struct SettingsView: View {
                         Button("Sign In…") { switchingAccount = true }.buttonStyle(.borderedProminent).tint(.primary)
                     }
                 }
+                Section("Background Hands") {
+                    Toggle("Make this Mac available as a Hand", isOn: Binding(get: { model.state.defaultHandEnabled != false }, set: { enabled in Task { await model.setDeviceHandEnabled(enabled) } }))
+                        .disabled(!model.state.connected).accessibilityIdentifier("device-hand-enabled")
+                    Toggle("Keep Mac awake while Hands are running", isOn: $model.keepMacAwake)
+                        .accessibilityIdentifier("keep-mac-awake")
+                    Text("Hands keep running when you close the window. Open Nanocodex or quit from the menu bar.")
+                    Text("Keeping awake prevents idle sleep and uses more battery. The display can turn off; closing the lid or choosing Sleep can still suspend Hands.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
                 Section("Appearance") {
                     Picker("Tabs", selection: $model.tabPosition) { Text("Sidebar").tag("left"); Text("Top").tag("top") }.pickerStyle(.segmented).onChange(of: model.tabPosition) { model.persistLayout() }
                     Picker("Theme", selection: $model.theme) { Text("System").tag("system"); Text("Light").tag("light"); Text("Dark").tag("dark") }.onChange(of: model.theme) { model.persistLayout() }
                 }
                 Section("Keyboard shortcuts") {
                     shortcut("New tab", keys: "⌘ T")
+                    shortcut("New agent to the right", keys: "⌘ \\")
+                    shortcut("Open existing agent to the right", keys: "⌘ ⇧ \\")
+                    shortcut("Leave composer / Start writing", keys: "Esc / ↩")
+                    shortcut("Navigate between agents", keys: "Tab / ⇧ Tab / Arrows")
+                    shortcut("Previous / Next agent", keys: "⌘ ⌥ ← / →")
+                    shortcut("Move pane left / right", keys: "⌘ ⌥ ⇧ ← / →")
+                    shortcut("Focus agent / Resume layout", keys: "⌘ ⇧ F")
+                    shortcut("Seen / Later", keys: "⌘ D / ⌘ ⇧ D")
                     shortcut("Find a thread", keys: "⌘ K")
                     shortcut("Send / New line", keys: "↩ / ⇧ ↩")
                     shortcut("Reopen closed tab", keys: "⌘ ⇧ T")

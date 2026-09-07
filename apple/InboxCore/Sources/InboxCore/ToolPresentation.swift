@@ -13,7 +13,11 @@ public struct ToolPresentation: Codable, Equatable, Sendable {
     public var status: String
     public var input: [ToolField]
     public var output: [ToolField] = []
-    private var terminalCommand: Bool?
+    var terminalCommand: Bool?
+    /// Both wire representations can contain distinct generated attachments.
+    /// Optional fields keep previously persisted transcripts decodable.
+    public var generatedResults: [String]?
+    public var generatedIncludesText: Bool?
 
     public init(name: String, arguments: JSON, metadata: JSON = .null) {
         var family = metadata["tool_name"].string
@@ -22,6 +26,7 @@ public struct ToolPresentation: Codable, Equatable, Sendable {
         if family.hasPrefix("mcp__") { family = family.components(separatedBy: "__").dropFirst(2).joined(separator: "_") }
         if family.hasPrefix("functions.") { family = String(family.dropFirst(10)) }
         terminalCommand = ["exec_command", "write_stdin"].contains(family)
+        generatedIncludesText = ["exec", "wait"].contains(family)
         let names = [
             "exec": "Run code", "exec_command": "Run command", "sandbox_exec": "Run command",
             "write_stdin": "Command progress",
@@ -44,8 +49,16 @@ public struct ToolPresentation: Codable, Equatable, Sendable {
         status = "Running"
     }
 
-    public mutating func finish(_ value: JSON, failed: Bool = false, state: String = "", metadata: JSON = .null, elapsedSeconds: Double? = nil) {
+    public mutating func finish(_ value: JSON, failed: Bool = false, state: String = "", metadata: JSON = .null, rawResult: JSON = .null, elapsedSeconds: Double? = nil) {
         let result = Self.decoded(value)
+        var retained: [String] = [], bytes = 0
+        let encoder = JSONEncoder(); encoder.outputFormatting = [.withoutEscapingSlashes, .sortedKeys]
+        for candidate in [value, rawResult] where candidate != .null {
+            guard let data = try? encoder.encode(candidate), let text = String(data: data, encoding: .utf8), !retained.contains(text) else { continue }
+            if bytes + data.count <= 16 * 1024 * 1024 { retained.append(text); bytes += data.count }
+            else { retained.append("{\"type\":\"unsupported\",\"title\":\"Large generated output\"}") }
+        }
+        generatedResults = retained.isEmpty ? nil : retained
         let exitFailed: Bool
         if case .number(let code) = result["exit_code"] { exitFailed = code != 0 } else { exitFailed = false }
         let hasError = result["error"] != .null && result["error"] != .bool(false) && result["error"] != .string("")
@@ -53,7 +66,8 @@ public struct ToolPresentation: Codable, Equatable, Sendable {
         let processRunning = terminalCommand == true && result["session_id"] != .null && result["exit_code"] == .null
         status = state == "cancelled" ? "Stopped" : isFailure ? "Failed" : processRunning ? "Running" : "Completed"
         if !metadata["tool_name"].string.isEmpty || !metadata["toolName"].string.isEmpty {
-            title = ToolPresentation(name: "", arguments: .null, metadata: metadata).title
+            let presentation = ToolPresentation(name: "", arguments: .null, metadata: metadata)
+            title = presentation.title; generatedIncludesText = presentation.generatedIncludesText
         }
         var displayedResult = result
         if terminalCommand == true, case .object(var fields) = result {
@@ -66,6 +80,12 @@ public struct ToolPresentation: Codable, Equatable, Sendable {
         }
         output = Self.fields(displayedResult, label: "Result")
         if output.isEmpty { output = [.init(label: "Result", value: isFailure ? "The action failed without an error message." : "No output returned.")] }
+    }
+
+    mutating func applyCompletion(_ result: Self, metadata: JSON) {
+        status = result.status; output = result.output; generatedResults = result.generatedResults
+        generatedIncludesText = generatedIncludesText == true || result.generatedIncludesText == true
+        if !metadata["tool_name"].string.isEmpty || !metadata["toolName"].string.isEmpty { title = result.title }
     }
 
     public static func humanize(_ value: String) -> String {
@@ -89,8 +109,9 @@ public struct ToolPresentation: Codable, Equatable, Sendable {
         case .number(let number): return [.init(label: label, value: String(number).replacingOccurrences(of: "\\.0$", with: "", options: .regularExpression))]
         case .string(let text):
             guard !text.isEmpty else { return [] }
-            if text.hasPrefix("data:") { return [.init(label: label, value: "Embedded attachment")] }
-            return [.init(label: label, value: text, code: ["Command", "Code", "Output", "Error output", "Patch"].contains(label))]
+            if text.lowercased().hasPrefix("data:") { return [.init(label: label, value: "Embedded attachment")] }
+            let readable = text.replacingOccurrences(of: #"data:[^\s\)\]\"<>]+"#, with: "[embedded attachment]", options: [.regularExpression, .caseInsensitive])
+            return [.init(label: label, value: readable, code: ["Command", "Code", "Output", "Error output", "Patch"].contains(label))]
         case .array(let items):
             return items.enumerated().flatMap { index, item -> [ToolField] in
                 let itemLabel = items.count == 1 ? label : "\(label) · \(index + 1)"
@@ -103,17 +124,17 @@ public struct ToolPresentation: Codable, Equatable, Sendable {
         case .object(let object):
             // Binary content is described, never printed as base64 in a transcript.
             let kind = object["type"]?.string ?? ""
-            if ["image", "audio", "input_audio", "image_url"].contains(kind) {
+            if ["image", "input_image", "audio", "input_audio", "output_audio", "video", "input_video", "image_url"].contains(kind) {
                 return [.init(label: humanize(kind), value: object["name"]?.string.isEmpty == false ? object["name"]!.string : "\(humanize(kind)) attachment")]
             }
-            if kind == "text", let text = object["text"] { return fields(text, label: label) }
+            if ["text", "input_text", "output_text"].contains(kind), let text = object["text"] { return fields(text, label: label) }
             let labels = ["cmd": "Command", "command": "Command", "stdout": "Output", "stderr": "Error output",
                           "workdir": "Folder", "cwd": "Folder", "exit_code": "Exit code", "file_path": "File", "elapsed_seconds": "Elapsed (seconds)",
                           "is_error": "Failed", "isError": "Failed", "uri": "Location", "url": "Link"]
             return object.keys.sorted().flatMap { key -> [ToolField] in
                 let field = labels[key] ?? humanize(key)
                 let child = object[key]!
-                if key == "data", object["mimeType"] != nil || object["mime_type"] != nil {
+                if key == "blob" || (key == "data" && (object["mimeType"] != nil || object["mime_type"] != nil)) {
                     return [.init(label: "Attachment", value: "Embedded file")]
                 }
                 if case .object = decoded(child) {

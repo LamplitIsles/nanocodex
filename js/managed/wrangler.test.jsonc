@@ -34,6 +34,10 @@
       {
         "name": "NANOCODEX_SESSIONS",
         "class_name": "DurableAgentSession"
+      },
+      {
+        "name": "NANOCODEX_USERS",
+        "class_name": "UserAccount"
       }
     ]
   },
@@ -53,6 +57,10 @@
     {
       "tag": "vm-host-pool-v1",
       "new_sqlite_classes": ["VmHostPool"]
+    },
+    {
+      "tag": "user-account-test-v1",
+      "new_sqlite_classes": ["UserAccount"]
     }
   ]
 }

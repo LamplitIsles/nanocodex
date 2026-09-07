@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 import { test } from "node:test";
+import { WebSocketServer } from "ws";
 import { DesktopRuntime, managedOrigin, validateHand, validateSettings, compareCursor, restoredLayout } from "../src/runtime.mjs";
 import { desktopPreferences } from "../src/configuration.mjs";
 
@@ -33,6 +34,104 @@ test("service origins cannot redirect credentials or embed paths", () => {
   assert.equal(managedOrigin("https://nanocodex.gakonst.workers.dev"), "https://nanocodex.gakonst.workers.dev");
   assert.equal(managedOrigin("http://127.0.0.1:8787"), "http://127.0.0.1:8787");
   for (const origin of ["http://remote.example", "https://user:password@example.com", "https://example.com/api", "https://example.com?key=secret"]) assert.throws(() => managedOrigin(origin));
+});
+test("account discovery retains offline devices and fences account changes", async t => {
+  const phone = { id: "ios-phone", name: "iPhone", workspace: "/ios-phone", capabilities: ["native", "background_limited"] };
+  let devices = [phone], stalled;
+  const requested = deferred();
+  const baseUrl = await service(t, (request, response) => {
+    if (request.url === "/v1/account/hands") {
+      if (stalled) { stalled = response; requested.resolve(); return; }
+      response.end(JSON.stringify({ data: devices }));
+    } else response.end(JSON.stringify({ data: [] }));
+  });
+  let saved;
+  const runtime = new DesktopRuntime({ baseUrl, apiKey: key, persist: async value => { saved = value; } });
+  t.after(() => runtime.close());
+  await runtime.refresh(); await runtime.refreshAccountHands();
+  assert.equal(runtime.state().accountHands[0].status, "connected");
+  assert.equal(saved.accountHands[0].status, "offline", "Disk must never assert current presence");
+  devices = []; await runtime.refreshAccountHands();
+  assert.equal(runtime.state().accountHands[0].status, "offline");
+  stalled = true;
+  const pending = runtime.refreshAccountHands(); await requested.promise;
+  await runtime.connect({ baseUrl, apiKey: secondKey });
+  stalled.end(JSON.stringify({ data: [phone] })); await pending;
+  assert.deepEqual(runtime.state().accountHands, [], "Late discovery cannot cross accounts");
+  assert.deepEqual(saved.accountHands, []);
+});
+test("default Hand preparation creates its workspace once and reconnects the saved Hand", { timeout: 15_000 }, async t => {
+  const path = await directory(t);
+  const server = createServer((_request, response) => { response.setHeader("content-type", "application/json"); response.end(JSON.stringify({ data: [] })); });
+  const sockets = new WebSocketServer({ server });
+  let catalogs = 0;
+  sockets.on("connection", socket => socket.on("message", data => {
+    const frame = JSON.parse(String(data));
+    if (frame.type === "catalog") { catalogs++; socket.send(JSON.stringify({ type: "ready" })); }
+    if (frame.type === "ping") socket.send(JSON.stringify({ type: "pong", nonce: frame.nonce }));
+    if (frame.type === "drain") socket.send(JSON.stringify({ type: "draining" }));
+  }));
+  server.listen(0, "127.0.0.1"); await once(server, "listening");
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  let saved;
+  const runtime = new DesktopRuntime({ baseUrl, apiKey: key, defaults: { name: "Test Mac", workspace: join(path, "automatic") }, persist: async value => { saved = structuredClone(value); } });
+  t.after(async () => { await runtime.close(); for (const socket of sockets.clients) socket.terminate(); sockets.close(); await new Promise(resolve => server.close(resolve)); });
+  await runtime.refresh();
+  const [first, duplicate] = await Promise.all([runtime.prepareDefaultHand(), runtime.prepareDefaultHand()]);
+  assert.equal(first.id, duplicate.id);
+  assert.equal(first.status, "connected");
+  assert.equal(first.agentId, undefined);
+  assert.equal(runtime.state().hands.length, 1);
+  assert.equal(catalogs, 1);
+  assert.equal((await stat(join(path, "automatic"))).isDirectory(), true);
+  await runtime.close();
+  const restored = new DesktopRuntime({ baseUrl, apiKey: key, saved, persist: async value => { saved = structuredClone(value); } });
+  try {
+    await restored.refresh();
+    const reconnected = await restored.prepareDefaultHand();
+    assert.equal(reconnected.id, first.id);
+    assert.equal(reconnected.status, "connected");
+    assert.equal(catalogs, 2);
+    await restored.stopHand(first.id);
+    assert.equal(saved.defaultHandEnabled, false);
+    assert.equal(await restored.prepareDefaultHand(), null);
+    await restored.refresh();
+    assert.equal(await restored.prepareDefaultHand(), null);
+    assert.equal(catalogs, 2, "A reconnect must preserve an explicit disable");
+    const disabled = new DesktopRuntime({ baseUrl, apiKey: key, saved });
+    try {
+      await disabled.refresh();
+      assert.equal(await disabled.prepareDefaultHand(), null);
+      await disabled.setDefaultHandEnabled(true);
+      assert.equal((await disabled.prepareDefaultHand()).id, first.id);
+      await disabled.stopHand(first.id);
+      const folder = await disabled.prepareFolderHand({ agentId: "folder-test", workspace: first.workspace });
+      assert.notEqual(folder.id, first.id);
+      assert.equal(folder.agentId, "folder-test");
+      assert.equal(disabled.state().defaultHandEnabled, false, "A chosen folder must not re-enable the account Hand");
+      await disabled.removeHand(first.id);
+      assert.equal(await disabled.prepareDefaultHand(), null, "Removing the automatic Hand must not recreate it");
+    } finally { await disabled.close(); }
+    await restored.disconnect();
+    assert.deepEqual(restored.state().hands, []);
+  } finally { await restored.close(); }
+});
+test("disabling during automatic workspace creation prevents attachment", { timeout: 10_000 }, async t => {
+  const path = await directory(t);
+  const saving = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  const runtime = new DesktopRuntime({ baseUrl: await service(t), apiKey: key, defaults: { workspace: join(path, "automatic") }, persist: async value => {
+    if (value.hands.length && value.defaultHandEnabled) { saving.resolve(); await release.promise; }
+  } });
+  t.after(() => runtime.close());
+  await runtime.refresh();
+  const preparing = runtime.prepareDefaultHand();
+  await saving.promise;
+  await runtime.setDefaultHandEnabled(false);
+  release.resolve();
+  assert.equal(await preparing, null);
+  assert.equal(runtime.state().hands[0].status, "stopped");
+  assert.equal(await runtime.prepareDefaultHand(), null);
 });
 test("Astra accepts its supported settings and rejects None or Pro", () => {
   const settings = { model: "gpt-6-astra", thinking: "high", reasoning_mode: "standard", fast_mode: false };
@@ -250,6 +349,8 @@ test("saved drafts and Hand grants are private and account scoped", async t => {
   assert.equal((await stat(join(path, "desktop.json"))).mode & 0o777, 0o600);
   assert.deepEqual((await desktopPreferences({ directory: path, apiKey: key })).saved, preferences);
   assert.deepEqual((await desktopPreferences({ directory: path, apiKey: secondKey })).saved, {});
+  await first.persist({ ...preferences, defaultHandEnabled: false });
+  assert.deepEqual((await desktopPreferences({ directory: path, apiKey: secondKey })).saved, { defaultHandEnabled: false }, "The device opt-out follows account switches without carrying private grants or drafts");
 });
 test("VM readiness can exceed 60 seconds and stopping cancels pending setup", { timeout: 90_000 }, async t => {
   const path = await directory(t);
@@ -330,4 +431,83 @@ test("streamed completed-turn detail survives beyond 4096 events", { timeout: 10
   assert.equal(snapshot.events.length, 4200);
   assert.equal(snapshot.events[0].data.event.payload.text, "detail-0");
   assert.equal(snapshot.events.at(-1).data.event.payload.text, "detail-4199");
+});
+
+
+test("native workspace review and sizing survive persistence without changing legacy layouts", async t => {
+  let saved;
+  const runtime = new DesktopRuntime({ baseUrl: await service(t), apiKey: key, persist: async value => { saved = value; } });
+  t.after(() => runtime.close());
+  const layout = { tabs: [{ id: "one", draft: "retained", seenCursor: "9007199254740993", deferredCursor: "9007199254740994" }], activeTabId: "one", tabPosition: "left", theme: "system", workspaceMode: "single", paneWidth: 0, tiledTabIDs: ["one", "one", "missing"] };
+  await runtime.saveLayout(layout);
+  const restored = restoredLayout(saved.layout);
+  assert.equal(restored.tabs[0].seenCursor, "9007199254740993");
+  assert.equal(restored.tabs[0].deferredCursor, "9007199254740994");
+  assert.equal(restored.workspaceMode, "single");
+  assert.equal(restored.paneWidth, 0);
+  assert.deepEqual(restored.tiledTabIDs, ["one"]);
+  assert.equal(restoredLayout({ ...layout, paneWidth: 10000 }).paneWidth, 880);
+  assert.equal(restoredLayout({ ...layout, paneWidth: 100 }).paneWidth, 420);
+  assert.equal(restoredLayout({ ...layout, paneWidth: "secret", workspaceMode: "unknown" }).paneWidth, undefined);
+  assert.equal(restoredLayout({ ...layout, tabs: [{ id: "one", deferredCursor: "invalid" }] }).tabs[0].deferredCursor, undefined);
+  const legacy = restoredLayout({ tabs: [{ id: "one" }], tabPosition: "top" });
+  assert.equal(legacy.workspaceMode, undefined);
+  assert.equal(legacy.paneWidth, undefined);
+});
+
+test("durable queued messages retain their exact retry payload and account scope", async t => {
+  let saved;
+  const runtime = new DesktopRuntime({ baseUrl: await service(t), apiKey: key, persist: async value => { saved = value; } });
+  t.after(() => runtime.close());
+  const message = { id: "follow-up", tabID: "one", agentID: "agent", text: "Change direction", prompt: "Change direction\n\n[Selected Hand: captured]", predecessor: "current", phase: "queued", acceptedCursor: "9007199254740993", target: "hand", folder: "", settings: { model: "gpt-6-astra", thinking: "high", reasoning_mode: "standard", fast_mode: false } };
+  const layout = { tabs: [{ id: "one" }], activeTabId: "one", theme: "system", tabPosition: "left", pendingMessages: [message] };
+  await runtime.saveLayout(layout);
+  assert.deepEqual(restoredLayout(saved.layout).pendingMessages, [message]);
+  await runtime.saveLayout({ ...layout, accountScope: "another-account", pendingMessages: [] });
+  assert.deepEqual(saved.layout.pendingMessages, [message]);
+  assert.deepEqual(restoredLayout({ ...layout, pendingMessages: [message, message, { ...message, id: "bad", acceptedCursor: "not-a-cursor" }] }).pendingMessages, [message]);
+});
+
+test("queued submission and retry use one durable ID; steering cancels only its predecessor", async t => {
+  const requests = [];
+  const baseUrl = await service(t, async (request, response) => {
+    if (request.method !== "POST") { response.end(JSON.stringify({ data: [] })); return; }
+    let body = "";
+    for await (const chunk of request) body += chunk;
+    requests.push({ path: request.url, key: request.headers["idempotency-key"], body: body ? JSON.parse(body) : undefined });
+    response.end(JSON.stringify(request.url.endsWith("/cancel") ? { turn_id: "predecessor", state: "cancelled" } : { turn_id: "queued", state: "queued", cursor: "9007199254740993" }));
+  });
+  const runtime = new DesktopRuntime({ baseUrl, apiKey: key });
+  t.after(() => runtime.close());
+  const message = { agentId: "thread", input: "Use this exact follow-up", requestId: "queued" };
+  await runtime.refresh();
+  const first = await runtime.queuePrompt(message);
+  assert.deepEqual(await runtime.queuePrompt(message), first);
+  assert.equal(first.cursor, "9007199254740993");
+  assert.deepEqual(requests[0], requests[1]);
+  assert.equal(requests[0].key, "queued");
+  assert.deepEqual(requests[0].body, { id: "queued", input: message.input });
+  assert.equal((await runtime.cancel({ agentId: "thread", turnId: "predecessor" })).state, "cancelled");
+  assert.equal(requests.length, 3);
+  assert.equal(requests[2].path, "/v1/agents/thread/turns/predecessor/cancel");
+});
+
+test("replayed acceptance cannot resurrect a turn already finished in the state read", { timeout: 5_000 }, async t => {
+  const accepted = { cursor: "9007199254740993", created_at: 1, turn_id: "finished", type: "turn_accepted", id: "finished", input: "hello" };
+  const received = deferred();
+  const baseUrl = await service(t, (request, response) => {
+    if (request.url.includes("/events/history")) response.end(JSON.stringify({ data: [], latest_cursor: "9007199254740992", has_more: false }));
+    else if (request.url.includes("/events?")) {
+      response.setHeader("content-type", "text/event-stream");
+      response.write(`id: ${accepted.cursor}\nevent: message\ndata: ${JSON.stringify(accepted)}\n\n`);
+    } else response.end(JSON.stringify({ data: [], active_turns: [], latest_event_cursor: "9007199254740994" }));
+  });
+  const runtime = new DesktopRuntime({ baseUrl, apiKey: key });
+  t.after(() => runtime.close());
+  runtime.on("event", event => { if (event.type === "thread" && event.thread.events.length) received.resolve(event.thread); });
+  await runtime.refresh();
+  await runtime.openThread("019a65fe-a456-7000-8000-000000000008");
+  const snapshot = await received.promise;
+  assert.equal(snapshot.cursor, "9007199254740994");
+  assert.deepEqual(snapshot.activeTurns, []);
 });

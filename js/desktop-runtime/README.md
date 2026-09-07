@@ -1,9 +1,10 @@
 # Nanocodex desktop runtime
 
 `@nanocodex/desktop-runtime` owns the managed connection, durable thread event
-observers, preferences, and compute Hand lifecycle shared by the Electron and
-Swift applications. Apps own their native UI, file pickers, OS credential store,
-and packaging. Neither app imports another app's source.
+observers, preferences, and compute Hand lifecycle for the native tiling app in
+[`macos/`](../../macos/README.md). The app owns its native UI, file pickers,
+OS credential store, and packaging. This package is its runtime, not a separate
+desktop app.
 
 `pnpm --filter @nanocodex/desktop-runtime build` bundles `dist/host.mjs` and its
 lazy chunks for a Node 22.13+ host. Copy the complete `dist` directory when
@@ -26,8 +27,8 @@ An unknown action, duplicate pending ID, malformed arguments, or oversized
 request receives an error. Stdout is reserved for this protocol.
 
 The allowlist is `state`, `connect`, `disconnect`, `refresh`, `openThread`,
-`closeThread`, `older`, `createThread`, `prompt`, `steer`, `cancel`, `settings`,
-`saveLayout`, `saveHand`, `prepareFolderHand`, `startHand`, `stopHand`, and
+`closeThread`, `older`, `createThread`, `prompt`, `queuePrompt`, `steer`, `cancel`, `settings`,
+`saveLayout`, `saveHand`, `prepareDefaultHand`, `prepareFolderHand`, `startHand`, `stopHand`, and
 `removeHand`. There is no
 arbitrary fetch, command, filesystem, or subprocess bridge.
 
@@ -47,7 +48,7 @@ deduplicated by durable cursor, and replayed after reconnect. Closing a tab stop
 its observer without canceling its managed agent. Stdin EOF or SIGTERM closes
 every observer and Hand before exiting.
 
-A local Hand runs real native commands in an explicitly selected workspace.
+A local Hand runs real native commands in the default or selected workspace.
 The workspace is a working directory, not an OS sandbox. Native process tools
 support retained pipe sessions and do not inherit API credentials. VM Hands use
 the existing `nanocodex2 hand` CLI and Linux guest runtime. A selected base image
@@ -55,6 +56,12 @@ is cloned to an account-scoped private writable disk; its source is untouched.
 The VM's cache also lives in the app's private directory. A VM is connected only
 after the CLI emits `vm.hand.ready`. Stopping during startup cancels setup and
 closes any partially acquired resources.
+
+`prepareDefaultHand()` reuses the account-wide local Hand, or creates one with
+the default name and workspace, and returns it connected. The native app calls
+this automatically after sign-in and restoration, retrying transient failures.
+Concurrent calls share preparation; account changes invalidate it. Generic
+runtime reads do not start compute.
 
 `prepareFolderHand({ agentId, workspace })` connects a folder when the user sends
 a message in that folder's tab. It reuses an existing eligible Hand or creates a
@@ -70,6 +77,15 @@ helper runs directly.
 
 Optional VM defaults are `NANOCODEX_HAND_BINARY`, `NANOCODEX_VM_ROOTFS`, and
 `NANOCODEX_VM_GUEST_RUNTIME`. Development hosts can also discover the built CLI
-and guest ELF beside `NANOCODEX_ENV_FILE`. Cloud Hands and inventory discovery
-remain ordinary managed agent tool calls through the canonical service; the
-runtime does not invent a separate cloud provisioning API.
+and guest ELF beside `NANOCODEX_ENV_FILE`. Cloud provisioning remains an ordinary
+managed agent tool call through the canonical service.
+
+`refreshAccountHands()` reads the account-owned `/v1/account/hands` catalog.
+The native app polls it every five seconds while connected. These devices are
+separate from locally managed `hands`: they can be selected without creating or
+starting a local process. Observed devices are cached in account-scoped
+preferences and retained offline when absent or discovery fails. Cached entries
+start offline after restart; only a fresh catalog marks them connected. A new
+profile must observe a device connected at least once before retaining it.
+Discovery requests time out and old-account responses cannot publish into a new
+account. The service projection excludes physical paths and routing credentials.

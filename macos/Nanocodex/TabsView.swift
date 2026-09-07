@@ -11,7 +11,7 @@ struct SidebarView: View {
             navButton("Connections", symbol: "link") { model.openAccount() }
             if model.tabPosition == "left" {
                 HStack {
-                    Text("Tabs").font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
+                    Text("Open agents").font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
                     Spacer()
                     Button { model.newTab() } label: { Image(systemName: "plus").font(.system(size: 11)) }.buttonStyle(.plain).help("New tab")
                 }.padding(.horizontal, 10).padding(.top, 26).padding(.bottom, 4)
@@ -68,12 +68,13 @@ struct TabItem: View {
     let horizontal: Bool
     @State private var hovering = false
     var selected: Bool { tab.id == model.activeTabID && model.screen == .chat }
-    var running: Bool { tab.threadId.flatMap { model.snapshots[$0] }.map { !$0.activeTurns.isEmpty } ?? (model.pending[tab.id] != nil) }
+    var running: Bool { tab.threadId.flatMap { model.snapshots[$0] }.map { !$0.activeTurns.isEmpty } ?? (!model.pendingMessages(tab.id).isEmpty) }
     var body: some View {
         HStack(spacing: 7) {
             Button { model.select(tab.id) } label: {
                 HStack(spacing: 8) {
                     if running { ProgressView().controlSize(.mini).frame(width: 13, height: 13) }
+                    else if model.update(for: tab).needsAttention(tab) { Circle().fill(model.update(for: tab).failed ? Color.orange : Color.accentColor).frame(width: 7, height: 7).frame(width: 13) }
                     else { Image(systemName: tab.threadId == nil ? "square.and.pencil" : "bubble.left").font(.system(size: 12)).foregroundStyle(.secondary).frame(width: 13) }
                     Text(model.title(tab)).font(.system(size: 12)).lineLimit(1).truncationMode(.tail)
                     Spacer(minLength: 0)
@@ -94,6 +95,8 @@ struct TabItem: View {
             return true
         }
         .contextMenu {
+            Button("Open Beside") { model.openBeside(tab.id) }.disabled(tab.id == model.activeTabID)
+            Divider()
             Button("Rename Tab…") { model.renameTab(tab) }
             Button("Close Tab") { model.closeTab(tab.id) }
             Button("New Tab") { model.newTab() }
@@ -107,6 +110,7 @@ struct TabItem: View {
 struct ThreadSearchView: View {
     @EnvironmentObject private var model: AppModel
     @State private var query = ""
+    @State private var selectedID: String?
     @FocusState private var focused: Bool
     var filtered: [AgentThread] { model.state.threads.filter { query.isEmpty || $0.title.localizedCaseInsensitiveContains(query) } }
     var body: some View {
@@ -114,12 +118,16 @@ struct ThreadSearchView: View {
             HStack(spacing: 10) {
                 Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
                 TextField("Search threads", text: $query).textFieldStyle(.plain).font(.system(size: 17)).focused($focused).accessibilityIdentifier("search-threads-input")
+                    .onSubmit { if let thread = filtered.first(where: { $0.id == selectedID }) ?? filtered.first { model.open(thread) } }
+                    .onKeyPress(.upArrow) { moveSelection(-1); return .handled }
+                    .onKeyPress(.downArrow) { moveSelection(1); return .handled }
+                    .onChange(of: query) { selectedID = filtered.first?.id }
                 Button("Done") { model.showingSearch = false }.keyboardShortcut(.cancelAction)
             }.padding(20)
             Divider()
             if filtered.isEmpty { ContentUnavailableView(query.isEmpty ? "No threads yet" : "No matching threads", systemImage: "bubble.left.and.bubble.right", description: Text(query.isEmpty ? "Start a new thread to get going." : "Try a different search.")) }
             else {
-                List(filtered) { thread in
+                List(filtered, selection: $selectedID) { thread in
                     Button { model.open(thread) } label: {
                         HStack(spacing: 12) {
                             Image(systemName: "bubble.left").foregroundStyle(.secondary)
@@ -127,9 +135,14 @@ struct ThreadSearchView: View {
                             Spacer()
                             Text(Date(timeIntervalSince1970: thread.updatedAt / 1000), style: .relative).font(.caption).foregroundStyle(.secondary)
                         }.padding(.vertical, 7).contentShape(Rectangle())
-                    }.buttonStyle(.plain)
+                    }.buttonStyle(.plain).tag(thread.id)
                 }.listStyle(.plain)
             }
-        }.frame(width: 600, height: 450).onAppear { focused = true }
+        }.frame(width: 600, height: 450).onAppear { selectedID = filtered.first?.id; focused = true }
+    }
+    private func moveSelection(_ offset: Int) {
+        guard !filtered.isEmpty else { return }
+        let index = filtered.firstIndex { $0.id == selectedID } ?? 0
+        selectedID = filtered[min(filtered.count - 1, max(0, index + offset))].id
     }
 }

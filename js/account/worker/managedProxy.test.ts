@@ -72,3 +72,18 @@ test("VM host WebSockets stay on their exact managed service boundaries", () => 
     assert.equal(isManagedRoutePath(path), false, path);
   }
 });
+
+
+test("account Hand discovery uses only the exact managed route", async () => {
+  assert.equal(isManagedRoutePath("/v1/account/hands"), true);
+  assert.equal(isManagedRoutePath("/v1/account/hands/"), false);
+  assert.equal(isManagedRoutePath("/v1/account/hands/other"), false);
+  const request = new Request("https://nanocodex.localhost/v1/account/hands", { headers: { authorization: "Bearer test" } });
+  let forwarded: Request | undefined;
+  const response = await routeManaged(request, { NANOCODEX_BACKEND: {
+    fetch(candidate: Request) { forwarded = candidate; return Promise.resolve(Response.json({ data: [] })); },
+    connect() { throw new Error("unused"); },
+  } }, new URL(request.url));
+  assert.equal(forwarded, request);
+  assert.deepEqual(await response?.json(), { data: [] });
+});

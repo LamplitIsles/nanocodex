@@ -266,6 +266,7 @@ export type AgentSummary = Readonly<{
   createdAt: number;
   updatedAt: number;
   turnCount: number;
+  mayHaveScheduledJobs: boolean;
 }>;
 
 type AgentRegistryRow = Readonly<{
@@ -275,6 +276,7 @@ type AgentRegistryRow = Readonly<{
   updated_at: number;
   turn_count: number;
   deleted_at: number | null;
+  cron_candidate: number | null;
 }>;
 
 export async function routeAccountRequest(
@@ -869,6 +871,7 @@ export async function attachAgent(
   userId: string,
   agentId: string,
   timeoutMs = DEFAULT_OWNERSHIP_IO_TIMEOUT_MS,
+  hasCronTriggers?: boolean,
 ): Promise<void> {
   await fetchResponseWithDeadline(
     env.NANOCODEX_USERS.getByName(userId),
@@ -876,12 +879,31 @@ export async function attachAgent(
     {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ agentId }),
+      body: JSON.stringify({ agentId, hasCronTriggers }),
     },
     timeoutMs,
     "agent attachment",
     (response) => {
       if (!response.ok) throw new Error("agent attachment failed");
+    },
+  );
+}
+
+/** Presence is monotonic: a late empty read cannot hide a concurrently saved cron. */
+export async function recordAgentCronPresence(
+  env: AccountAuthEnv,
+  userId: string,
+  agentId: string,
+  present: boolean,
+): Promise<void> {
+  await fetchResponseWithDeadline(
+    env.NANOCODEX_USERS.getByName(userId),
+    `https://user.internal/agents/${agentId}/cron-presence`,
+    { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ present }) },
+    DEFAULT_OWNERSHIP_IO_TIMEOUT_MS,
+    "cron discovery update",
+    (response) => {
+      if (!response.ok) throw new Error("cron discovery update failed");
     },
   );
 }
@@ -1661,6 +1683,12 @@ export class UserAccount extends DurableObject<AccountAuthEnv> {
       CREATE INDEX IF NOT EXISTS agent_registry_active_created
         ON agent_registry (created_at, id) WHERE deleted_at IS NULL;
     `);
+    // Existing agents stay candidates until their first schedule read. New
+    // registrations supply their actual presence; omitted legacy values stay unknown.
+    const columns = new Set(ctx.storage.sql.exec<{ name: string }>("PRAGMA table_info(agent_registry)").toArray().map(({ name }) => name));
+    if (!columns.has("cron_candidate")) {
+      ctx.storage.sql.exec("ALTER TABLE agent_registry ADD COLUMN cron_candidate INTEGER CHECK (cron_candidate IN (0, 1))");
+    }
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -1744,16 +1772,17 @@ export class UserAccount extends DurableObject<AccountAuthEnv> {
     if (url.pathname === "/agents") {
       if (request.method === "GET") {
         return json(this.ctx.storage.sql.exec<AgentRegistryRow>(
-          `SELECT id, title, created_at, updated_at, turn_count, deleted_at
+          `SELECT id, title, created_at, updated_at, turn_count, deleted_at, cron_candidate
            FROM agent_registry
            WHERE deleted_at IS NULL
            ORDER BY created_at, id`,
         ).toArray().map(agentSummary));
       }
       if (request.method === "POST") {
-        const body = await request.json<{ agentId?: unknown }>();
+        const body = await request.json<{ agentId?: unknown; hasCronTriggers?: unknown }>();
         const agentId = typeof body.agentId === "string" ? body.agentId : "";
-        if (!/^[0-9a-f-]{36}$/.test(agentId)) {
+        if (!/^[0-9a-f-]{36}$/.test(agentId)
+          || (body.hasCronTriggers !== undefined && typeof body.hasCronTriggers !== "boolean")) {
           return json({ error: "invalid_agent" }, { status: 400 });
         }
         const existing = this.ctx.storage.sql.exec<{ deleted_at: number | null }>(
@@ -1767,15 +1796,31 @@ export class UserAccount extends DurableObject<AccountAuthEnv> {
           const now = Date.now();
           this.ctx.storage.sql.exec(
             `INSERT INTO agent_registry
-               (id, title, created_at, updated_at, turn_count, deleted_at)
-             VALUES (?, '', ?, ?, 0, NULL)`,
+               (id, title, created_at, updated_at, turn_count, deleted_at, cron_candidate)
+             VALUES (?, '', ?, ?, 0, NULL, ?)`,
             agentId,
             now,
             now,
+            typeof body.hasCronTriggers === "boolean" ? Number(body.hasCronTriggers) : null,
           );
+        } else if (body.hasCronTriggers === true) {
+          this.ctx.storage.sql.exec("UPDATE agent_registry SET cron_candidate = 1 WHERE id = ?", agentId);
         }
         return new Response(null, { status: 204 });
       }
+    }
+    const cronMatch = url.pathname.match(/^\/agents\/([0-9a-f-]{36})\/cron-presence$/);
+    if (cronMatch && request.method === "POST") {
+      const { present } = await request.json<{ present?: unknown }>();
+      if (typeof present !== "boolean") return json({ error: "invalid_cron_presence" }, { status: 400 });
+      const updated = this.ctx.storage.sql.exec(
+        `UPDATE agent_registry
+         SET cron_candidate = CASE WHEN ? = 1 THEN 1 ELSE COALESCE(cron_candidate, 0) END
+         WHERE id = ? AND deleted_at IS NULL`,
+        Number(present), cronMatch[1]!,
+      );
+      if (updated.rowsWritten === 0) return json({ error: "not_found" }, { status: 404 });
+      return new Response(null, { status: 204 });
     }
     const activityMatch = url.pathname.match(/^\/agents\/([0-9a-f-]{36})\/activity$/);
     if (activityMatch && request.method === "POST") {
@@ -1827,6 +1872,7 @@ function agentSummary(row: AgentRegistryRow): AgentSummary {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     turnCount: row.turn_count,
+    mayHaveScheduledJobs: row.cron_candidate !== 0,
   };
 }
 

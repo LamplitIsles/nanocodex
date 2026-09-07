@@ -93,4 +93,29 @@ final class ToolPresentationTests: XCTestCase {
         let cancelled = try AgentEvent(.object(["cursor": .string("3"), "type": .string("turn_cancelled"), "turn_id": .string("t")]))
         XCTAssertEqual(transcript([call, cancelled]).first?.tool?.status, "Stopped")
     }
+
+    func testCodeModeProjectionPreservesBothResultFormsAndHidesEmbeddedBytes() throws {
+        let image: JSON = .object(["type": .string("input_image"), "image_url": .string("data:image/png;base64,PRIVATE_IMAGE_BYTES")])
+        let raw: JSON = .array([.object(["type": .string("input_text"), "text": .string("## Chart ready")]), image])
+        let structured: JSON = .object(["exit_code": .number(0), "content": .array([.object(["type": .string("resource"), "resource": .object([
+            "uri": .string("artifact:///chart.csv"), "mimeType": .string("text/csv"), "blob": .string("PRIVATE_FILE_BYTES")
+        ])])])])
+        let result = try AgentEvent(.object(["cursor": .string("1"), "type": .string("event"), "turn_id": .string("t"), "event": .object([
+            "type": .string("tool.result"), "payload": .object(["call_id": .string("exec"), "tool": .string("functions.exec"),
+                "structured_result": structured, "result": .string(raw.pretty)])
+        ])]))
+        let rows = transcript([result, result])
+        let tool = try XCTUnwrap(rows.first?.tool)
+        XCTAssertEqual(rows.count, 1)
+        XCTAssertEqual(tool.generatedResults?.count, 2)
+        XCTAssertEqual(tool.generatedIncludesText, true)
+        XCTAssertTrue(tool.generatedResults?.contains { $0.contains("PRIVATE_IMAGE_BYTES") } == true)
+        XCTAssertTrue(tool.generatedResults?.contains { $0.contains("PRIVATE_FILE_BYTES") } == true)
+        XCTAssertFalse(tool.output.contains { $0.value.contains("PRIVATE_FILE_BYTES") || $0.value.contains("PRIVATE_IMAGE_BYTES") })
+        let restored = try JSONDecoder().decode(TranscriptRow.self, from: JSONEncoder().encode(rows[0]))
+        XCTAssertEqual(restored.tool?.generatedResults, tool.generatedResults)
+        XCTAssertFalse(ToolPresentation.fields(raw, label: "Result").contains { $0.value.contains("PRIVATE_IMAGE_BYTES") })
+        let markdown: JSON = .object(["type": .string("input_text"), "text": .string("Chart: ![Preview](data:image/png;base64,PRIVATE_MARKDOWN_BYTES)")])
+        XCTAssertFalse(ToolPresentation.fields(markdown, label: "Result").contains { $0.value.contains("PRIVATE_MARKDOWN_BYTES") })
+    }
 }

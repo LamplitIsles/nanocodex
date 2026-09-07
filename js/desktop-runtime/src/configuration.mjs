@@ -48,7 +48,7 @@ export async function desktopPreferences({ directory, apiKey, baseUrl = DEFAULT_
     return saving;
   };
   return {
-    saved: scope && store.scope === scope ? store.preferences ?? {} : {},
+    saved: { ...(scope && store.scope === scope ? store.preferences ?? {} : {}), ...(store.preferences?.defaultHandEnabled === false ? { defaultHandEnabled: false } : {}) },
     async persist(preferences) { store = { scope, preferences }; await write(); },
     async saveConnection(connection) { scope = scopeFor(connection); },
     async close() { await saving; },

@@ -51,17 +51,29 @@ public struct Cursor: RawRepresentable, Codable, Equatable, Comparable, Sendable
 public struct AgentEvent: Equatable, Sendable {
     public let cursor: Cursor
     public let data: JSON
+    /// Immutable tool results are prepared once when admitted, not on every
+    /// streamed transcript rebuild (which may include large generated images).
+    let preparedToolResult: ToolPresentation?
     public var type: String { data["type"].string }
     public var turnID: String { data["turn_id"].string.isEmpty ? data["id"].string : data["turn_id"].string }
     public init(_ data: JSON, cursor: String? = nil) throws {
         guard let position = Cursor(rawValue: cursor ?? data["cursor"].string), !data["type"].string.isEmpty else { throw APIError.invalidResponse }
         self.cursor = position; self.data = data
+        let event = data["event"], payload = event["payload"]
+        if data["type"].string == "event", event["type"].string == "tool.result" {
+            var result = ToolPresentation(name: payload["tool"].string, arguments: .null, metadata: payload["metadata"])
+            let preferred = payload["structured_result"] == .null ? payload["result"] : payload["structured_result"]
+            result.finish(preferred, failed: payload["is_error"].bool || payload["isError"].bool,
+                state: payload["status"].string, metadata: payload["metadata"], rawResult: payload["result"])
+            preparedToolResult = result
+        } else { preparedToolResult = nil }
     }
 }
 
 public struct SSEFrame: Sendable {
     public var event: AgentEvent?
     public var cursor: Cursor?
+    public var payloadBytes = 0
 }
 
 /// Byte parsing preserves empty lines and split UTF-8/CRLF boundaries. Frames, including multiline data,
@@ -89,19 +101,21 @@ public struct SSEParser: Sendable {
         guard size <= 16 * 1024 * 1024 else { throw APIError.invalidResponse }
         guard line.isEmpty else { lines.append(line); return nil }
         defer { lines.removeAll(keepingCapacity: true); size = 0 }
-        var id: String?, control: Cursor?, data: [String] = []
+        var id: String?, control: Cursor?, data: [String] = [], heartbeat = false
         for line in lines {
             if line.hasPrefix(": cursor ") { control = Cursor(rawValue: String(line.dropFirst(9))); continue }
+            if line == ": keepalive" { heartbeat = true; continue }
             let pair = line.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
             var value = pair.count == 2 ? String(pair[1]) : ""
             if value.hasPrefix(" ") { value.removeFirst() }
             if pair[0] == "id", Cursor(rawValue: value) != nil { id = value }
             if pair[0] == "data" { data.append(value) }
         }
-        if data.isEmpty { return control.map { SSEFrame(cursor: $0) } }
-        let json = try JSONDecoder().decode(JSON.self, from: Data(data.joined(separator: "\n").utf8))
+        if data.isEmpty { return control != nil || heartbeat ? SSEFrame(cursor: control) : nil }
+        let payload = Data(data.joined(separator: "\n").utf8)
+        let json = try JSONDecoder().decode(JSON.self, from: payload)
         let event = try AgentEvent(json, cursor: id)
-        return SSEFrame(event: event, cursor: event.cursor)
+        return SSEFrame(event: event, cursor: event.cursor, payloadBytes: payload.count)
     }
 }
 
@@ -112,8 +126,16 @@ public struct TranscriptRow: Identifiable, Codable, Equatable, Sendable {
     public var detail: String = ""
     public var running = false
     public var tool: ToolPresentation?
-    public init(id: String, role: String, text: String, detail: String = "", running: Bool = false, tool: ToolPresentation? = nil) {
-        self.id = id; self.role = role; self.text = text; self.detail = detail; self.running = running; self.tool = tool
+    public var images: [String]?
+    public var videos: [TranscriptVideo]?
+    public var turnID: String?
+    public var agentID: String?
+    public var phase: String?
+    public var itemID: String?
+    /// Cursor that admitted this row; retained while streamed content changes.
+    public var cursor: Cursor?
+    public init(id: String, role: String, text: String, detail: String = "", running: Bool = false, tool: ToolPresentation? = nil, images: [String]? = nil) {
+        self.id = id; self.role = role; self.text = text; self.detail = detail; self.running = running; self.tool = tool; self.images = images
     }
 }
 
@@ -132,16 +154,36 @@ public func transcript(_ events: [AgentEvent]) -> [TranscriptRow] {
     }
     for envelope in events where seen.insert(envelope.cursor.rawValue).inserted {
         let d = envelope.data, turn = envelope.turnID
+        let firstNewRow = rows.count
         let prefix = turn + ":" + d["agent_id"].pretty
         let id = prefix + ":" + envelope.cursor.rawValue
         if envelope.type == "turn_accepted" {
             let input = d["input"]
-            let text = input.array.isEmpty ? input.string : input.array.map { $0["text"].string.isEmpty ? "[Attachment]" : $0["text"].string }.joined(separator: "\n")
-            rows.append(.init(id: id, role: "You", text: text))
+            let media = VideoAttachmentContent.project(input.array)
+            let text = input.array.isEmpty ? input.string : media.remaining.compactMap {
+                $0["type"].string == "image" ? nil : $0["type"].string == "audio" ? "[Audio]" : $0["text"].string
+            }.joined(separator: "\n")
+            let images = media.remaining.filter { $0["type"].string == "image" }.map { $0["image_url"].string }
+            if let spoken = RealtimeTranscript.project(text) {
+                for (index, entry) in spoken.enumerated() {
+                    rows.append(.init(id: id + ":voice:\(index)", role: entry.speaker == "user" ? "You" : "Agent", text: entry.text))
+                }
+            } else {
+                var row = TranscriptRow(id: id, role: "You", text: text, images: images.isEmpty ? nil : images)
+                row.videos = media.videos.isEmpty ? nil : media.videos
+                rows.append(row)
+            }
         } else if envelope.type == "turn_completed" {
             let final = d["final_message"].string
-            if !final.isEmpty, rows.last(where: { $0.id.hasPrefix(turn + "::") && $0.role == "Agent" })?.text != final {
-                rows.append(.init(id: id, role: "Agent", text: final))
+            if !final.isEmpty {
+                if let last = rows.indices.last, rows[last].id.hasPrefix(turn + "::"), rows[last].role == "Agent" {
+                    rows[last].text = final; rows[last].phase = "final_answer"
+                } else if let index = rows.lastIndex(where: { $0.id.hasPrefix(turn + "::") && $0.role == "Agent" && $0.text == final }) {
+                    rows[index].phase = "final_answer"
+                } else {
+                    var row = TranscriptRow(id: id, role: "Agent", text: final)
+                    row.phase = "final_answer"; rows.append(row)
+                }
             }
             for index in rows.indices where rows[index].id.hasPrefix(turn + ":") {
                 if rows[index].running, rows[index].tool != nil {
@@ -160,14 +202,19 @@ public func transcript(_ events: [AgentEvent]) -> [TranscriptRow] {
         } else if envelope.type == "event" {
             let event = d["event"], p = event["payload"], type = event["type"].string
             let role = type == "reasoning.summary.delta" ? "Thinking" : "Agent"
+            let phase = p["phase"].string.isEmpty ? nil : p["phase"].string
+            let itemID = p["item_id"].string.isEmpty ? nil : p["item_id"].string
             switch type {
             case "assistant.delta", "reasoning.summary.delta":
-                if let last = rows.indices.last, rows[last].id.hasPrefix(prefix + ":"), rows[last].role == role, rows[last].running {
+                if let last = rows.indices.last, rows[last].id.hasPrefix(prefix + ":"), rows[last].role == role, rows[last].running,
+                   rows[last].phase == phase, rows[last].itemID == itemID {
                     rows[last].text += p["text"].string
                 } else { rows.append(.init(id: id, role: role, text: p["text"].string, running: true)) }
             case "assistant.message":
-                if let last = rows.indices.last, rows[last].id.hasPrefix(prefix + ":"), rows[last].role == "Agent", rows[last].running {
-                    rows[last].text = p["text"].string; rows[last].running = false
+                if let last = rows.indices.last, rows[last].id.hasPrefix(prefix + ":"), rows[last].role == "Agent", rows[last].running,
+                   (phase == nil || rows[last].phase == phase), (itemID == nil || rows[last].itemID == itemID) {
+                    if !p["text"].string.isEmpty { rows[last].text = p["text"].string }
+                    rows[last].running = false
                 } else { rows.append(.init(id: id, role: "Agent", text: p["text"].string)) }
             case "tool.call":
                 if case .number(let time) = d["created_at"], time.isFinite, time >= 0 {
@@ -182,37 +229,54 @@ public func transcript(_ events: [AgentEvent]) -> [TranscriptRow] {
                 rows.append(.init(id: prefix + ":tool:" + p["call_id"].string, role: "Tool", text: tool.title, running: true, tool: tool))
             case "tool.result":
                 let toolID = prefix + ":tool:" + p["call_id"].string
-                let result = p["structured_result"] == .null ? p["result"] : p["structured_result"]
-                if let index = terminalPolls.removeValue(forKey: toolID) {
-                    let previous = rows[index].tool?.output.first(where: { $0.label == "Output" })?.value ?? ""
-                    let decoded = ToolPresentation.decoded(result)
-                    var combined: [String: JSON]
-                    if case .object(let object) = decoded { combined = object }
-                    else { combined = ["output": decoded] }
-                    let output = previous + combined["output", default: .null].string
-                    combined["output"] = .string(output.count > 4_000 ? "…\n" + String(output.suffix(3_998)) : output)
-                    let elapsed = elapsedSeconds(rows[index].id, at: d["created_at"])
-                    rows[index].tool?.finish(.object(combined), failed: p["is_error"].bool || p["isError"].bool, state: p["status"].string, metadata: p["metadata"], elapsedSeconds: elapsed)
-                    rows[index].running = rows[index].tool?.status == "Running"
-                    if !rows.contains(where: { $0.id == toolID }) { continue }
-                }
-                if let index = rows.firstIndex(where: { $0.id == toolID }) {
-                    rows[index].tool?.finish(result, failed: p["is_error"].bool || p["isError"].bool, state: p["status"].string, metadata: p["metadata"], elapsedSeconds: elapsedSeconds(toolID, at: d["created_at"]))
-                    rows[index].running = rows[index].tool?.status == "Running"
-                    let session = ToolPresentation.decoded(result)["session_id"]
-                    if p["tool"].string == "exec_command", session != .null {
-                        terminalSessions[d["agent_id"].pretty + ":" + session.pretty] = index
+                guard let result = envelope.preparedToolResult else { break }
+                if result.terminalCommand == true {
+                    let result = p["structured_result"] == .null ? p["result"] : p["structured_result"]
+                    if let index = terminalPolls.removeValue(forKey: toolID) {
+                        let previous = rows[index].tool?.output.first(where: { $0.label == "Output" })?.value ?? ""
+                        let decoded = ToolPresentation.decoded(result)
+                        var combined: [String: JSON]
+                        if case .object(let object) = decoded { combined = object }
+                        else { combined = ["output": decoded] }
+                        let output = previous + combined["output", default: .null].string
+                        combined["output"] = .string(output.count > 4_000 ? "…\n" + String(output.suffix(3_998)) : output)
+                        let elapsed = elapsedSeconds(rows[index].id, at: d["created_at"])
+                        rows[index].tool?.finish(.object(combined), failed: p["is_error"].bool || p["isError"].bool, state: p["status"].string, metadata: p["metadata"], rawResult: p["result"], elapsedSeconds: elapsed)
+                        rows[index].running = rows[index].tool?.status == "Running"
+                        if !rows.contains(where: { $0.id == toolID }) { continue }
+                    }
+                    if let index = rows.firstIndex(where: { $0.id == toolID }) {
+                        rows[index].tool?.finish(result, failed: p["is_error"].bool || p["isError"].bool, state: p["status"].string, metadata: p["metadata"], rawResult: p["result"], elapsedSeconds: elapsedSeconds(toolID, at: d["created_at"]))
+                        rows[index].running = rows[index].tool?.status == "Running"
+                        let session = ToolPresentation.decoded(result)["session_id"]
+                        if p["tool"].string == "exec_command", session != .null {
+                            terminalSessions[d["agent_id"].pretty + ":" + session.pretty] = index
+                        }
+                    } else {
+                        // History can start after a call. Its result must remain readable.
+                        var tool = ToolPresentation(name: p["tool"].string, arguments: .null, metadata: p["metadata"])
+                        tool.finish(result, failed: p["is_error"].bool || p["isError"].bool, state: p["status"].string, metadata: p["metadata"], rawResult: p["result"])
+                        rows.append(.init(id: toolID, role: "Tool", text: tool.title, running: tool.status == "Running", tool: tool))
                     }
                 } else {
-                    // History can start after a call. Its result must remain readable.
-                    var tool = ToolPresentation(name: p["tool"].string, arguments: .null, metadata: p["metadata"])
-                    tool.finish(result, failed: p["is_error"].bool || p["isError"].bool, state: p["status"].string, metadata: p["metadata"])
-                    rows.append(.init(id: toolID, role: "Tool", text: tool.title, running: tool.status == "Running", tool: tool))
+                    if let index = rows.firstIndex(where: { $0.id == toolID }) {
+                        rows[index].running = result.status == "Running"
+                        rows[index].tool?.applyCompletion(result, metadata: p["metadata"])
+                    } else {
+                        // History can start after a call. Its result must remain readable.
+                        rows.append(.init(id: toolID, role: "Tool", text: result.title, running: result.status == "Running", tool: result))
+                    }
                 }
             case "run.steered": rows.append(.init(id: id, role: "Status", text: "Direction updated"))
             case "run.error": rows.append(.init(id: id, role: "Status", text: p["message"].string))
             default: break
             }
+            for index in firstNewRow..<rows.count { rows[index].phase = phase; rows[index].itemID = itemID }
+        }
+        for index in firstNewRow..<rows.count {
+            rows[index].cursor = envelope.cursor
+            rows[index].turnID = turn
+            rows[index].agentID = d["agent_id"].pretty.isEmpty ? nil : d["agent_id"].pretty
         }
     }
     return rows

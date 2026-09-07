@@ -3,14 +3,13 @@ import SwiftUI
 
 struct HandsView: View {
     @EnvironmentObject private var model: AppModel
-    @State private var enablingMac = false
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 28) {
                 HStack(alignment: .top) {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("Hands").font(.system(size: 29, weight: .semibold)).tracking(-0.6)
-                        Text("Give your agents a place to work.").font(.system(size: 14)).foregroundStyle(.secondary)
+                        Text("Your connected computers and phones, with this Mac available automatically.").font(.system(size: 14)).foregroundStyle(.secondary)
                     }
                     Spacer()
                     Menu {
@@ -25,24 +24,35 @@ struct HandsView: View {
                     Spacer()
                     HStack(spacing: 5) { Circle().fill(model.state.connected ? .green : .secondary).frame(width: 5, height: 5); Text(model.state.connected ? "Connected" : "Sign in") }.font(.system(size: 11)).foregroundStyle(.secondary).fixedSize()
                 }.padding(18).background(Color.primary.opacity(0.025), in: RoundedRectangle(cornerRadius: 13))
-                if !model.state.hands.contains(where: { $0.kind == "local" }) {
+                if model.state.defaultHandEnabled == false {
+                    Label("This Mac’s automatic Hand is disabled. Enable it in Settings or start a Hand below.", systemImage: "hand.raised.slash")
+                        .font(.system(size: 13)).foregroundStyle(.secondary)
+                } else if !model.state.hands.contains(where: { $0.kind == "local" }) {
                     VStack(alignment: .leading, spacing: 15) {
-                        Label("Use this Mac", systemImage: "laptopcomputer").font(.system(size: 18, weight: .medium))
-                        Text("Run commands and work with files in your Nanocodex folder. It’s created automatically, and you can stop sharing at any time.").font(.system(size: 13)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                        Text("Commands run with your macOS user’s permissions.").font(.system(size: 12)).foregroundStyle(.secondary)
-                        HStack {
-                            Button {
-                                enablingMac = true
-                                Task { await model.useThisMac(); enablingMac = false }
-                            } label: { if enablingMac { ProgressView().controlSize(.small) } else { Text("Enable this Mac") } }.buttonStyle(.borderedProminent).tint(.primary).disabled(enablingMac || !model.state.connected).accessibilityIdentifier("enable-this-mac")
-                            Button("Choose a different folder…") { model.editingHand = nil; model.showingHandSetup = true }.buttonStyle(.link).disabled(!model.state.connected)
-                        }
+                        Label("Connecting this Mac…", systemImage: "laptopcomputer").font(.system(size: 18, weight: .medium))
+                        Text("Your Nanocodex workspace is being prepared automatically.").font(.system(size: 13)).foregroundStyle(.secondary)
                     }.padding(22).frame(maxWidth: .infinity, alignment: .leading).overlay(RoundedRectangle(cornerRadius: 13).stroke(Color.primary.opacity(0.12)))
                 }
                 if !model.state.hands.isEmpty {
                     VStack(alignment: .leading, spacing: 10) {
                         Text("Your compute").font(.system(size: 12, weight: .medium)).foregroundStyle(.secondary).padding(.bottom, 3)
                         ForEach(model.state.hands) { hand in HandCard(hand: hand) }
+                    }
+                }
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack {
+                        Text("Other devices on your account").font(.system(size: 12, weight: .medium)).foregroundStyle(.secondary)
+                        Spacer()
+                        Button("Refresh") { Task { await model.refreshAccountHands() } }.disabled(!model.state.connected)
+                    }
+                    ForEach(model.otherAccountHands) { hand in
+                        AccountHandRow(hand: hand) { model.useAccountHand(hand) }
+                    }
+                    if let error = model.state.accountHandsError {
+                        Text(error).font(.system(size: 12)).foregroundStyle(.secondary)
+                    } else if model.otherAccountHands.isEmpty {
+                        Text("Open the app on your phone or another computer while signed into this account. It appears here when connected.")
+                            .font(.system(size: 12)).foregroundStyle(.secondary)
                     }
                 }
                 VStack(alignment: .leading, spacing: 14) {
@@ -63,6 +73,34 @@ struct HandsView: View {
                 VStack(alignment: .leading, spacing: 5) { Text(title).font(.system(size: 13, weight: .medium)).lineLimit(1); Text(subtitle).font(.system(size: 12)).foregroundStyle(.secondary).lineLimit(2) }
             }.padding(18).frame(maxWidth: .infinity, minHeight: 100, alignment: .leading).background(Color.primary.opacity(0.025), in: RoundedRectangle(cornerRadius: 12)).overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Color.primary.opacity(0.035)))
         }.buttonStyle(.plain).disabled(!model.state.connected)
+    }
+}
+
+struct AccountHandRow: View {
+    let hand: AccountHand
+    var compact = false
+    var use: () -> Void
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: hand.isPhone ? "iphone" : "desktopcomputer")
+                .font(.system(size: 20)).foregroundStyle(hand.isConnected ? Color.blue : .secondary)
+            VStack(alignment: .leading, spacing: 5) {
+                Text(hand.name).font(.system(size: 13, weight: .medium))
+                Text(hand.isConnected ? "Connected" : "Offline")
+                    .font(.system(size: 11)).foregroundStyle(hand.isConnected ? Color.green : .secondary)
+                if !compact {
+                    Text(hand.isPhone
+                         ? "iOS limits background availability. Open Centaur on this phone to reconnect."
+                         : "Open the app on this device to reconnect.")
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                    Text(hand.workspace).font(.system(size: 11, design: .monospaced)).foregroundStyle(.secondary)
+                }
+            }.frame(maxWidth: .infinity, alignment: .leading)
+            if hand.isConnected {
+                Button(compact ? "Use" : "Use in a tab", action: use).controlSize(.small)
+            }
+        }.padding(compact ? 12 : 18).background(Color.primary.opacity(0.025), in: RoundedRectangle(cornerRadius: 12))
+            .accessibilityElement(children: .contain).accessibilityIdentifier("account-hand-\(hand.id)")
     }
 }
 
@@ -207,7 +245,7 @@ struct RemoteSetupView: View {
             VStack(alignment: .leading, spacing: 14) {
                 Label("Open Nanocodex on the other Mac.", systemImage: "1.circle")
                 Label("Connect the same Nanocodex account.", systemImage: "2.circle")
-                Label("Open Hands and choose Enable this Mac.", systemImage: "3.circle")
+                Label("Its Hand connects automatically.", systemImage: "3.circle")
             }.font(.system(size: 14)).padding(.vertical, 6)
             Text("Its compute becomes available to your agents here. Keep Nanocodex running on that computer while you use it.").font(.system(size: 13)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             DisclosureGroup("Server or VM with nanocodex2", isExpanded: $advanced) {

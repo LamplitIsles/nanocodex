@@ -6,7 +6,7 @@ struct RuntimeFailure: LocalizedError {
     var errorDescription: String? { message }
 }
 
-enum RuntimeEvent: Decodable {
+enum RuntimeEvent: Decodable, Sendable {
     case state(DesktopState), thread(ThreadSnapshot), ignored
     private enum CodingKeys: String, CodingKey { case type, state, thread }
     init(from decoder: Decoder) throws {
@@ -18,11 +18,38 @@ enum RuntimeEvent: Decodable {
         }
     }
 }
-private struct RuntimeFrame: Decodable {
+private struct RuntimeFrame: Decodable, Sendable {
     var id: JSONValue?
     var event: RuntimeEvent?
     var result: JSONValue?
     var error: String?
+}
+
+/// Keep JSON decoding and fragmented-frame assembly off the main actor. One
+/// serial queue preserves stdout order, including responses mixed with events.
+private final class RuntimeFrameDecoder: @unchecked Sendable {
+    private let queue = DispatchQueue(label: "xyz.paradigm.nanocodex.runtime.decode", qos: .userInitiated)
+    private var buffer = Data()
+    private let decoder = JSONDecoder()
+
+    func receive(_ data: Data, deliver: @escaping @Sendable ([RuntimeFrame]) -> Void) {
+        queue.async { deliver(self.decode(data)) }
+    }
+    func finish(_ completion: @escaping @Sendable () -> Void) { queue.async(execute: completion) }
+    #if DEBUG
+    func receiveForTesting(_ data: Data) -> [RuntimeFrame] { queue.sync { decode(data) } }
+    #endif
+    private func decode(_ data: Data) -> [RuntimeFrame] {
+        guard !data.isEmpty else { return [] }
+        buffer.append(data)
+        var frames: [RuntimeFrame] = [], consumed = buffer.startIndex
+        while let newline = buffer[consumed...].firstIndex(of: 0x0a) {
+            if let value = try? decoder.decode(RuntimeFrame.self, from: buffer[consumed..<newline]) { frames.append(value) }
+            consumed = buffer.index(after: newline)
+        }
+        if consumed != buffer.startIndex { buffer.removeSubrange(..<consumed) }
+        return frames
+    }
 }
 
 @MainActor
@@ -35,13 +62,26 @@ final class RuntimeClient {
     private var diagnostics: FileHandle?
     private var pending: [String: CheckedContinuation<JSONValue, Error>] = [:]
     private var deadlines: [String: Task<Void, Never>] = [:]
-    private var buffer = Data()
+    private let decoder = RuntimeFrameDecoder()
     private var stopped = false
+    private var processExited = false
+    private var outputEnded = false
     private var nextID = 0
     private let dataDirectory: String?
     #if DEBUG
     var requestOverride: ((String, [JSONValue]) async throws -> JSONValue)?
-    func receiveForTesting(_ data: Data) { receive(data) }
+    func receiveForTesting(_ data: Data) { receive(decoder.receiveForTesting(data)) }
+    func receiveAsynchronouslyForTesting(_ data: Data) {
+        decoder.receive(data) { [weak self] frames in
+            DispatchQueue.main.async { [weak self] in self?.receive(frames) }
+        }
+    }
+    func startForTesting(executable: URL, arguments: [String]) throws {
+        let child = Process()
+        child.executableURL = executable; child.arguments = arguments
+        child.environment = ["PATH": "/usr/bin:/bin"]
+        try launch(child)
+    }
     #endif
 
     init(dataDirectory: String? = nil) { self.dataDirectory = dataDirectory }
@@ -54,7 +94,7 @@ final class RuntimeClient {
         guard FileManager.default.isExecutableFile(atPath: node.path), FileManager.default.fileExists(atPath: host.path) else {
             throw RuntimeFailure(message: "Nanocodex’s runtime is missing. Rebuild the app with its bundled runtime.")
         }
-        let child = Process(), stdin = Pipe(), stdout = Pipe(), stderr = Pipe()
+        let child = Process()
         child.executableURL = node; child.arguments = [host.path]
         var env = ProcessInfo.processInfo.environment.filter { ["HOME", "PATH", "TMPDIR", "LANG", "USER", "NC_API_KEY", "NANOCODEX_API_KEY", "NANOCODEX_MANAGED_URL", "NANOCODEX_HAND_BINARY", "NANOCODEX_VM_ROOTFS", "NANOCODEX_VM_GUEST_RUNTIME", "NANOCODEX_KRUNFW_DIR"].contains($0.key) }
         let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Nanocodex/Native")
@@ -69,17 +109,34 @@ final class RuntimeClient {
             env["NANOCODEX_MANAGED_URL"] = credential.baseUrl
         }
         child.environment = env
+        try launch(child)
+    }
+    private func launch(_ child: Process) throws {
+        let stdin = Pipe(), stdout = Pipe(), stderr = Pipe()
         child.standardInput = stdin; child.standardOutput = stdout; child.standardError = stderr
+        let decoder = decoder
         stdout.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
-            if data.isEmpty { handle.readabilityHandler = nil; return }
-            Task { @MainActor [weak self] in self?.receive(data) }
+            if data.isEmpty {
+                handle.readabilityHandler = nil
+                // EOF is queued behind every decoded stdout chunk. Process exit
+                // alone can precede the final readability callback.
+                decoder.finish { [weak self] in
+                    DispatchQueue.main.async { [weak self] in self?.outputEnded = true; self?.finishTermination() }
+                }
+                return
+            }
+            decoder.receive(data) { [weak self] frames in
+                DispatchQueue.main.async { [weak self] in self?.receive(frames) }
+            }
         }
         // Consume diagnostic output without copying credentials or subprocess text to the UI/logs.
         stderr.fileHandleForReading.readabilityHandler = { handle in
             if handle.availableData.isEmpty { handle.readabilityHandler = nil }
         }
-        child.terminationHandler = { [weak self] _ in Task { @MainActor [weak self] in self?.terminated() } }
+        child.terminationHandler = { [weak self] _ in
+            DispatchQueue.main.async { [weak self] in self?.processExited = true; self?.finishTermination() }
+        }
         try child.run()
         process = child; input = stdin.fileHandleForWriting; output = stdout.fileHandleForReading; diagnostics = stderr.fileHandleForReading
     }
@@ -109,12 +166,9 @@ final class RuntimeClient {
             catch { deadlines.removeValue(forKey: id)?.cancel(); pending.removeValue(forKey: id)?.resume(throwing: error) }
         }
     }
-    private func receive(_ data: Data) {
-        guard !data.isEmpty else { return }
-        buffer.append(data)
-        while let newline = buffer.firstIndex(of: 0x0a) {
-            let line = buffer.prefix(upTo: newline); buffer.removeSubrange(...newline)
-            guard let value = try? JSONDecoder().decode(RuntimeFrame.self, from: line) else { continue }
+    private func receive(_ frames: [RuntimeFrame]) {
+        guard !stopped else { return }
+        for value in frames {
             if let event = value.event { onEvent?(event); continue }
             let id = value.id?.string ?? ""
             guard let continuation = pending.removeValue(forKey: id) else { continue }
@@ -123,17 +177,24 @@ final class RuntimeClient {
             else { continuation.resume(returning: value.result ?? .null) }
         }
     }
-    private func terminated() {
+    private func finishTermination() {
+        guard processExited, outputEnded else { return }
+        let expected = stopped
+        stopped = true
+        try? input?.close(); input = nil
+        output?.readabilityHandler = nil; diagnostics?.readabilityHandler = nil
         for continuation in pending.values { continuation.resume(throwing: RuntimeFailure(message: "Nanocodex’s runtime stopped. Reopen the app to reconnect.")) }
         pending.removeAll()
         deadlines.values.forEach { $0.cancel() }; deadlines.removeAll()
-        if !stopped { onFailure?("Nanocodex’s runtime stopped. Reopen the app to reconnect.") }
+        if !expected { onFailure?("Nanocodex’s runtime stopped. Reopen the app to reconnect.") }
     }
     func stop() {
         guard !stopped else { return }; stopped = true
         try? input?.close(); input = nil
         output?.readabilityHandler = nil
         diagnostics?.readabilityHandler = nil
+        outputEnded = true
+        finishTermination()
         // stdin EOF lets the helper stop Hands and release every owned process before exiting.
         let child = process
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 25) { if child?.isRunning == true { child?.terminate() } }

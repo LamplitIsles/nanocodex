@@ -11,6 +11,7 @@ import { createTools } from "nanocodex/tools";
 import * as Workspace from "nanocodex/node/workspace";
 import { createNodeProcessTools } from "nanocodex-tools/node";
 import WebSocket from "ws";
+import { mergeAccountHands, restoredAccountHands } from "./account-hands.mjs";
 
 export const DEFAULT_ORIGIN = "https://nanocodex.gakonst.workers.dev";
 export const DEFAULT_SETTINGS = Object.freeze({ model: "gpt-5.6-sol", thinking: "high", reasoning_mode: "standard", fast_mode: false });
@@ -63,6 +64,34 @@ export function validateHand(value) {
   return config;
 }
 
+function restoredPendingMessages(value) {
+  if (!Array.isArray(value)) return [];
+  const ids = new Set();
+  return value.flatMap(message => {
+    if (!message || typeof message.id !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/.test(message.id) || ids.has(message.id)) return [];
+    for (const field of ["tabID", "text", "predecessor", "target", "folder"]) {
+      if (typeof message[field] !== "string" || message[field].length > (field === "text" ? 200_000 : 4096)) return [];
+    }
+    if (!["submitting", "queued", "starting", "cancelling", "failed"].includes(message.phase)) return [];
+    if (message.agentID != null && (typeof message.agentID !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/.test(message.agentID))) return [];
+    const clean = Object.fromEntries(["id", "tabID", "text", "predecessor", "target", "folder", "phase"].map(key => [key, message[key]]));
+    if (message.agentID) clean.agentID = message.agentID;
+    for (const key of ["prompt", "error", "acceptedCursor"]) {
+      if (message[key] == null) continue;
+      if (typeof message[key] !== "string" || message[key].length > (key === "prompt" ? 210_000 : 4096)) return [];
+      if (key === "acceptedCursor" && !/^[0-9]{1,40}$/.test(message[key])) return [];
+      clean[key] = message[key];
+    }
+    if (message.settings) {
+      const settings = message.settings;
+      if (!["model", "thinking", "reasoning_mode"].every(key => typeof settings[key] === "string") || typeof settings.fast_mode !== "boolean") return [];
+      try { clean.settings = validateSettings(Object.fromEntries(["model", "thinking", "reasoning_mode", "fast_mode"].map(key => [key, settings[key]]))); } catch { return []; }
+    }
+    ids.add(message.id);
+    return [clean];
+  });
+}
+
 export function restoredLayout(value) {
   if (!value || !Array.isArray(value.tabs)) return undefined;
   const ids = new Set();
@@ -70,12 +99,14 @@ export function restoredLayout(value) {
     if (!tab || typeof tab.id !== "string" || !tab.id || tab.id.length > 128 || ids.has(tab.id)) return [];
     ids.add(tab.id);
     const clean = { id: tab.id, draft: "", target: "", folder: "" };
-    for (const key of ["threadId", "title", "draft", "target", "folder", "seenCursor"]) {
+    for (const key of ["threadId", "title", "draft", "target", "folder", "seenCursor", "deferredCursor"]) {
       if (typeof tab[key] === "string" && tab[key].length <= (key === "draft" ? 200_000 : 4096)) clean[key] = tab[key];
     }
     if (clean.threadId && !/^[A-Za-z0-9._:-]{1,128}$/.test(clean.threadId)) delete clean.threadId;
     if (clean.folder && !isAbsolute(clean.folder)) clean.folder = "";
-    if (clean.seenCursor && !/^[0-9]{1,40}$/.test(clean.seenCursor)) delete clean.seenCursor;
+    for (const key of ["seenCursor", "deferredCursor"]) {
+      if (clean[key] && !/^[0-9]{1,40}$/.test(clean[key])) delete clean[key];
+    }
     return [clean];
   });
   if (!tabs.length) return undefined;
@@ -84,6 +115,10 @@ export function restoredLayout(value) {
     activeTabId: ids.has(value.activeTabId) ? value.activeTabId : tabs[0].id,
     tabPosition: value.tabPosition === "top" ? "top" : "left",
     theme: ["system", "light", "dark"].includes(value.theme) ? value.theme : "system",
+    ...(Array.isArray(value.pendingMessages) ? { pendingMessages: restoredPendingMessages(value.pendingMessages) } : {}),
+    ...(Array.isArray(value.tiledTabIDs) ? { tiledTabIDs: [...new Set(value.tiledTabIDs.filter(id => ids.has(id)))] } : {}),
+    ...(["tiles", "single"].includes(value.workspaceMode) ? { workspaceMode: value.workspaceMode } : {}),
+    ...(Number.isFinite(value.paneWidth) ? { paneWidth: value.paneWidth === 0 ? 0 : Math.min(880, Math.max(420, value.paneWidth)) } : {}),
   };
 }
 
@@ -102,8 +137,10 @@ export class DesktopRuntime extends EventEmitter {
   #accountTransition = Promise.resolve();
   #dataDirectory;
   #folderPreparations = new Map();
+  #defaultPreparation;
   #helperPreparations = new Map();
   #refreshPending;
+  #handDiscoveryPending;
   #eventSnapshots = new WeakMap();
 
   constructor({ baseUrl = DEFAULT_ORIGIN, apiKey, saved = {}, defaults = {}, dataDirectory = join(homedir(), "Library", "Application Support", "Nanocodex", "Runtime"), persist = async () => {}, saveConnection = async () => {} } = {}) {
@@ -115,6 +152,8 @@ export class DesktopRuntime extends EventEmitter {
     this.#options = { baseUrl: managedOrigin(baseUrl), fetch: desktopFetch, ...(apiKey ? { apiKey } : {}) };
     this.#state = {
       connected: false, hasCredentials: Boolean(apiKey), baseUrl: this.#options.baseUrl, accountScope: randomUUID(), threads: [],
+      defaultHandEnabled: saved.defaultHandEnabled !== false,
+      accountHands: restoredAccountHands(saved.accountHands),
       hands: (Array.isArray(saved.hands) ? saved.hands : []).flatMap(config => {
         try { return [{ ...validateHand(config), status: "stopped", calls: 0, activeCalls: 0, logs: [] }]; }
         catch { return []; } // A stale preference must not prevent the app opening.
@@ -136,8 +175,8 @@ export class DesktopRuntime extends EventEmitter {
     }, 32);
   }
   #snapshot(thread) {
-    const { id, events, hasMore, connected, activeTurns, acceptedTurns, settings, error } = thread;
-    const snapshot = structuredClone({ id, events: undefined, hasMore, connected, activeTurns, acceptedTurns, settings, error });
+    const { id, events, hasMore, connected, activeTurns, acceptedTurns, settings, error, stateCursor: cursor } = thread;
+    const snapshot = structuredClone({ id, events: undefined, hasMore, connected, activeTurns, acceptedTurns, settings, error, cursor });
     // Durable envelopes never change. Clone/freeze each once instead of copying
     // the complete historical payload on every streamed frame. The new array
     // and header keep older snapshots stable as the live transcript advances.
@@ -159,7 +198,7 @@ export class DesktopRuntime extends EventEmitter {
     this.#accountTransition = operation;
     return operation;
   }
-  async #save() { await this.#persist({ layout: this.#state.layout, hands: this.#state.hands.map(({ status, calls, activeCalls, error, logs, ...config }) => config) }); }
+  async #save() { await this.#persist({ defaultHandEnabled: this.#state.defaultHandEnabled, accountHands: restoredAccountHands(this.#state.accountHands), layout: this.#state.layout, hands: this.#state.hands.map(({ status, calls, activeCalls, error, logs, ...config }) => config) }); }
 
   async saveLayout(value) {
     // A UI may deliver a debounced message after the account has changed. The
@@ -171,13 +210,13 @@ export class DesktopRuntime extends EventEmitter {
       if (typeof tab.id !== "string" || tab.id.length > 128 || ids.has(tab.id)) throw new Error("Invalid tab.");
       ids.add(tab.id);
       const clean = { id: tab.id };
-      for (const key of ["threadId", "title", "draft", "target", "folder", "seenCursor"]) {
+      for (const key of ["threadId", "title", "draft", "target", "folder", "seenCursor", "deferredCursor"]) {
         if (tab[key] !== undefined && (typeof tab[key] !== "string" || tab[key].length > (key === "draft" ? 200_000 : 4096))) throw new Error("Invalid tab content.");
         if (tab[key] !== undefined) clean[key] = tab[key];
       }
       return clean;
     });
-    this.#state.layout = restoredLayout({ tabs, activeTabId: value.activeTabId, tabPosition: value.tabPosition, theme: value.theme });
+    this.#state.layout = restoredLayout({ tabs, activeTabId: value.activeTabId, tabPosition: value.tabPosition, theme: value.theme, workspaceMode: value.workspaceMode, paneWidth: value.paneWidth, tiledTabIDs: value.tiledTabIDs, pendingMessages: value.pendingMessages });
     await this.#save();
   }
 
@@ -258,10 +297,12 @@ export class DesktopRuntime extends EventEmitter {
     this.#state.connected = false;
     this.#state.hasCredentials = false;
     this.#options = { baseUrl: this.#options.baseUrl, fetch: desktopFetch };
-    await Promise.all(this.#state.hands.map(hand => this.stopHand(hand.id)));
+    await Promise.all(this.#state.hands.map(hand => this.#stopHand(hand.id)));
     this.#state.threads = [];
     // Configurations are explicit grants to the old account. Never transfer them.
     this.#state.hands = [];
+    this.#state.accountHands = [];
+    delete this.#state.accountHandsError;
     this.#state.layout = undefined;
     delete this.#state.error;
   }
@@ -277,6 +318,32 @@ export class DesktopRuntime extends EventEmitter {
     this.#sameAccount(generation);
     if (!response.ok) throw new Error(body.message || body.error || `Managed request failed (${response.status}).`);
     return body;
+  }
+
+  async refreshAccountHands() {
+    if (this.#closed || !this.#state.connected) return this.state();
+    const generation = this.#generation;
+    if (this.#handDiscoveryPending?.generation === generation) return this.#handDiscoveryPending.promise;
+    const pending = { generation };
+    pending.promise = (async () => {
+      const before = JSON.stringify(this.#state.accountHands);
+      try {
+        const { data } = await this.request("/v1/account/hands", { signal: AbortSignal.timeout(10_000) });
+        this.#sameAccount(generation);
+        this.#state.accountHands = mergeAccountHands(this.#state.accountHands, data);
+        delete this.#state.accountHandsError;
+      } catch (error) {
+        if (generation !== this.#generation || this.#closed) return this.state();
+        this.#state.accountHands = restoredAccountHands(this.#state.accountHands);
+        this.#state.accountHandsError = "Unable to refresh account Hands. Retained devices are shown offline.";
+      }
+      if (before !== JSON.stringify(this.#state.accountHands)) await this.#save();
+      this.#sameAccount(generation);
+      this.#emit();
+      return this.state();
+    })().finally(() => { if (this.#handDiscoveryPending === pending) this.#handDiscoveryPending = undefined; });
+    this.#handDiscoveryPending = pending;
+    return pending.promise;
   }
 
   async createThread(settings = DEFAULT_SETTINGS) {
@@ -297,7 +364,7 @@ export class DesktopRuntime extends EventEmitter {
     const existing = this.#threads.get(id);
     if (existing) { await existing.ready; return this.#snapshot(existing); }
     const agent = Agent.open(id, this.#options);
-    const thread = { id, agent, abort: new AbortController(), events: [], cursors: new Set(), hasMore: false, connected: false, activeTurns: [], acceptedTurns: 0, settings: { ...DEFAULT_SETTINGS }, cursor: "0" };
+    const thread = { id, agent, abort: new AbortController(), events: [], cursors: new Set(), hasMore: false, connected: false, activeTurns: [], acceptedTurns: 0, settings: { ...DEFAULT_SETTINGS }, cursor: "0", stateCursor: "0" };
     this.#threads.set(id, thread);
     thread.ready = (async () => {
       const [page, state] = await Promise.all([agent.events.page({ limit: 256, signal: thread.abort.signal }), this.request(`/v1/agents/${encodeURIComponent(id)}`, { signal: thread.abort.signal })]);
@@ -309,6 +376,7 @@ export class DesktopRuntime extends EventEmitter {
       thread.hasMore = page.hasMore;
       thread.cursor = page.latestCursor;
       thread.activeTurns = state.active_turns ?? [];
+      thread.stateCursor = state.latest_event_cursor ?? "0";
       thread.acceptedTurns = Math.max(state.accepted_turns ?? 0, thread.activeTurns.length, thread.events.filter(event => event.data.type === "turn_accepted").length);
       thread.settings = state.settings ?? { ...DEFAULT_SETTINGS };
       thread.connected = true;
@@ -338,15 +406,16 @@ export class DesktopRuntime extends EventEmitter {
             thread.events.push(event);
             if (compareCursor(event.cursor, thread.cursor) >= 0) thread.cursor = event.cursor;
             else thread.events.sort((a, b) => compareCursor(a.cursor, b.cursor));
-            if (event.data.type === "turn_accepted") {
+            if (event.data.type === "turn_accepted" && compareCursor(event.cursor, thread.stateCursor) > 0) {
               if (!thread.activeTurns.includes(event.data.id)) thread.activeTurns.push(event.data.id);
               thread.acceptedTurns = Math.max(thread.acceptedTurns, thread.events.filter(entry => entry.data.type === "turn_accepted").length);
             }
-            if (["turn_completed", "turn_failed", "turn_cancelled"].includes(event.data.type)) {
+            if (["turn_completed", "turn_failed", "turn_cancelled"].includes(event.data.type) && compareCursor(event.cursor, thread.stateCursor) > 0) {
               thread.activeTurns = thread.activeTurns.filter(id => id !== event.data.id);
               void this.refresh();
             }
           }
+          if (compareCursor(event.cursor, thread.stateCursor) > 0) thread.stateCursor = event.cursor;
           this.#emitThread(thread);
           backoff = 500;
         }
@@ -400,12 +469,24 @@ export class DesktopRuntime extends EventEmitter {
     void this.refresh();
     return id;
   }
+  async queuePrompt({ agentId, input, requestId }) {
+    if (typeof input !== "string" || !input.trim() || input.length > 200_000) throw new Error("Enter a message of up to 200,000 characters.");
+    if (typeof requestId !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/.test(requestId)) throw new Error("A stable message ID is required.");
+    const receipt = await this.request(`/v1/agents/${encodeURIComponent(agentId)}/turns`, {
+      method: "POST", headers: { "Idempotency-Key": requestId }, body: JSON.stringify({ id: requestId, input }),
+    });
+    if (receipt.turn_id !== requestId) throw new Error("The message acknowledgement did not match.");
+    const thread = this.#threads.get(agentId);
+    if (thread) { thread.acceptedTurns = Math.max(1, thread.acceptedTurns); this.#emitThread(thread); }
+    void this.refresh();
+    return receipt;
+  }
   async steer({ agentId, turnId, input }) {
     if (typeof input !== "string" || !input.trim()) throw new Error("Enter a steering message.");
     await this.request(`/v1/agents/${encodeURIComponent(agentId)}/turns/${encodeURIComponent(turnId)}/steer`, { method: "POST", body: JSON.stringify({ input }) });
   }
   async cancel({ agentId, turnId }) {
-    await this.request(`/v1/agents/${encodeURIComponent(agentId)}/turns/${encodeURIComponent(turnId)}/cancel`, { method: "POST" });
+    return this.request(`/v1/agents/${encodeURIComponent(agentId)}/turns/${encodeURIComponent(turnId)}/cancel`, { method: "POST" });
   }
   async settings({ agentId, settings }) {
     const thread = this.#threads.get(agentId);
@@ -455,6 +536,33 @@ export class DesktopRuntime extends EventEmitter {
     await this.#save(); this.#emit(); return this.state();
   }
 
+  async prepareDefaultHand() {
+    this.#requireConnection();
+    if (!this.#state.defaultHandEnabled) return null;
+    const generation = this.#generation;
+    if (this.#defaultPreparation?.generation === generation) return this.#defaultPreparation.promise;
+    const pending = { generation };
+    pending.promise = (async () => {
+      let hand = this.#state.hands.find(candidate => candidate.kind === "local" && !candidate.agentId);
+      if (!hand) {
+        const config = validateHand({ id: `mac-${randomUUID()}`, kind: "local", name: this.#state.defaults.name, workspace: this.#state.defaults.workspace });
+        await this.saveHand(config);
+        this.#sameAccount(generation);
+        hand = this.#state.hands.find(candidate => candidate.id === config.id);
+      }
+      // Disabling during folder creation must fence the pending attachment.
+      if (!this.#state.defaultHandEnabled) return null;
+      await this.#startHand(hand.id);
+      this.#sameAccount(generation);
+      if (!this.#state.defaultHandEnabled) return null;
+      const connected = this.#state.hands.find(candidate => candidate.id === hand.id);
+      if (connected?.status !== "connected") throw new Error(connected?.error || "This Mac is reconnecting.");
+      return structuredClone(connected);
+    })().finally(() => { if (this.#defaultPreparation === pending) this.#defaultPreparation = undefined; });
+    this.#defaultPreparation = pending;
+    return pending.promise;
+  }
+
   async prepareFolderHand({ agentId, workspace }) {
     this.#requireConnection();
     const generation = this.#generation;
@@ -467,7 +575,8 @@ export class DesktopRuntime extends EventEmitter {
     if (this.#folderPreparations.has(key)) return this.#folderPreparations.get(key);
     const preparation = (async () => {
       let hand;
-      const candidates = this.#state.hands.filter(candidate => candidate.kind === "local" && (!candidate.agentId || candidate.agentId === agentId))
+      const candidates = this.#state.hands.filter(candidate => candidate.kind === "local" && (!candidate.agentId || candidate.agentId === agentId)
+        && (this.#state.defaultHandEnabled || !this.#isDefaultHand(candidate.id)))
         .sort((a, b) => Number(b.status === "connected") - Number(a.status === "connected"));
       for (const candidate of candidates) {
         if (await realpath(candidate.workspace).catch(() => null) === folder) { hand = candidate; break; }
@@ -494,6 +603,30 @@ export class DesktopRuntime extends EventEmitter {
     this.#emit();
   }
   async startHand(id) {
+    this.#requireConnection();
+    const generation = this.#generation;
+    if (this.#isDefaultHand(id)) {
+      this.#state.defaultHandEnabled = true;
+      await this.#save();
+      this.#sameAccount(generation);
+      if (!this.#state.defaultHandEnabled) return this.state();
+    }
+    return this.#startHand(id);
+  }
+  async setDefaultHandEnabled(enabled) {
+    if (typeof enabled !== "boolean") throw new Error("Choose whether this device Hand is enabled.");
+    this.#state.defaultHandEnabled = enabled;
+    // Stop synchronously before awaiting disk IO or a pending handshake.
+    const hand = this.#state.hands.find(hand => this.#isDefaultHand(hand.id));
+    const stopping = !enabled && hand ? this.#stopHand(hand.id) : Promise.resolve();
+    await Promise.all([this.#save(), stopping]);
+    this.#emit();
+    return this.state();
+  }
+  #isDefaultHand(id) {
+    return this.#state.hands.find(hand => hand.kind === "local" && !hand.agentId)?.id === id;
+  }
+  async #startHand(id) {
     this.#requireConnection();
     const hand = this.#state.hands.find(hand => hand.id === id);
     if (!hand) throw new Error("Hand not found.");
@@ -674,6 +807,10 @@ export class DesktopRuntime extends EventEmitter {
     catch (error) { this.#helperPreparations.delete(identity); throw error; }
   }
   async stopHand(id) {
+    if (this.#isDefaultHand(id)) return this.setDefaultHandEnabled(false);
+    return this.#stopHand(id);
+  }
+  async #stopHand(id) {
     const resource = this.#resources.get(id);
     if (resource) {
       resource.abort.abort();
@@ -698,7 +835,7 @@ export class DesktopRuntime extends EventEmitter {
     ++this.#connectionAttempt;
     ++this.#generation;
     for (const id of this.#threads.keys()) this.closeThread(id);
-    await Promise.all(this.#state.hands.map(hand => this.stopHand(hand.id)));
+    await Promise.all(this.#state.hands.map(hand => this.#stopHand(hand.id)));
     await this.#accountTransition.catch(() => {});
   }
 }

@@ -9,9 +9,9 @@ console.log = (...values) => console.error(...values);
 const safeError = error => String(error?.message ?? error).replace(/ncx_live_[A-Za-z0-9_-]+/g, "[redacted]").slice(0, 500);
 const send = value => process.stdout.write(`${JSON.stringify(value)}\n`);
 const methods = new Set([
-  "state", "connect", "disconnect", "refresh", "openThread", "closeThread", "older",
-  "createThread", "prompt", "steer", "cancel", "settings", "saveLayout", "saveHand",
-  "startHand", "stopHand", "removeHand", "prepareFolderHand",
+  "state", "connect", "disconnect", "refresh", "refreshAccountHands", "openThread", "closeThread", "older",
+  "createThread", "prompt", "queuePrompt", "steer", "cancel", "settings", "saveLayout", "saveHand",
+  "startHand", "stopHand", "removeHand", "prepareFolderHand", "prepareDefaultHand", "setDefaultHandEnabled",
   "startSignIn", "verifySignIn", "completeSignIn", "cancelSignIn",
 ]);
 const environment = await desktopEnvironment();
