@@ -17,7 +17,7 @@ export function ConnectHome() {
           {account?.persistent && <RemoteScreens key={account.id} showLabel />}
         </nav>
         <div className="wizard-content">
-          {vault ? <Vault /> : <AccountMenu inline />}
+          {vault ? <Vault key={account?.id ?? "signed-out"} /> : <AccountMenu inline />}
         </div>
       </section>
     </div>

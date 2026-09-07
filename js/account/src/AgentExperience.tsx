@@ -1,3 +1,6 @@
+import { sessionQueryKey } from "./queryClient";
+import type { BrowserSession } from "./sessionQueries";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   lazy,
   memo,
@@ -26,11 +29,12 @@ import {
   type ModelSessionStatus,
   type CredentialSource,
 } from "./modelSession";
-import { conversationTitle } from "./localConversationRuntime";
 import {
   createManagedConversation,
   loadManagedConversationSelection,
-  type ManagedConversation,
+  managedConversationsQueryOptions,
+  managedConversationQueryOptions,
+  recordManagedConversationActivity,
 } from "./managedAgentRuntime";
 import "nanocodex-connect-ui/styles.css";
 import "./AgentTerminal.css";
@@ -69,7 +73,6 @@ export const AgentExperience = memo(function AgentExperience({
   const toggleDesktopSidebar = () => setSidebarCollapsed((collapsed) => { safeSet("nanocodex:sidebar-collapsed", String(!collapsed)); return !collapsed; });
   const sidebarTriggerRef = useRef<HTMLButtonElement>(null);
   const closeSidebar = useCallback(() => setRailOpen(false), []);
-  const [managedConversations, setManagedConversations] = useState<readonly ManagedConversation[]>([]);
   const [managedConversationId, setManagedConversationId] = useState<string>();
   const [managedError, setManagedError] = useState<string>();
   const [managedAttempt, setManagedAttempt] = useState(0);
@@ -79,6 +82,16 @@ export const AgentExperience = memo(function AgentExperience({
   const [sponsoredExhausted, setSponsoredExhausted] = useState(false);
   const hasCredential = credentialSource === "brokered" || credentialSource === "sponsored";
   const hasDurableCredential = credentialSource === "brokered";
+  const queryClient = useQueryClient();
+  const accountId = account.account?.id;
+  const conversationsQuery = useQuery({
+    ...managedConversationsQueryOptions(accountId ?? ""),
+    enabled: !landing && account.status === "ready" && Boolean(accountId) && hasDurableCredential && authStatus?.state === "ready",
+  });
+  const managedConversations = conversationsQuery.data ?? [];
+  const prefetchConversation = useCallback((id: string) => {
+    if (accountId) void queryClient.prefetchQuery(managedConversationQueryOptions(accountId, id));
+  }, [accountId, queryClient]);
   const showHomepageSms = landing
     && account.status !== "checking"
     && account.account?.persistent !== true;
@@ -97,7 +110,6 @@ export const AgentExperience = memo(function AgentExperience({
     : undefined;
 
   useEffect(() => {
-    setManagedConversations([]);
     setManagedConversationId(undefined);
     setRuntimeState(undefined);
   }, [account.account?.id]);
@@ -129,7 +141,6 @@ export const AgentExperience = memo(function AgentExperience({
       refresh,
     }).then((selection) => {
       if (cancelled) return;
-      setManagedConversations(selection.conversations);
       setManagedConversationId(selection.selectedId);
       if (selection.selectedId) {
         safeSet(managedSelectionKey(accountId), selection.selectedId);
@@ -191,7 +202,7 @@ export const AgentExperience = memo(function AgentExperience({
     setConversationPending(true);
     setManagedError(undefined);
     void createManagedConversation(account.account.id).then((conversation) => {
-      setManagedConversations((current) => [conversation, ...current]);
+      if (queryClient.getQueryData<BrowserSession>(sessionQueryKey)?.account?.id !== account.account?.id) return;
       setManagedConversationId(conversation.id);
       safeSet(managedSelectionKey(account.account!.id), conversation.id);
       setRuntimeState(undefined);
@@ -199,21 +210,15 @@ export const AgentExperience = memo(function AgentExperience({
       onAgentChange?.(conversation.id);
     }).catch((error) => setManagedError(errorMessage(error)))
       .finally(() => setConversationPending(false));
-  }, [account.account, conversationPending, onAgentChange]);
+  }, [account.account, conversationPending, onAgentChange, queryClient]);
   const retryManagedConversations = useCallback(() => {
     setManagedError(undefined);
     refreshManagedList.current = true;
     setManagedAttempt((value) => value + 1);
   }, []);
   const recordActivity = useCallback((input: string) => {
-    if (!managedConversationId) return;
-    setManagedConversations((current) => current.map((item) => item.id === managedConversationId ? {
-      ...item,
-      title: (item.turnCount ?? 0) === 0 ? conversationTitle(input) : item.title,
-      turnCount: (item.turnCount ?? 0) + 1,
-      updatedAt: Date.now(),
-    } : item).sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0)));
-  }, [managedConversationId]);
+    if (accountId && managedConversationId) recordManagedConversationActivity(accountId, managedConversationId, input);
+  }, [accountId, managedConversationId]);
   const recordSponsoredActivity = useCallback(() => {
     // The egress reservation, not local submission, owns the allowance.
   }, []);
@@ -246,9 +251,9 @@ export const AgentExperience = memo(function AgentExperience({
   return <div className={`nanocodex-demo chat-workspace is-${mode}${landing ? " is-landing" : ""}`}>
     <div className={`conversation-workspace${sidebarCollapsed ? " is-sidebar-collapsed" : ""}`}>
       <AgentSidebar key={account.account?.id ?? "anonymous"}
-        conversations={managedConversations} error={managedError} landing={!!landing} active={mode !== "hidden"}
+        conversations={managedConversations} error={managedError ?? conversationsQuery.error?.message} landing={!!landing} active={mode !== "hidden"}
         open={railOpen && mode !== "hidden"} pending={conversationPending} selectedId={visibleManagedConversationId}
-        onClose={closeSidebar} onCollapse={toggleDesktopSidebar} collapsed={sidebarCollapsed} onCreate={newChat} onRetry={retryManagedConversations} onSelect={selectManaged}
+        onClose={closeSidebar} onCollapse={toggleDesktopSidebar} collapsed={sidebarCollapsed} onCreate={newChat} onRetry={retryManagedConversations} onSelect={selectManaged} onPrefetch={prefetchConversation}
         persistent={account.account?.persistent === true} triggerRef={sidebarTriggerRef}
       />
       <div className="conversation-main">
@@ -292,7 +297,7 @@ export const AgentExperience = memo(function AgentExperience({
               ? <ReservedTerminal message={managedError} mode={mode} />
               : hasDurableCredential && visibleManagedConversationId
                 ? <ManagedAgentTerminal
-                  key={visibleManagedConversationId} agentId={visibleManagedConversationId} authStatus={authStatus}
+                  key={`${accountId}:${visibleManagedConversationId}`} agentId={visibleManagedConversationId} authStatus={authStatus}
                   mode={mode} onConversationActivity={recordActivity} onStateChange={setRuntimeState}
                   source={credentialSource}
                   voiceEnabled={voiceEnabled}

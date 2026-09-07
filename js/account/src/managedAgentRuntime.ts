@@ -1,3 +1,6 @@
+import { QueryObserver, queryOptions } from "@tanstack/react-query";
+import { appQueryClient, accountQueryKey, sessionQueryKey } from "./queryClient.ts";
+import type { BrowserSession } from "./sessionQueries.ts";
 import type { AgentEvent } from "nanocodex";
 import {
   Agent,
@@ -20,8 +23,6 @@ const DEFAULT_MANAGED_CREATE_SETTINGS: ManagedCreateSettings = Object.freeze({
   fastMode: false,
 });
 export const MAX_MANAGED_RETAINED_ENVELOPES = MANAGED_HISTORY_PAGE_SIZE * 2;
-const managedAgents = new Map<string, ManagedAgent>();
-const managedLists = new Map<string, Promise<readonly ManagedConversation[]>>();
 const managedCreates = new Map<string, Promise<ManagedConversation>>();
 
 export type ManagedConversation = Readonly<{
@@ -39,25 +40,60 @@ export type ManagedConversationSelection = Readonly<{
 
 export type ManagedTerminalSource = Pick<ManagedAgent, "events" | "id" | "turn" | "type">;
 
-export function listManagedConversations(
+function queryFetch(signal: AbortSignal): typeof fetch {
+  return (input, init) => fetch(input, {
+    ...init,
+    signal: init?.signal ? AbortSignal.any([signal, init.signal]) : signal,
+  });
+}
+
+export const managedConversationsKey = (accountId: string) => [...accountQueryKey(accountId), "conversations"] as const;
+
+export function managedConversationsQueryOptions(accountId: string) {
+  return queryOptions({
+    queryKey: managedConversationsKey(accountId),
+    queryFn: async ({ signal }) => {
+      const agents = await Agent.list({ fetch: queryFetch(signal) });
+      signal.throwIfAborted();
+      return Object.freeze(agents.map(managedConversation).sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0)));
+    },
+    staleTime: 15_000,
+  });
+}
+
+export function managedConversationQueryOptions(accountId: string, agentId: string) {
+  return queryOptions({
+    queryKey: [...accountQueryKey(accountId), "conversation", agentId],
+    queryFn: async ({ signal }) => {
+      const state = await Agent.open(agentId, { fetch: queryFetch(signal) }).state();
+      signal.throwIfAborted();
+      return state;
+    },
+    staleTime: 30_000,
+  });
+}
+
+export async function listManagedConversations(
   accountId = "default",
   options: Readonly<{ refresh?: boolean }> = {},
 ): Promise<readonly ManagedConversation[]> {
-  if (options.refresh) managedLists.delete(accountId);
-  const retained = managedLists.get(accountId);
-  if (retained) return retained;
-  const loading = Agent.list().then((agents) => {
-    const conversations = agents.map((agent) => {
-      managedAgents.set(agent.id, agent);
-      return managedConversation(agent);
-    });
-    return Object.freeze(conversations.sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0)));
-  }).catch((error) => {
-    if (managedLists.get(accountId) === loading) managedLists.delete(accountId);
-    throw error;
-  });
-  managedLists.set(accountId, loading);
-  return loading;
+  const query = managedConversationsQueryOptions(accountId);
+  if (options.refresh) {
+    await appQueryClient.cancelQueries({ queryKey: query.queryKey, exact: true });
+    await appQueryClient.invalidateQueries({ queryKey: query.queryKey, exact: true, refetchType: "none" });
+  }
+  return appQueryClient.fetchQuery(query);
+}
+
+export function recordManagedConversationActivity(accountId: string, agentId: string, input: string): void {
+  appQueryClient.setQueryData(managedConversationsQueryOptions(accountId).queryKey, (current) => current
+    ? Object.freeze(current.map((item) => item.id === agentId ? {
+      ...item,
+      title: (item.turnCount ?? 0) === 0 ? titleFromPrompt(input) : item.title,
+      turnCount: (item.turnCount ?? 0) + 1,
+      updatedAt: Date.now(),
+    } : item).sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0)))
+    : undefined);
 }
 
 export async function loadManagedConversationSelection(options: Readonly<{
@@ -71,15 +107,20 @@ export async function loadManagedConversationSelection(options: Readonly<{
   const accountId = options.accountId ?? "default";
   const listing = listManagedConversations(accountId, { refresh: options.refresh });
   if (options.routeAgentId) {
-    const [exact, listed] = await Promise.all([
-      getManagedConversation(options.routeAgentId),
+    const [, listed] = await Promise.all([
+      appQueryClient.fetchQuery(managedConversationQueryOptions(accountId, options.routeAgentId)),
       listing.catch((): readonly ManagedConversation[] => Object.freeze([])),
     ]);
+    const exact = listed.find(({ id }) => id === options.routeAgentId) ?? Object.freeze({
+      id: options.routeAgentId,
+      title: `Conversation ${options.routeAgentId.slice(0, 8)}`,
+    });
     const conversations = listed.some(({ id }) => id === exact.id)
       ? listed
       : Object.freeze([exact, ...listed]);
-    if (managedLists.get(accountId) === listing) {
-      managedLists.set(accountId, Promise.resolve(conversations));
+    const listState = appQueryClient.getQueryState(managedConversationsKey(accountId));
+    if (conversations !== listed && listState) {
+      appQueryClient.setQueryData(managedConversationsKey(accountId), conversations, { updatedAt: listState.dataUpdatedAt });
     }
     return Object.freeze({ conversations, selectedId: exact.id, replaceRoute: false });
   }
@@ -104,14 +145,20 @@ export function createManagedConversation(
   const retained = managedCreates.get(creationKey);
   if (retained) return retained;
   const creating = Agent.create({ settings }).then((agent) => {
-    managedAgents.set(agent.id, agent);
-    managedLists.delete(accountId);
-    return Object.freeze({
+    const conversation = Object.freeze({
       id: agent.id,
       title: "New conversation",
       updatedAt: Date.now(),
       turnCount: 0,
     });
+    const queryKey = managedConversationsKey(accountId);
+    const activeAccount = appQueryClient.getQueryData<BrowserSession>(sessionQueryKey)?.account?.id;
+    if (activeAccount === accountId || appQueryClient.getQueryState(queryKey)) {
+      appQueryClient.setQueryData<readonly ManagedConversation[]>(queryKey, (current) =>
+        Object.freeze([conversation, ...(current ?? []).filter(({ id }) => id !== conversation.id)]));
+      void appQueryClient.invalidateQueries({ queryKey, exact: true });
+    }
+    return conversation;
   }).finally(() => {
     if (managedCreates.get(creationKey) === creating) managedCreates.delete(creationKey);
   });
@@ -124,15 +171,7 @@ export function openManagedTerminalAgent(agentId: string): ControllerAgent {
 }
 
 export function openManagedAgent(agentId: string): ManagedAgent {
-  const managed = managedAgents.get(agentId) ?? Agent.open(agentId);
-  managedAgents.set(agentId, managed);
-  return managed;
-}
-
-async function getManagedConversation(agentId: string): Promise<ManagedConversation> {
-  const managed = await Agent.get(agentId);
-  managedAgents.set(agentId, managed);
-  return managedConversation(managed);
+  return Agent.open(agentId);
 }
 
 function managedConversation(agent: ManagedAgent): ManagedConversation {
@@ -148,7 +187,7 @@ function managedConversation(agent: ManagedAgent): ManagedConversation {
 
 export function managedTerminalAgent(
   managed: ManagedTerminalSource,
-  options: Readonly<{ history?: boolean }> = {},
+  options: Readonly<{ history?: boolean; accountId?: string }> = {},
 ): ControllerAgent {
   const historyEnabled = options.history !== false;
   const submitted = historyEnabled ? undefined : new Set<string>();
@@ -156,7 +195,7 @@ export function managedTerminalAgent(
     sessionId: managed.id,
     ...(isManagedAgent(managed) ? { voiceSource: managed } : {}),
     events: Object.freeze({
-      watch: () => managedEventWatcher(managed, submitted, historyEnabled),
+      watch: () => managedEventWatcher(managed, submitted, historyEnabled, options.accountId),
     }),
     turn: Object.freeze({
       prompt: ({ input }: { input: string }) => {
@@ -188,19 +227,36 @@ function managedTerminalTurn(managed: ManagedTerminalSource, turnId: string, inp
   });
 }
 
+type RetainedManagedHistory = Readonly<{
+  envelopes: readonly ManagedEvent[];
+  events: readonly AgentEvent[];
+  sequence: number;
+  hasOlder: boolean;
+  latestCursor: string;
+  olderBeforeCursor: string | undefined;
+}>;
+
 function managedEventWatcher(
   managed: ManagedTerminalSource,
   submitted: Set<string> | undefined,
   historyEnabled: boolean,
+  accountId?: string,
 ): ReturnType<ControllerAgent["events"]["watch"]> {
   const controller = new AbortController();
+  const cacheKey = [...accountQueryKey(accountId), "conversation-history", managed.id] as const;
+  const cached = historyEnabled && accountId ? appQueryClient.getQueryData<RetainedManagedHistory>(cacheKey) : undefined;
+  const cacheObserver = historyEnabled && accountId ? new QueryObserver<RetainedManagedHistory>(appQueryClient, {
+    queryKey: cacheKey, enabled: false, staleTime: Infinity, structuralSharing: false,
+  }) : undefined;
+  const releaseCache = cacheObserver?.subscribe(() => {});
+  const cacheQuery = appQueryClient.getQueryCache().find({ queryKey: cacheKey, exact: true });
   const listeners = new Set<(event: AgentEvent) => void>();
   const historyListeners = new Set<(events: readonly AgentEvent[]) => void>();
-  const envelopes: ManagedEvent[] = [];
-  const seen = new Set<string>();
-  let sequence = 0;
-  let hasOlder = false;
-  let historyLoaded = false;
+  const envelopes: ManagedEvent[] = [...(cached?.envelopes ?? [])];
+  const seen = new Set(envelopes.map(({ cursor }) => cursor));
+  let sequence = cached?.sequence ?? 0;
+  let hasOlder = cached?.hasOlder ?? false;
+  let historyLoaded = cached !== undefined;
   let loadingOlder: Promise<boolean> | undefined;
   let loadingInitial: Promise<boolean> | undefined;
   let historyPageInFlight: Promise<Awaited<ReturnType<typeof managed.events.page>>> | undefined;
@@ -208,9 +264,9 @@ function managedEventWatcher(
   let outageReported = false;
   let historyRetryDelay = MANAGED_HISTORY_RETRY_INITIAL_MS;
   let historyRetryTimer: ReturnType<typeof setTimeout> | undefined;
-  let latestLiveCursor: string | undefined;
-  let olderBeforeCursor: string | undefined;
-  let historySnapshot: readonly AgentEvent[] = Object.freeze([]);
+  let latestLiveCursor = cached?.latestCursor;
+  let olderBeforeCursor = cached?.olderBeforeCursor;
+  let historySnapshot: readonly AgentEvent[] = cached?.events ?? Object.freeze([]);
   const emit = (event: AgentEvent) => {
     for (const listener of listeners) listener(event);
   };
@@ -291,6 +347,10 @@ function managedEventWatcher(
           const turnId = managedEnvelopeTurnId(envelope);
           if (!historyEnabled && !submitted?.has(turnId ?? "")) continue;
           if (!retain(envelope)) continue;
+          if (accountId && (envelope.data.type === "turn_accepted" || managedOuterTerminal(envelope))) {
+            void appQueryClient.invalidateQueries({ queryKey: managedConversationsKey(accountId), exact: true });
+            void appQueryClient.invalidateQueries({ queryKey: managedConversationQueryOptions(accountId, managed.id).queryKey, exact: true });
+          }
           const projected = managedEnvelopeEvents(
             envelope,
             rawAssistantMessageTurns(envelopes),
@@ -443,7 +503,10 @@ function managedEventWatcher(
   };
   if (historyEnabled) {
     globalThis.addEventListener?.("online", retryWhenOnline);
-    void loadInitial();
+    if (cached) {
+      startTail(cached.latestCursor);
+      if (hasOlder) void loadRemainingHistory();
+    } else void loadInitial();
   } else {
     historyLoaded = true;
     startTail("latest");
@@ -464,7 +527,16 @@ function managedEventWatcher(
       return loadOlderPage();
     },
     off() {
+      if (controller.signal.aborted) return;
+      if (cacheObserver && historyLoaded && latestLiveCursor !== undefined
+        && cacheQuery === appQueryClient.getQueryCache().find({ queryKey: cacheKey, exact: true })) {
+        appQueryClient.setQueryData<RetainedManagedHistory>(cacheKey, {
+          envelopes: [...envelopes], events: historySnapshot, sequence, hasOlder,
+          latestCursor: latestLiveCursor, olderBeforeCursor,
+        });
+      }
       controller.abort();
+      releaseCache?.();
       if (historyRetryTimer !== undefined) clearTimeout(historyRetryTimer);
       globalThis.removeEventListener?.("online", retryWhenOnline);
       listeners.clear();

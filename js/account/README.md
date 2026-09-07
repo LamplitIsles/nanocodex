@@ -57,6 +57,24 @@ configuration and deployment attestation.
 
 ## Development and deployment
 
+React server state follows the [Wagmi TanStack Query patterns](https://wagmi.sh/react/guides/tanstack-query):
+reusable typed query options, deterministic keys, declarative enabled conditions,
+and mutation-driven invalidation. `BrowserApplication` provides one QueryClient
+shared with route prefetches. Account metadata uses account ID and endpoint keys;
+credentials and vault views select from the same cached response. Reads are fresh
+for 30 seconds by default and inactive queries expire after 10 minutes. Public
+repository metadata and changelog reads use five minutes of freshness; immutable
+commit pages and file contents use revision/object keys. Evals retains its live
+polling policy. Session transitions cancel and remove the previous account's
+queries. Private data stays in memory; form secrets and one-time API keys stay
+in component state. Thread lists and state/settings use account-and-thread keys;
+sidebar hover/focus prefetches thread state. Switching back restores retained
+history immediately and resumes the managed stream after its last durable
+cursor, including events received while another thread was open. Detached
+history expires after ten minutes; account changes remove it. Live turn events
+invalidate the list and selected thread state. Streaming transport and
+OAuth/device lifecycles retain their existing protocol ownership.
+
 Use the checkout-level operator interface in [AGENTS.md](../../AGENTS.md) for
 local development, checks, deployment, and verification. This package exposes
 the supporting `dev`, `build`, `test`, `typecheck`, `check:docs`, and `deploy`

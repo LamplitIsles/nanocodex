@@ -40,6 +40,7 @@ export function AgentSidebar({
   onCreate,
   onRetry,
   onSelect,
+  onPrefetch,
   open,
   pending,
   persistent,
@@ -57,6 +58,7 @@ export function AgentSidebar({
   onCreate(): void;
   onRetry(): void;
   onSelect(id: string): void;
+  onPrefetch(id: string): void;
   open: boolean;
   pending: boolean;
   persistent: boolean;
@@ -182,6 +184,8 @@ export function AgentSidebar({
                     key={conversation.id}
                     type="button"
                     title={conversation.title}
+                    onPointerEnter={() => onPrefetch(conversation.id)}
+                    onFocus={() => onPrefetch(conversation.id)}
                     disabled={pending}
                     aria-current={
                       conversation.id === selectedId ? "location" : undefined

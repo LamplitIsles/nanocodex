@@ -1,7 +1,10 @@
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useAccountSession } from "./AccountSession";
+import { accountQueryKey } from "./queryClient";
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Clock3, X } from "lucide-react";
-import type { ManagedCronTrigger as CronTrigger, ManagedAgent } from "nanocodex/managed";
+import type { ManagedAgent } from "nanocodex/managed";
 import "./ManagedAgentSchedules.css";
 
 type ScheduleAgent = Pick<ManagedAgent, "id" | "triggers">;
@@ -23,45 +26,44 @@ export function ManagedAgentSchedules({ agent }: { agent: ScheduleAgent }) {
 function ScheduleDialog({ agent, onClose }: { agent: ScheduleAgent; onClose(): void }) {
   const dialog = useRef<HTMLDialogElement>(null);
   const active = useRef(false);
-  const locked = useRef(false);
-  const [rows, setRows] = useState<readonly CronTrigger[]>();
-  const [pending, setPending] = useState(false);
-  const [error, setError] = useState<string>();
+  const accountId = useAccountSession().account?.id;
+  const client = useQueryClient();
+  const queryKey = [...accountQueryKey(accountId), "schedules", agent.id] as const;
+  const query = useQuery({ queryKey, queryFn: () => agent.triggers.list(), enabled: Boolean(accountId), staleTime: 15_000, refetchInterval: 30_000 });
+  const rows = query.data;
+  const [operationError, setError] = useState<string>();
+  const mutation = useMutation({
+    mutationKey: [...queryKey, "edit"],
+    mutationFn: (operation: () => Promise<void>) => operation(),
+    onSuccess: async () => {
+      await client.cancelQueries({ queryKey, exact: true });
+      await client.invalidateQueries({ queryKey, exact: true });
+    },
+  });
+  const pending = mutation.isPending || query.isFetching;
+  const error = operationError ?? query.error?.message;
   const [notice, setNotice] = useState("");
   const [draft, setDraft] = useState<Draft>();
   const [editing, setEditing] = useState(false);
   const [deleting, setDeleting] = useState<string>();
 
   async function run(operation: () => Promise<void>) {
-    if (locked.current) return;
-    locked.current = true;
-    setPending(true);
+    if (mutation.isPending) return;
     setError(undefined);
     setNotice("");
-    try { await operation(); }
+    try { await mutation.mutateAsync(operation); }
     catch (cause) { if (active.current) setError(cause instanceof Error ? cause.message : "Request failed. Please retry."); }
-    finally {
-      locked.current = false;
-      if (active.current) setPending(false);
-    }
   }
 
   async function refresh() {
-    const listed = await agent.triggers.list();
-    if (active.current) setRows(listed);
+    await query.refetch();
   }
 
   useEffect(() => {
     active.current = true;
     dialog.current?.showModal();
-    void run(refresh);
     return () => { active.current = false; dialog.current?.close(); };
   }, [agent]);
-
-  function replace(saved: CronTrigger) {
-    if (!active.current) return;
-    setRows((current) => [...(current ?? []).filter((row) => row.id !== saved.id), saved].sort((a, b) => a.id.localeCompare(b.id)));
-  }
 
   return <dialog ref={dialog} className="agent-schedules" aria-labelledby="agent-schedules-title"
     onCancel={(event) => { event.preventDefault(); onClose(); }}>
@@ -75,7 +77,7 @@ function ScheduleDialog({ agent, onClose }: { agent: ScheduleAgent; onClose(): v
         <button type="button" disabled={pending || rows === undefined || Boolean(draft)} onClick={() => {
           setDraft(freshDraft()); setEditing(false); setDeleting(undefined); setError(undefined); setNotice("");
         }}>New schedule</button>
-        <button type="button" disabled={pending} onClick={() => void run(refresh)}>Refresh</button>
+        <button type="button" disabled={pending} onClick={() => void refresh()}>Refresh</button>
       </div>
       {error && <p role="alert" className="agent-schedules-error">{error}</p>}
       <p role="status" className="agent-schedules-status">{pending ? "Saving or loading…" : notice}</p>
@@ -90,9 +92,9 @@ function ScheduleDialog({ agent, onClose }: { agent: ScheduleAgent; onClose(): v
         void run(async () => {
           if (!config.input.trim()) throw new Error("Enter a prompt.");
           if (!editing && rows?.some((row) => row.id === id)) throw new Error("That schedule ID already exists. Choose another ID or edit the existing schedule.");
-          const saved = await agent.triggers.put(id, config);
+          await agent.triggers.put(id, config);
           if (!active.current) return;
-          replace(saved); setDraft(undefined); setNotice(editing ? "Schedule updated." : "Schedule created.");
+          setDraft(undefined); setNotice(editing ? "Schedule updated." : "Schedule created.");
         });
       }}>
         <h3>{editing ? "Edit schedule" : "New schedule"}</h3>
@@ -147,7 +149,7 @@ function ScheduleDialog({ agent, onClose }: { agent: ScheduleAgent; onClose(): v
             }}>Edit</button>
             <button type="button" disabled={pending || Boolean(draft)} onClick={() => void run(async () => {
               const saved = await agent.triggers.put(row.id, { cron: row.cron, timezone: row.timezone, input: row.input, enabled: !row.enabled, session_mode: row.session_mode });
-              replace(saved); if (active.current) setNotice(saved.enabled ? "Schedule resumed." : "Schedule paused. Any running turn continues.");
+              if (active.current) setNotice(saved.enabled ? "Schedule resumed." : "Schedule paused. Any running turn continues.");
             })}>{row.enabled ? "Pause" : "Resume"}</button>
             <button type="button" disabled={pending || Boolean(draft)} onClick={() => setDeleting(row.id)}>Delete</button>
           </div>
@@ -157,7 +159,6 @@ function ScheduleDialog({ agent, onClose }: { agent: ScheduleAgent; onClose(): v
               <button type="button" disabled={pending} onClick={() => void run(async () => {
                 await agent.triggers.delete(row.id);
                 if (!active.current) return;
-                setRows((current) => current?.filter((item) => item.id !== row.id));
                 setDeleting(undefined); setNotice("Schedule deleted.");
               })}>Confirm delete</button>
               <button type="button" disabled={pending} onClick={() => setDeleting(undefined)}>Keep schedule</button>

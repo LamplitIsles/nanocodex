@@ -1,3 +1,4 @@
+import { useAccountQuery } from "./useAccountQuery";
 import { KeyRound, LockKeyhole, Plus, Trash2, X } from "lucide-react";
 import {
   useCallback,
@@ -45,41 +46,24 @@ export function Vault() {
   const session = useAccountSession();
   const refreshSession = session.refresh;
   const accountId = session.account?.persistent ? session.account.id : undefined;
-  const [status, setStatus] = useState<VaultStatus | null>(null);
-  const [failure, setFailure] = useState<string | null>(null);
+  const [operationFailure, setFailure] = useState<string | null>(null);
   const [operation, setOperation] = useState<string | null>(null);
   const [adding, setAdding] = useState<VaultEntryKind | null>(null);
   const dialogReturnFocusRef = useRef<HTMLElement | null>(null);
   const closeDialog = useCallback(() => setAdding(null), []);
 
+  const { query, refresh } = useAccountQuery(accountId, "/v1/credentials", decodeVaultStatus);
+  const status = query.data ?? null;
+  const failure = operationFailure ?? (query.error ? clientFailureMessage(query.error, "Couldn’t load your vault.") : null);
   const load = useCallback(async () => {
-    if (!accountId) return;
     setFailure(null);
-    try {
-      const response = await vaultRequest("/v1/credentials");
-      if (response.status === 401) {
-        await response.body?.cancel();
-        await refreshSession();
-        return;
-      }
-      if (!response.ok) throw await responseFailure(response, "Couldn’t load your vault.");
-      const value: unknown = await response.json();
-      if (!isRecord(value)) throw new Error("Invalid vault response.");
-      setStatus({
-        ssh: decodeSshIdentities(value.ssh),
-        entries: decodeVaultEntries(value.vault),
-      });
-    } catch (cause) {
-      setFailure(clientFailureMessage(cause, "Couldn’t load your vault."));
-    }
-  }, [accountId, refreshSession]);
+    await refresh();
+  }, [refresh]);
 
   useEffect(() => {
-    setStatus(null);
     setFailure(null);
     setAdding(null);
-    if (accountId) void load();
-  }, [accountId, load]);
+  }, [accountId]);
 
   const save = async (kind: VaultEntryKind, values: Record<string, string>) => {
     if (operation) return;
@@ -97,11 +81,8 @@ export function Vault() {
         return;
       }
       if (!response.ok) throw await responseFailure(response, `Couldn’t add the ${kind}.`);
-      const entry = decodeVaultEntries([await response.json()])[0]!;
-      setStatus((current) => current ? {
-        ...current,
-        entries: [entry, ...current.entries.filter((candidate) => candidate.id !== entry.id)],
-      } : current);
+      await response.body?.cancel();
+      await load();
       setAdding(null);
     } catch (cause) {
       setFailure(clientFailureMessage(cause, `Couldn’t add the ${kind}. Check every field and try again.`));
@@ -122,10 +103,8 @@ export function Vault() {
         return;
       }
       if (!response.ok) throw await responseFailure(response, "Couldn’t delete the vault item.");
-      setStatus((current) => current ? {
-        ...current,
-        entries: current.entries.filter((candidate) => candidate.id !== entry.id),
-      } : current);
+      await response.body?.cancel();
+      await load();
     } catch (cause) {
       setFailure(clientFailureMessage(cause, "Couldn’t delete the vault item."));
     } finally {
@@ -384,4 +363,9 @@ async function vaultRequest(path: string, init: RequestInit = {}): Promise<Respo
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function decodeVaultStatus(value: unknown): VaultStatus {
+  if (!isRecord(value)) throw new Error("Invalid vault response.");
+  return { ssh: decodeSshIdentities(value.ssh), entries: decodeVaultEntries(value.vault) };
 }

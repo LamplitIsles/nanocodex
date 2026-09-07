@@ -1,3 +1,4 @@
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   memo,
   type ReactNode,
@@ -35,8 +36,9 @@ import {
 import { clientFailureMessage } from "./clientFailure";
 import { AgentModelMenu } from "./AgentModelMenu";
 import { attachManagedBrowserHand } from "./managedBrowserHand";
+import { useAccountSession } from "./AccountSession";
 import { RemoteScreens } from "./RemoteScreens";
-import { managedTerminalAgent, openManagedAgent } from "./managedAgentRuntime";
+import { managedConversationQueryOptions, managedTerminalAgent, openManagedAgent } from "./managedAgentRuntime";
 
 export type { AgentTerminalMode, AgentTerminalState } from "nanocodex-terminal";
 export { AgentTerminalView } from "nanocodex-terminal";
@@ -235,13 +237,31 @@ export const ManagedAgentTerminal = memo(function ManagedAgentTerminal({
   source: Exclude<CredentialSource, null>;
   voiceEnabled: boolean;
 }) {
-  const managed = useMemo(() => openManagedAgent(agentId), [agentId]);
-  const agent = useMemo(() => managedTerminalAgent(managed), [managed]);
-  const [settings, setSettings] = useState<ManagedCreateSettings>(() => (
-    terminalDefaultSettings(source)
-  ));
-  const [settingsReady, setSettingsReady] = useState(false);
-  const [conversationStarted, setConversationStarted] = useState(true);
+  const accountId = useAccountSession().account?.id;
+  const queryClient = useQueryClient();
+  const managed = useMemo(() => openManagedAgent(agentId), [accountId, agentId]);
+  const agent = useMemo(() => managedTerminalAgent(managed, { accountId }), [accountId, managed]);
+  const stateOptions = managedConversationQueryOptions(accountId ?? "", agentId);
+  const stateQuery = useQuery({ ...stateOptions, enabled: Boolean(accountId) });
+  const wireSettings = stateQuery.data?.settings;
+  const settings: ManagedCreateSettings = wireSettings ? {
+    model: wireSettings.model, thinking: wireSettings.thinking,
+    reasoningMode: wireSettings.reasoning_mode, fastMode: wireSettings.fast_mode,
+  } : terminalDefaultSettings(source);
+  const settingsReady = stateQuery.isSuccess && Boolean(wireSettings);
+  const [locallyStarted, setLocallyStarted] = useState(false);
+  const conversationStarted = locallyStarted || stateQuery.data?.accepted_turns !== 0;
+  const settingsMutation = useMutation({
+    mutationKey: [...stateOptions.queryKey, "settings"],
+    mutationFn: (patch: Partial<ManagedCreateSettings>) => managed.settings.update(patch),
+    onSuccess: async (updated) => {
+      await queryClient.cancelQueries({ queryKey: stateOptions.queryKey, exact: true });
+      queryClient.setQueryData(stateOptions.queryKey, (current) => current ? {
+        ...current,
+        settings: { model: updated.model, thinking: updated.thinking, reasoning_mode: updated.reasoningMode, fast_mode: updated.fastMode },
+      } : undefined);
+    },
+  });
   const [browserHand, setBrowserHand] = useState<Awaited<ReturnType<typeof attachManagedBrowserHand>>>();
   const [browserHandSettledFor, setBrowserHandSettledFor] = useState<typeof managed>();
   const [browserHandAttempt, setBrowserHandAttempt] = useState(0);
@@ -279,34 +299,20 @@ export const ManagedAgentTerminal = memo(function ManagedAgentTerminal({
       if (retry) clearTimeout(retry);
       if (hand) void hand.close();
     };
-  }, [browserHandAttempt, managed]);
-  useEffect(() => {
-    let active = true;
-    setSettingsReady(false);
-    void Promise.all([managed.state(), managed.settings.read()]).then(([state, current]) => {
-      if (!active) return;
-      setSettings(current);
-      setConversationStarted(state.accepted_turns > 0);
-      setSettingsReady(true);
-    }).catch((error) => {
-      if (!active) return;
-      console.warn("nanocodex:managed_settings_failed", { error: errorMessage(error) });
-    });
-    return () => { active = false; };
-  }, [managed]);
+  }, [accountId, browserHandAttempt, managed]);
   const retryAgent = useCallback(() => {
     setBrowserHandAttempt((current) => current + 1);
-  }, []);
+    void stateQuery.refetch();
+  }, [stateQuery.refetch]);
   const recordConversationActivity = useCallback((input: string) => {
-    setConversationStarted(true);
+    setLocallyStarted(true);
     onConversationActivity(input);
   }, [onConversationActivity]);
   const updateManagedSettings = useCallback(async (
     patch: Partial<ManagedCreateSettings>,
   ) => {
-    const updated = await managed.settings.update(patch);
-    setSettings(updated);
-  }, [managed]);
+    await settingsMutation.mutateAsync(patch);
+  }, [settingsMutation.mutateAsync]);
   // Keep the first prompt queued while this page's hand is still attaching,
   // so the host can include it in the initial environment snapshot. A failed
   // optional hand does not block the managed brain or subsequent reconnects.
@@ -314,7 +320,7 @@ export const ManagedAgentTerminal = memo(function ManagedAgentTerminal({
   return (
     <AgentTerminalView
       agent={startupReady ? agent : undefined}
-      agentError={undefined}
+      agentError={stateQuery.error?.message}
       inactiveMessage={({ agentError, agentStatus }) => inactiveTerminalMessage({
         agentError,
         agentStatus,

@@ -1,3 +1,6 @@
+import { useQuery } from "@tanstack/react-query";
+import { useAccountSession } from "./AccountSession";
+import { accountQueryKey } from "./queryClient";
 import { useEffect, useRef, useState, type PointerEvent, type KeyboardEvent } from "react";
 import { createPortal } from "react-dom";
 import { Monitor, X } from "lucide-react";
@@ -5,28 +8,31 @@ import { listRemoteHands, RemoteBrowserSession, remoteKeys, type RemoteHand, typ
 import "./RemoteScreens.css";
 
 export function RemoteScreens({ showLabel = false }: { showLabel?: boolean }) {
+  const accountId = useAccountSession().account?.id;
   const [open, setOpen] = useState(false);
   return <>
     <button type="button" className="remote-screens-open" aria-haspopup="dialog" aria-label="Remote screens" title="Remote screens"
       onClick={() => setOpen(true)}><Monitor size={17} aria-hidden="true" />{showLabel && "Screens"}</button>
-    {open && createPortal(<ScreensDialog onClose={() => setOpen(false)} />, document.body)}
+    {open && createPortal(<ScreensDialog key={accountId} onClose={() => setOpen(false)} />, document.body)}
   </>;
 }
 
 function ScreensDialog({ onClose }: { onClose(): void }) {
   const dialog = useRef<HTMLDialogElement>(null);
-  const [hands, setHands] = useState<readonly RemoteHand[]>([]);
+  const accountId = useAccountSession().account?.id;
+  const query = useQuery({
+    queryKey: [...accountQueryKey(accountId), "remote-screens"],
+    queryFn: ({ signal }) => listRemoteHands(signal),
+    enabled: Boolean(accountId),
+    staleTime: 5_000,
+    refetchInterval: 5_000,
+  });
+  const hands = query.data ?? [];
+  const error = query.error?.message;
   const [selected, setSelected] = useState<RemoteHand>();
-  const [error, setError] = useState("");
   useEffect(() => {
     dialog.current?.showModal();
-    const abort = new AbortController();
-    const refresh = async () => {
-      try { const hands = await listRemoteHands(abort.signal); if (!abort.signal.aborted) { setHands(hands); setError(""); } }
-      catch (error) { if (!abort.signal.aborted) setError(error instanceof Error ? error.message : "Could not list screens."); }
-    };
-    void refresh(); const timer = setInterval(() => void refresh(), 5000);
-    return () => { abort.abort(); clearInterval(timer); dialog.current?.close(); };
+    return () => dialog.current?.close();
   }, []);
   return <dialog ref={dialog} className="remote-screens" aria-labelledby="remote-screens-title"
     onCancel={event => { event.preventDefault(); onClose(); }}>
