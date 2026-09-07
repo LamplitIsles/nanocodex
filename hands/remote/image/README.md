@@ -1,0 +1,70 @@
+# Releasing the Linux server Hand image
+
+The manual `Linux Hand image` workflow builds `hands/remote/image/Dockerfile`
+on native AMD64 and ARM64 GitHub runners. Zig runs on the target architecture;
+the build does not depend on Rosetta or QEMU. Each image must start a non-root
+headless desktop, capture and decode a JPEG, and encode and decode H.264 before
+publication. The smoke container has no network and is removed on exit.
+
+After the workflow is on master, validate both architectures without publishing:
+
+```sh
+gh workflow run hand-image.yml --ref master -f publish=false
+gh run list --workflow hand-image.yml --limit 1
+gh run watch RUN_ID --exit-status
+```
+
+To publish a verified image:
+
+```sh
+gh workflow run hand-image.yml --ref master -f publish=true
+gh run list --workflow hand-image.yml --limit 1
+gh run watch RUN_ID --exit-status
+gh run download RUN_ID --name hand-image-receipt --dir /tmp/nanocodex-hand-release
+```
+
+Publication is restricted to master. Both architecture jobs must succeed before
+the manifest is created. Tags include the full source commit, run ID, and attempt;
+the receipt records the immutable multi-architecture manifest digest, each child
+digest, and the manifest itself. No `latest` tag is used. The workflow uses the
+repository's package-write `GITHUB_TOKEN`; it does not deploy Workers or update
+their configuration.
+
+The SSH installer pulls without registry credentials. Make the
+`gakonst/nanocodex-hand` GitHub package public if its initial publication is
+private, then verify anonymous access before configuring the service:
+
+```sh
+HAND_IMAGE=$(cat /tmp/nanocodex-hand-release/hand-image.txt)
+ANONYMOUS_DOCKER_CONFIG=$(mktemp -d)
+docker --config "$ANONYMOUS_DOCKER_CONFIG" manifest inspect "$HAND_IMAGE"
+docker --config "$ANONYMOUS_DOCKER_CONFIG" pull --platform linux/amd64 "$HAND_IMAGE"
+docker --config "$ANONYMOUS_DOCKER_CONFIG" pull --platform linux/arm64 "$HAND_IMAGE"
+rm -rf "$ANONYMOUS_DOCKER_CONFIG"
+```
+
+Set `NANOCODEX_HAND_IMAGE` in the production `vars` of
+`js/managed/wrangler.jsonc` to the exact `ghcr.io/gakonst/nanocodex-hand@sha256:...`
+receipt. The managed SSH installer rejects mutable tags. Deploy egress, managed,
+then account using the root deployment scripts, or the existing Cloudflare
+production workflow. Reverting this variable to a previously verified digest
+selects that image for subsequent server setup; existing running hosts retain
+their current image until explicitly reconnected.
+
+Cloudflare Sandbox desktops use the separate AMD64 `js/managed/Dockerfile`,
+which bundles the desktop with the Sandbox SDK. `NANOCODEX_SANDBOX_DESKTOPS=true`
+enables publication from those containers. It is independent of the SSH image
+variable. The Cloudflare workflow includes Hand source and image preparation
+scripts when deciding whether a container rollout is necessary.
+
+For a local native build, use the host architecture (`arm64` on Apple Silicon):
+
+```sh
+docker buildx build --platform linux/arm64 --load \
+  --tag nanocodex-server-hand:local --file hands/remote/image/Dockerfile hands/remote
+bash hands/remote/image/smoke.sh nanocodex-server-hand:local arm64
+```
+
+Use the native CI jobs for the combined release. The Cloudflare image's native
+cross-compiler is specific to its AMD64 SDK target and is not the server image
+release path.

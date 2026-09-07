@@ -47,7 +47,10 @@ jobs:
           rollout=immediate
           if [ -n "$BASE_SHA" ] && [ "$BASE_SHA" != "0000000000000000000000000000000000000000" ]; then
             git fetch --no-tags --depth=1 origin "$BASE_SHA"
-            if git diff --quiet "$BASE_SHA" "$GITHUB_SHA" -- js/managed/Dockerfile js/managed/wrangler.jsonc; then
+            if git diff --quiet "$BASE_SHA" "$GITHUB_SHA" -- \
+              js/managed/Dockerfile js/managed/wrangler.jsonc js/managed/.dockerignore \
+              js/managed/scripts/prepare-hand-image.mjs js/managed/scripts/bundle-hand-desktop.sh \
+              hands/remote; then
               rollout=none
             fi
           fi
@@ -144,7 +147,10 @@ jobs:
           rollout=immediate
           if [ -n "$BASE_SHA" ] && [ "$BASE_SHA" != "0000000000000000000000000000000000000000" ]; then
             git fetch --no-tags --depth=1 origin "$BASE_SHA"
-            if git diff --quiet "$BASE_SHA" "$GITHUB_SHA" -- js/managed/Dockerfile js/managed/wrangler.jsonc; then
+            if git diff --quiet "$BASE_SHA" "$GITHUB_SHA" -- \
+              js/managed/Dockerfile js/managed/wrangler.jsonc js/managed/.dockerignore \
+              js/managed/scripts/prepare-hand-image.mjs js/managed/scripts/bundle-hand-desktop.sh \
+              hands/remote; then
               rollout=none
             fi
           fi
