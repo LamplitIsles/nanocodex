@@ -37,11 +37,20 @@ private, then verify anonymous access before configuring the service:
 ```sh
 HAND_IMAGE=$(cat /tmp/nanocodex-hand-release/hand-image.txt)
 ANONYMOUS_DOCKER_CONFIG=$(mktemp -d)
+printf '%s\n' '{"auths":{"ghcr.io":{}}}' > "$ANONYMOUS_DOCKER_CONFIG/config.json"
 docker --config "$ANONYMOUS_DOCKER_CONFIG" manifest inspect "$HAND_IMAGE"
-docker --config "$ANONYMOUS_DOCKER_CONFIG" pull --platform linux/amd64 "$HAND_IMAGE"
-docker --config "$ANONYMOUS_DOCKER_CONFIG" pull --platform linux/arm64 "$HAND_IMAGE"
+for arch in amd64 arm64; do
+  child=$(cat "/tmp/nanocodex-hand-release/digests/digest-$arch.txt")
+  docker --config "$ANONYMOUS_DOCKER_CONFIG" pull --platform "linux/$arch" "$child"
+done
 rm -rf "$ANONYMOUS_DOCKER_CONFIG"
 ```
+
+Use the architecture-specific child digests for this two-platform check: Docker's
+classic image store cannot retain both architectures under one index digest.
+The explicit empty registry entry prevents credential-helper fallback during
+anonymous verification. Production still uses the combined manifest digest;
+Docker selects the server's architecture when it pulls that reference.
 
 Set `NANOCODEX_HAND_IMAGE` in the production `vars` of
 `js/managed/wrangler.jsonc` to the exact `ghcr.io/gakonst/nanocodex-hand@sha256:...`
