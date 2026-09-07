@@ -200,16 +200,14 @@ mod tests {
                 .is_err()
             );
         }
-        for instructions in ["\0".to_owned()] {
-            assert!(
-                VoiceSettings {
-                    instructions,
-                    ..Default::default()
-                }
-                .validate_chatgpt()
-                .is_err()
-            );
-        }
+        assert!(
+            VoiceSettings {
+                instructions: "\0".to_owned(),
+                ..Default::default()
+            }
+            .validate_chatgpt()
+            .is_err()
+        );
         let instructions = "🦊".repeat(2049);
         let session = VoiceSettings {
             instructions: instructions.clone(),

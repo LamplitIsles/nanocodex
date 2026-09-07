@@ -233,8 +233,8 @@ impl ManagedVoiceProtocol {
                 let settings = serde_json::from_value(command["settings"].clone())
                     .map_err(|error| format!("invalid voice settings: {error}"))?;
                 self.protocol.configure(settings)?;
-                return Ok(serde_json::to_value(self.protocol.settings())
-                    .map_err(|error| error.to_string())?);
+                return serde_json::to_value(self.protocol.settings())
+                    .map_err(|error| error.to_string());
             }
             "settings" => {
                 return serde_json::to_value(self.protocol.settings())
