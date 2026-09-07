@@ -38,8 +38,8 @@ jobs:
       - name: Remote companion protocol
         run: go test -race ./...
         working-directory: hands/remote
-      - name: Native remote protocol
-        run: swift test --package-path apple/NanocodexRemote --filter RemoteProtocolTests
+      - name: Native remote video, input, and reconnection
+        run: swift test --package-path apple/NanocodexRemote
       - name: Build shared desktop runtime and dependencies
         run: pnpm exec turbo run build --filter=@nanocodex/desktop-runtime
       - name: Prepare bundled Mac runtime

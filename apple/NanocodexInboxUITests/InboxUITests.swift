@@ -3,20 +3,32 @@ import XCTest
 final class InboxUITests: XCTestCase {
     override func setUp() { super.setUp(); continueAfterFailure = false }
     func testRemoteScreenControlAndReconnect() throws {
-        guard let origin = ProcessInfo.processInfo.environment["NANOCODEX_TEST_REMOTE_ORIGIN"] else {
-            throw XCTSkip("Requires signing into the isolated local account and a published Wayland test desktop")
+        let environment = ProcessInfo.processInfo.environment
+        guard let origin = environment["NANOCODEX_TEST_REMOTE_ORIGIN"],
+              let machine = environment["NANOCODEX_TEST_VM_MACHINE_ID"], machine.hasPrefix("vm:") else {
+            throw XCTSkip("Requires a signed-in account and an explicitly selected disposable VM with a focused test terminal")
         }
-        XCTAssertTrue(URL(string: origin)?.host?.hasSuffix(".localhost") == true)
-        let app = XCUIApplication(); app.launch()
+        XCTAssertEqual(URL(string: origin)?.scheme, "https")
+        let app = XCUIApplication()
+        app.launchEnvironment["NANOCODEX_REMOTE_DIAGNOSTICS"] = "1"
+        app.launch()
+        defer { print("Remote status: \(app.staticTexts["remote-status"].debugDescription)") }
         let screens = app.buttons["Remote screens"]
         XCTAssertTrue(screens.waitForExistence(timeout: 20)); screens.tap()
-        let desktopName = ProcessInfo.processInfo.environment["NANOCODEX_TEST_REMOTE_MACHINE_NAME"] ?? "Wayland desktop test"
-        let desktop = app.buttons.containing(.staticText, identifier: desktopName).firstMatch
+        let desktop = app.buttons["remote-screen:\(machine):desktop"]
         XCTAssertTrue(desktop.waitForExistence(timeout: 15)); desktop.tap()
         let control = app.buttons["Take control"]
         XCTAssertTrue(control.waitForExistence(timeout: 10))
-        let connected = XCTNSPredicateExpectation(predicate: NSPredicate(format: "enabled == true"), object: control)
-        XCTAssertEqual(XCTWaiter.wait(for: [connected], timeout: 25), .completed)
+        func waitForConnection(timeout: TimeInterval = 45) {
+            let connected = XCTNSPredicateExpectation(predicate: NSPredicate(format: "enabled == true"), object: control)
+            let result = XCTWaiter.wait(for: [connected], timeout: timeout)
+            if result != .completed {
+                print("Remote connection failure: \(app.staticTexts["remote-status"].debugDescription)")
+                capture(app, "remote-ios-connection-failure")
+            }
+            XCTAssertEqual(result, .completed)
+        }
+        waitForConnection()
         control.tap()
         XCTAssertTrue(app.buttons["Release control"].waitForExistence(timeout: 5))
         let canvas = app.otherElements["remote-canvas"]
@@ -24,19 +36,75 @@ final class InboxUITests: XCTestCase {
         let remoteReturn = app.buttons.matching(NSPredicate(format: "label == %@", "Return")).firstMatch
         remoteReturn.tap()
         let text = app.textFields["Type on remote screen"]
-        text.tap(); text.typeText("touch /workspace/ios-native-control-evidence")
+        let marker = "ios-native-control-" + UUID().uuidString.lowercased()
+        text.tap(); text.typeText("touch /workspace/\(marker)")
         app.buttons["Send"].tap(); remoteReturn.tap()
         capture(app, "remote-ios-control")
+        // Leave with control and an unsent draft. Returning must retain the
+        // selected screen, release control, and clear input before reconnecting.
+        text.tap(); text.typeText("must-not-be-replayed")
+        XCUIDevice.shared.press(.home)
+        XCTAssertTrue(app.wait(for: .runningBackground, timeout: 10))
+        app.activate()
+        XCTAssertTrue(control.waitForExistence(timeout: 15))
+        waitForConnection()
+        XCTAssertFalse(app.buttons["Release control"].exists)
+        XCTAssertTrue(canvas.exists, "Returning must reopen the selected screen without tapping its catalog row")
+        capture(app, "remote-ios-background-resumed")
+        control.tap()
+        XCTAssertTrue(app.buttons["Release control"].waitForExistence(timeout: 5))
+        XCTAssertEqual(text.value as? String, "Type on remote screen", "Unsent input must be cleared after losing control")
+        text.tap(); text.typeText("ls /workspace/\(marker)")
+        app.buttons["Send"].tap(); remoteReturn.tap()
+        capture(app, "remote-ios-input-after-resume")
+        print("Remote VM evidence file: /workspace/\(marker)")
         app.buttons["Release control"].tap()
         app.buttons["Done"].tap(); app.terminate(); app.launch()
         XCTAssertTrue(screens.waitForExistence(timeout: 20)); screens.tap()
         XCTAssertTrue(desktop.waitForExistence(timeout: 15)); desktop.tap()
         XCTAssertTrue(control.waitForExistence(timeout: 10))
-        let reconnected = XCTNSPredicateExpectation(predicate: NSPredicate(format: "enabled == true"), object: control)
-        XCTAssertEqual(XCTWaiter.wait(for: [reconnected], timeout: 25), .completed)
+        waitForConnection()
         control.tap(); XCTAssertTrue(app.buttons["Release control"].waitForExistence(timeout: 5))
         capture(app, "remote-ios-reconnected")
         app.buttons["Release control"].tap(); app.buttons["Done"].tap()
+        // The same viewer must be reachable without leaving an open chat.
+        // Read an existing chat. Only the explicitly selected disposable VM
+        // receives input; the conversation itself is never changed.
+        app.buttons["Browse agents"].tap()
+        let sidebar = app.otherElements["inbox-sidebar"]
+        XCTAssertTrue(sidebar.waitForExistence(timeout: 10))
+        let candidates = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@", "agent-row:")).allElementsBoundByIndex
+        let chat = try XCTUnwrap(candidates.first { row in
+            row.isHittable && row.frame.minY > sidebar.frame.minY + 180 && row.frame.maxY < app.frame.maxY - 150
+        }, "An existing conversation must be fully visible above the sidebar actions")
+        chat.tap()
+        gone(sidebar)
+        let title = app.staticTexts["agent-title"]
+        XCTAssertTrue(title.waitForExistence(timeout: 10)); title.tap()
+        XCTAssertTrue(app.scrollViews["conversation"].waitForExistence(timeout: 5))
+        let chatScreens = app.buttons["conversation-remote-screens"]
+        XCTAssertTrue(chatScreens.waitForExistence(timeout: 5)); chatScreens.tap()
+        XCTAssertTrue(desktop.waitForExistence(timeout: 15)); desktop.tap()
+        XCTAssertTrue(control.waitForExistence(timeout: 10))
+        waitForConnection()
+        capture(app, "remote-ios-from-conversation")
+        if environment["NANOCODEX_TEST_REMOTE_RESTART"] == "1" {
+            print("REMOTE_RESTART_READY")
+            let disconnected = XCTNSPredicateExpectation(predicate: NSPredicate(format: "enabled == false"), object: control)
+            XCTAssertEqual(XCTWaiter.wait(for: [disconnected], timeout: 30), .completed)
+            waitForConnection(timeout: 90)
+            XCTAssertFalse(app.buttons["Release control"].exists)
+            control.tap()
+            XCTAssertTrue(app.buttons["Release control"].waitForExistence(timeout: 5))
+            canvas.tap()
+            text.tap(); text.typeText("ls /workspace/\(marker); touch /workspace/\(marker)-after-restart")
+            app.buttons["Send"].tap(); remoteReturn.tap()
+            capture(app, "remote-ios-vm-restarted")
+            app.buttons["Release control"].tap()
+        }
+        app.buttons["Done"].tap()
+        XCTAssertTrue(app.scrollViews["conversation"].waitForExistence(timeout: 5))
+        app.buttons["Done"].tap()
     }
 
     @MainActor

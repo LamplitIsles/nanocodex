@@ -13,10 +13,12 @@ func TestRemoteServiceKeepsAllocationCredentialScoped(t *testing.T) {
 		t.Fatal(err)
 	}
 	allocation := "/v1/vm-host-attachments/" + strings.Repeat("p", 43) + "/11111111-1111-4111-8111-111111111111/hands"
+	server := "/v1/hand-hosts/11111111-1111-4111-8111-111111111111/22222222-2222-4222-8222-222222222222/hands"
 	for _, test := range []struct{ origin, path string }{
 		{"https://managed.example", "/v1/account/hands"},
 		{"http://127.0.0.1:4011/", "/v1/account/hands"},
 		{"https://managed.example" + allocation, allocation},
+		{"https://managed.example" + server, server},
 	} {
 		service, err := newRemoteService(test.origin, credential)
 		if err != nil || service.base.Path != test.path {
@@ -27,6 +29,7 @@ func TestRemoteServiceKeepsAllocationCredentialScoped(t *testing.T) {
 		"http://managed.example", "https://user:password@managed.example", "https://managed.example?token=secret",
 		"https://managed.example#fragment", "https://managed.example/v1/account/hands",
 		"https://managed.example" + allocation + "/view", "https://managed.example" + strings.Replace(allocation, "/hands", "/%68ands", 1),
+		"https://managed.example" + server + "/view", "https://managed.example" + strings.Replace(server, "/hands", "/%68ands", 1),
 	} {
 		if _, err := newRemoteService(origin, credential); err == nil {
 			t.Fatalf("accepted invalid endpoint %q", origin)

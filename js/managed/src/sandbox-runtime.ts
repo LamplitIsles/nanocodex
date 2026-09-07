@@ -4,10 +4,12 @@ import {
 } from "@cloudflare/sandbox";
 
 import { handleManagedEgress } from "./managed-egress";
+import { SandboxDesktop, type SandboxDesktopScope, type SandboxHandHosts } from "./sandbox-desktop";
 import { BRAIN_INLINE_BYTES } from "./brain-bucket";
 
 export type SandboxRuntimeEnv = Readonly<{
   NANOCODEX: Fetcher;
+  NANOCODEX_ACCOUNT_TOOLS?: SandboxHandHosts;
 }>;
 
 /**
@@ -18,6 +20,25 @@ export type SandboxRuntimeEnv = Readonly<{
 export class Sandbox extends CloudflareSandbox<SandboxRuntimeEnv> {
   override enableInternet = false;
   override interceptHttps = true;
+  private desktop?: SandboxDesktop;
+
+  private remoteDesktop(): SandboxDesktop {
+    if (!this.env.NANOCODEX_ACCOUNT_TOOLS) throw new Error("sandbox desktop binding is unavailable");
+    return this.desktop ??= new SandboxDesktop(this.ctx.storage, this, this.env.NANOCODEX_ACCOUNT_TOOLS, async ({ owner, id }) => {
+      const subject = await this.ctx.storage.get<string>("nanocodex-egress-subject");
+      if (!subject) throw new Error("sandbox account must be bound before desktop setup");
+      await this.setOutboundByHost("nanocodex-hand.internal", "account", { subject, hand: { owner, id } });
+    });
+  }
+
+  /** Called after the retained workspace is mounted, through trusted Worker RPC. */
+  async configureRemoteDesktop(scope: SandboxDesktopScope): Promise<void> {
+    await this.remoteDesktop().configure(scope);
+  }
+
+  async clearRemoteDesktop(): Promise<void> {
+    if (await this.ctx.storage.get("nanocodex-desktop")) await this.remoteDesktop().clear();
+  }
 
   /** Called over trusted Worker RPC, never derived from container headers. */
   async bindAccountEgress(subject: string): Promise<void> {
@@ -37,6 +58,28 @@ export async function handleSandboxEgress(
   env: SandboxRuntimeEnv,
   context?: Readonly<{ params?: unknown }>,
 ): Promise<Response> {
+  const url = new URL(request.url);
+  if (url.hostname === "nanocodex-hand.internal") {
+    const params = context?.params as { hand?: { owner?: string; id?: string } } | undefined;
+    const hand = params?.hand;
+    const match = /^\/v1\/hand-hosts\/([^/]+)\/([^/]+)\/hands\/(host|renew)$/.exec(url.pathname);
+    if (url.origin !== "https://nanocodex-hand.internal" || url.search || !match || !hand
+      || match[1] !== hand.owner || match[2] !== hand.id || !env.NANOCODEX_ACCOUNT_TOOLS
+      || (match[3] === "host" ? request.method !== "GET" || request.headers.get("upgrade")?.toLowerCase() !== "websocket" : request.method !== "POST")) {
+      return new Response("Sandbox desktop destination is not authorized", { status: 403 });
+    }
+    const headers = new Headers({ "x-nanocodex-owner-id": hand.owner! });
+    for (const name of ["authorization", "upgrade", "content-type"]) {
+      const value = request.headers.get(name);
+      if (value !== null) headers.set(name, value);
+    }
+    // The bound mount determines routing. Its separate publisher credential is
+    // still required by the account broker and cannot view another desktop.
+    return env.NANOCODEX_ACCOUNT_TOOLS.getByName(hand.owner!).fetch(new Request(
+      `https://account-tools.internal/hand-hosts/${hand.id}/hands/${match[3]}`,
+      { method: request.method, headers, body: request.body },
+    ));
+  }
   const headers = new Headers(request.headers);
   // The transparent container proxy reconstructs this from the intercepted
   // destination. It is transport metadata, not a caller-controlled credential,
@@ -57,6 +100,9 @@ export async function handleSandboxEgress(
 }
 
 Sandbox.outbound = handleSandboxEgress;
+// Register this synthetic hostname explicitly, including its DNS interception.
+// Until trusted setup supplies per-instance params, the static handler denies it.
+Sandbox.outboundByHost = { "nanocodex-hand.internal": handleSandboxEgress };
 Sandbox.outboundHandlers = { account: handleSandboxEgress };
 
 /**

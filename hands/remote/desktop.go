@@ -16,19 +16,34 @@ import (
 // Its private credential file is atomically replaced on lease rotation and
 // emptied on shutdown. The compositor survives signaling/credential reconnects.
 func serveDesktop(parent context.Context, config hostConfig, workspace string) error {
+	return serveDesktopSession(parent, config, workspace, "/etc/nanocodex-desktop", true)
+}
+
+// A server desktop runs as the SSH user without a nested VM or a privileged
+// compositor. Its machine credential is independent of the SSH login key.
+func serveDesktopSession(parent context.Context, config hostConfig, workspace, desktopConfig string, vm bool) error {
 	if !filepath.IsAbs(workspace) {
 		return errors.New("desktop workspace must be absolute")
+	}
+	if !filepath.IsAbs(desktopConfig) {
+		return errors.New("desktop configuration must be absolute")
 	}
 	service, err := newRemoteService(config.Origin, config.CredentialFile)
 	if err != nil {
 		return err
 	}
-	if !strings.HasPrefix(service.base.Path, "/v1/vm-host-attachments/") {
-		return errors.New("VM desktops require an allocation-scoped endpoint")
+	prefix := "/v1/hand-hosts/"
+	runtimeParent := os.TempDir()
+	if vm {
+		prefix = "/v1/vm-host-attachments/"
+		runtimeParent = "/run"
+	}
+	if !strings.HasPrefix(service.base.Path, prefix) {
+		return errors.New("desktop requires its scoped publisher endpoint")
 	}
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
-	runtime, err := os.MkdirTemp("/run", "nanocodex-desktop-")
+	runtime, err := os.MkdirTemp(runtimeParent, "nanocodex-desktop-")
 	if err != nil {
 		return err
 	}
@@ -43,7 +58,7 @@ func serveDesktop(parent context.Context, config hostConfig, workspace string) e
 			return err
 		}
 	}
-	compositor := exec.CommandContext(ctx, "labwc", "--config-dir", "/etc/nanocodex-desktop")
+	compositor := exec.CommandContext(ctx, "labwc", "--config-dir", desktopConfig)
 	compositor.Dir = workspace
 	compositor.Stdout, compositor.Stderr = io.Discard, io.Discard
 	compositor.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -56,7 +71,7 @@ func serveDesktop(parent context.Context, config hostConfig, workspace string) e
 	}
 	compositor.WaitDelay = time.Second
 	if err := compositor.Start(); err != nil {
-		return errors.New("cannot start VM compositor")
+		return errors.New("cannot start desktop compositor")
 	}
 	done := make(chan struct{})
 	go func() { _ = compositor.Wait(); cancel(); close(done) }()
@@ -74,9 +89,9 @@ func serveDesktop(parent context.Context, config hostConfig, workspace string) e
 		}
 		select {
 		case <-ctx.Done():
-			return errors.New("VM compositor stopped")
+			return errors.New("desktop compositor stopped")
 		case <-deadline.C:
-			return errors.New("VM compositor did not become ready")
+			return errors.New("desktop compositor did not become ready")
 		case <-tick.C:
 		}
 	}
@@ -89,7 +104,31 @@ func serveDesktop(parent context.Context, config hostConfig, workspace string) e
 	statusPath := config.CredentialFile + ".status"
 	defer os.Remove(statusPath)
 	config.published = func() { _ = os.WriteFile(statusPath, []byte("published\n"), 0600) }
+	// Capture and input belong to the desktop, not to a signaling connection.
+	// Recreating Waymote on reconnect can lose text while its replacement input
+	// method activates. Each host session still drops its control lease and
+	// releases held input before a new authenticated connection can take over.
+	defer func() {
+		if config.capture != nil {
+			config.capture.close()
+		}
+	}()
 	for ctx.Err() == nil {
+		if config.capture != nil {
+			select {
+			case <-config.capture.done:
+				config.capture.close()
+				config.capture = nil
+			default:
+			}
+		}
+		if config.capture == nil {
+			capture, err := startWaymoteWithDiagnostics(ctx, config.Waymote, io.Discard)
+			if err != nil {
+				return err
+			}
+			config.capture = capture
+		}
 		hostCtx, stop := context.WithCancel(ctx)
 		finished := make(chan error, 1)
 		go func() { finished <- serveWayland(hostCtx, config) }()

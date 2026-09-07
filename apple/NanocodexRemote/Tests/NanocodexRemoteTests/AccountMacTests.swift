@@ -20,25 +20,28 @@ private final class MacFrameReceiver: NSObject, RTCVideoRenderer, @unchecked Sen
 }
 
 final class AccountMacTests: XCTestCase {
-    // Start sharing from the isolated Mac app's real Screens UI, then focus its
+    // Start sharing from the Mac app's real Screens UI, then focus its
     // empty composer before running this test. Inspect that composer afterwards
     // to confirm the marker arrived; this test does not claim to inspect app UI.
     @MainActor func testPublishedMacVideoAndControlSession() async throws {
         let environment = ProcessInfo.processInfo.environment
-        guard let path = environment["NANOCODEX_TEST_REMOTE_ENV"],
-              let machineID = environment["NANOCODEX_TEST_MAC_MACHINE_ID"] else {
-            throw XCTSkip("Requires the isolated local account and a Mac shared through its native UI")
+        guard let machineID = environment["NANOCODEX_TEST_MAC_MACHINE_ID"] else {
+            throw XCTSkip("Requires an explicitly selected Mac shared through its native UI")
         }
         var values: [String: String] = [:]
-        for line in try String(contentsOfFile: path, encoding: .utf8).split(separator: "\n") {
-            guard let split = line.firstIndex(of: "=") else { continue }
-            values[String(line[..<split])] = String(line[line.index(after: split)...])
+        if let path = environment["NANOCODEX_TEST_REMOTE_ENV"] {
+            for line in try String(contentsOfFile: path, encoding: .utf8).split(separator: "\n") {
+                guard let split = line.firstIndex(of: "=") else { continue }
+                values[String(line[..<split])] = String(line[line.index(after: split)...])
+            }
         }
-        let origin = try XCTUnwrap(URL(string: try XCTUnwrap(values["NANOCODEX_MANAGED_URL"])))
-        guard ["127.0.0.1", "localhost"].contains(origin.host ?? "") else {
-            throw XCTSkip("This journey only uses the local account service")
+        let origin = try XCTUnwrap(URL(string: try XCTUnwrap(environment["NANOCODEX_MANAGED_URL"] ?? values["NANOCODEX_MANAGED_URL"])))
+        let local = ["127.0.0.1", "localhost"].contains(origin.host ?? "")
+        let live = environment["NANOCODEX_TEST_MAC_LIVE"] == "1" && origin.scheme == "https"
+        guard local || live else {
+            throw XCTSkip("A live account requires NANOCODEX_TEST_MAC_LIVE=1")
         }
-        let token = try XCTUnwrap(values["NANOCODEX_API_KEY"])
+        let token = try XCTUnwrap(environment["NANOCODEX_API_KEY"] ?? values["NANOCODEX_API_KEY"])
         let service = try RemoteService(origin: origin) { $0.setValue("Bearer " + token, forHTTPHeaderField: "Authorization") }
         let viewer = RemoteViewer()
         defer { viewer.close(); service.close() }
@@ -54,10 +57,10 @@ final class AccountMacTests: XCTestCase {
         viewer.takeControl()
         try await eventually { viewer.controlling }
 
-        // This identifier belongs to the isolated app build used for evidence.
         // Never type into whichever unrelated application happens to be frontmost.
-        guard NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "xyz.paradigm.nanocodex.macos.remote-evidence" else {
-            throw XCTSkip("Focus the isolated Mac app's empty composer before sending the marker")
+        let targetBundle = live ? "xyz.paradigm.nanocodex.macos" : "xyz.paradigm.nanocodex.macos.remote-evidence"
+        guard NSWorkspace.shared.frontmostApplication?.bundleIdentifier == targetBundle else {
+            throw XCTSkip("Focus the selected Mac app's empty composer before sending the marker")
         }
         viewer.input(kind: .text, text: "WebRTC Mac input verifiedx")
         for down in [true, false] { viewer.input(kind: .key, down: down, key: 42) }

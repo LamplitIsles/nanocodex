@@ -7,14 +7,16 @@ const LEASE_MS = 30_000;
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const noStore = { "cache-control": "no-store" };
 export const REMOTE_VM_ASSERTION = "x-nanocodex-remote-vm";
-export type RemoteVMPublisher = { machineId: string; routeId: string; expiresAt: number };
+export type RemoteVMPublisher = { machineId: string; routeId: string; expiresAt: number; surfaceKind?: "desktop" };
 
-type Surface = { id: string; name: string; kind: "desktop" | "window" | "phone" | "vm"; width: number; height: number; controllable: boolean; agent_tools?: boolean };
+type Surface = { id: string; name: string; kind: "desktop" | "window" | "phone" | "vm"; width: number; height: number; controllable: boolean; agent_tools?: boolean; transport?: "frames-v1" };
 type Attachment = {
   kind: typeof TAG; role: "host" | "viewer"; id: string; generation: string; expiresAt: number;
   machineId?: string; machineName?: string; surfaces?: Surface[]; hostId?: string; surfaceId?: string;
   rateWindow: number; rateCount: number;
   vm?: RemoteVMPublisher;
+  transport?: "frames-v1";
+  framePending?: boolean;
 };
 type Context = Pick<DurableObjectState, "acceptWebSocket" | "getWebSockets">;
 
@@ -32,6 +34,12 @@ export class HandRemoteBroker {
   }
 
   tools() { return this.list().filter(target => target.agent_tools).map(screenTool); }
+
+  revokePublisher(routeId: string): void {
+    for (const socket of this.context.getWebSockets(TAG)) {
+      if (this.attachment(socket)?.vm?.routeId === routeId) this.close(socket, "Hand revoked");
+    }
+  }
 
   async invoke(name: string, route: string, input: unknown, agentId: string, signal: AbortSignal): Promise<Response | undefined> {
     if (!route.startsWith("screen:v1:")) return undefined;
@@ -95,7 +103,8 @@ export class HandRemoteBroker {
         && state.surfaces?.some(surface => surface.id === surfaceId));
       if (!selected) return Response.json({ error: "remote_unavailable" }, { status: 409, headers: noStore });
       host = selected.socket;
-      Object.assign(state, { role: "viewer", hostId: selected.state.id, generation, machineId, surfaceId });
+      Object.assign(state, { role: "viewer", hostId: selected.state.id, generation, machineId, surfaceId,
+        transport: selected.state.surfaces!.find(surface => surface.id === surfaceId)!.transport });
     } else if (url.pathname !== "/hands/host" || url.search) return this.invalid();
     const [client, server] = Object.values(new WebSocketPair());
     this.context.acceptWebSocket(server, [TAG]);
@@ -147,16 +156,20 @@ export class HandRemoteBroker {
         }
         return;
       }
-      if (new TextEncoder().encode(message).length > 70_000) throw new Error();
+      if (value.type !== "frame" && new TextEncoder().encode(message).length > 70_000) throw new Error();
       if (Date.now() - state.rateWindow >= 1000) { state.rateWindow = Date.now(); state.rateCount = 0; }
       if (++state.rateCount > 160) throw new Error();
       socket.serializeAttachment(state);
+      if (["frame_request", "frame", "control", "input"].includes(value.type)) {
+        this.relayFrameMessage(socket, state, value); return;
+      }
       if (value.type === "catalog" && state.role === "host" && state.surfaces === undefined) {
         exact(value, ["type", "machine_id", "machine_name", "surfaces"]);
         if (typeof value.machine_id !== "string" || !ID.test(value.machine_id) || typeof value.machine_name !== "string" || !value.machine_name.trim()
           || new TextEncoder().encode(value.machine_name).length > 128) throw new Error();
         const surfaces = normalizeSurfaces(value.surfaces);
-        if (state.vm && (value.machine_id !== state.vm.machineId || surfaces.some(surface => surface.kind !== "vm"))) throw new Error();
+        if (state.vm && (value.machine_id !== state.vm.machineId
+          || surfaces.some(surface => surface.kind !== (state.vm!.surfaceKind ?? "vm")))) throw new Error();
         // Publish only a complete validated catalog. Replacement fences every old viewer.
         for (const old of this.hosts().filter(({ state: old }) => old.machineId === value.machine_id)) {
           this.close(old.socket, "Host replaced");
@@ -180,7 +193,7 @@ export class HandRemoteBroker {
         if (viewer) this.close(viewer, "Screen connection unavailable");
         return;
       }
-      if (value.type !== "signal") throw new Error();
+      if (value.type !== "signal" || state.transport === "frames-v1") throw new Error();
       exact(value, state.role === "host" ? ["type", "viewer_id", "signal"] : ["type", "signal"]);
       const signal = normalizeSignal(value.signal, state.role);
       if (state.role === "viewer") {
@@ -195,7 +208,10 @@ export class HandRemoteBroker {
             && candidate.generation === state.generation && candidate.expiresAt > Date.now();
         });
         // A viewer may disconnect while its offer is being prepared.
-        if (viewer) this.send(viewer, { type: "signal", signal });
+        if (viewer) {
+          if (this.attachment(viewer)?.transport === "frames-v1") throw new Error();
+          this.send(viewer, { type: "signal", signal });
+        }
       }
     } catch { this.close(socket, "Invalid remote signaling"); }
   }
@@ -220,6 +236,46 @@ export class HandRemoteBroker {
       if (host) this.send(host.socket, { type: "viewer_left", viewer_id: state.id });
     }
     try { socket.close(1008, reason); } catch { /* Already closed. */ }
+  }
+
+  /** Pull-based frames use the same account, publication and authorization lease. */
+  private relayFrameMessage(socket: WebSocket, state: Attachment, value: Record<string, any>): void {
+    if (state.role === "viewer") {
+      if (state.transport !== "frames-v1" || !["frame_request", "control", "input"].includes(value.type)) throw new Error();
+      exact(value, value.type === "frame_request" ? ["type"] : ["type", "data"]);
+      const host = this.hosts().find(({ state: host }) => host.id === state.hostId && host.generation === state.generation);
+      if (!host) throw new Error();
+      if (value.type === "frame_request") {
+        if (state.framePending) return;
+        state.framePending = true; socket.serializeAttachment(state);
+      } else if (!value.data || typeof value.data !== "object" || Array.isArray(value.data)
+        || new TextEncoder().encode(JSON.stringify(value.data)).length > 8192) throw new Error();
+      this.send(host.socket, { ...value, viewer_id: state.id });
+      return;
+    }
+    if (!["frame", "control"].includes(value.type) || typeof value.viewer_id !== "string") throw new Error();
+    const viewer = this.context.getWebSockets(TAG).find(peer => {
+      const candidate = this.attachment(peer);
+      return candidate?.role === "viewer" && candidate.id === value.viewer_id && candidate.hostId === state.id
+        && candidate.generation === state.generation && candidate.expiresAt > Date.now() && candidate.transport === "frames-v1";
+    });
+    if (!viewer) return; // The requested frame may finish after its viewer leaves.
+    if (value.type === "frame") {
+      exact(value, ["type", "viewer_id", "jpeg", "width", "height"]);
+      const target = this.attachment(viewer)!;
+      if (!target.framePending || typeof value.jpeg !== "string" || value.jpeg.length > 700_000
+        || !/^\/9j\/[A-Za-z0-9+/]*={0,2}$/.test(value.jpeg)
+        || ![value.width, value.height].every(n => Number.isInteger(n) && n > 0 && n <= 1280)) throw new Error();
+      target.framePending = false; viewer.serializeAttachment(target);
+      this.send(viewer, { type: "frame", jpeg: value.jpeg, width: value.width, height: value.height });
+    } else {
+      exact(value, ["type", "viewer_id", "data"]);
+      if (!value.data || !["granted", "denied", "revoked"].includes(value.data.type)) throw new Error();
+      exact(value.data, ["type", "generation"]);
+      if (value.data.type === "granted" && value.data.generation === undefined) throw new Error();
+      if (value.data.generation !== undefined && (typeof value.data.generation !== "string" || !ID.test(value.data.generation))) throw new Error();
+      this.send(viewer, { type: "control", data: value.data });
+    }
   }
 
   private sweep(): void {
@@ -251,11 +307,12 @@ function normalizeSurfaces(value: unknown): Surface[] {
   const ids = new Set();
   return value.map(surface => {
     if (!surface || typeof surface !== "object") throw new Error();
-    exact(surface, ["id", "name", "kind", "width", "height", "controllable", "agent_tools"]);
+    exact(surface, ["id", "name", "kind", "width", "height", "controllable", "agent_tools", "transport"]);
     if (typeof surface.id !== "string" || !ID.test(surface.id) || ids.has(surface.id)
       || typeof surface.name !== "string" || !surface.name.trim() || new TextEncoder().encode(surface.name).length > 128
       || !["desktop", "window", "phone", "vm"].includes(surface.kind) || typeof surface.controllable !== "boolean"
       || (surface.agent_tools !== undefined && typeof surface.agent_tools !== "boolean")
+      || (surface.transport !== undefined && surface.transport !== "frames-v1")
       || ![surface.width, surface.height].every(n => Number.isInteger(n) && n > 0 && n <= 16384)) throw new Error();
     ids.add(surface.id); return surface as Surface;
   });

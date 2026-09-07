@@ -1,5 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { HandRemoteBroker, REMOTE_VM_ASSERTION, type RemoteVMPublisher } from "./hand-remote";
+import { HandHosts, boundedJSON } from "./hand-hosts";
+import { remoteICE, type RemoteICEEnv } from "./hand-remote-ice";
 import {
   HOSTED_TOOLS_PRE_ADMISSION_UNAVAILABLE,
   HOSTED_MACHINE_TOOL_NAMES,
@@ -45,7 +47,7 @@ type RoutedHostedTool = HostedToolsCodeTool & Readonly<{
   timeoutMs: number;
 }>;
 
-type AccountHostedToolsEnv = Record<string, never>;
+type AccountHostedToolsEnv = RemoteICEEnv;
 
 type InvocationRequest = Readonly<{
   owner_id: string;
@@ -81,15 +83,63 @@ type AuthorizationContext = Pick<InvocationContext, "sessionId" | "subagent">;
 export class AccountHostedTools extends DurableObject<AccountHostedToolsEnv> {
   readonly #broker: HostedToolsBroker;
   readonly #remote: HandRemoteBroker;
+  readonly #handHosts: HandHosts;
 
   constructor(ctx: DurableObjectState, env: AccountHostedToolsEnv) {
     super(ctx, env);
     this.#broker = new HostedToolsBroker(ctx, { resumeRetainedSockets: true });
     this.#remote = new HandRemoteBroker(ctx);
+    this.#handHosts = new HandHosts(ctx.storage, this.#remote);
   }
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
+    const sandboxHost = url.pathname.match(/^\/sandbox-hand-hosts\/([^/]+)$/);
+    if (sandboxHost) {
+      const ownerId = request.headers.get(OWNER_ASSERTION);
+      if (url.search || !isUserId(ownerId) || !await this.#claim(ownerId)) return Response.json({ error: "not_found" }, { status: 404 });
+      if (request.method === "DELETE") return this.#handHosts.manage(request, sandboxHost[1]);
+      if (request.method !== "PUT") return Response.json({ error: "invalid_request" }, { status: 400 });
+      let body;
+      try { body = await boundedJSON(request); } catch { return Response.json({ error: "invalid_request" }, { status: 400 }); }
+      if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).length !== 2
+        || !("name" in body) || !("machine_id" in body) || typeof body.machine_id !== "string"
+        || !/^cf:[A-Za-z0-9][A-Za-z0-9._:-]{0,120}$/.test(body.machine_id)) return Response.json({ error: "invalid_request" }, { status: 400 });
+      return this.#handHosts.manage(new Request(request.url, { method: "PUT", body: JSON.stringify({ name: body.name }) }), sandboxHost[1], body.machine_id);
+    }
+    const setup = url.pathname.match(/^\/hand-host-setups\/([^/]+)$/);
+    if (setup) {
+      const ownerId = request.headers.get(OWNER_ASSERTION);
+      if (url.search || !isUserId(ownerId) || !await this.#claim(ownerId)) return Response.json({ error: "not_found" }, { status: 404 });
+      return this.#handHosts.setupLock(request, setup[1]!);
+    }
+    if (url.pathname === "/hand-hosts" || url.pathname.startsWith("/hand-hosts/")) {
+      const ownerId = request.headers.get(OWNER_ASSERTION);
+      if (!isUserId(ownerId)) return Response.json({ error: "not_found" }, { status: 404 });
+      const publisher = url.pathname.match(/^\/hand-hosts\/([^/]+)\/hands\/(host|ice|renew)$/);
+      if (publisher) {
+        if (url.search || !await this.#owns(ownerId)) return Response.json({ error: "not_found" }, { status: 404 });
+        const scope = await this.#handHosts.authorize(request, publisher[1]!);
+        if (!scope) return Response.json({ error: "unauthorized" }, { status: 401 });
+        const endpoint = publisher[2]!;
+        if (endpoint !== "host" && request.method !== "POST") return Response.json({ error: "invalid_request" }, { status: 400 });
+        if (endpoint === "ice") return remoteICE(this.env, ownerId);
+        if (endpoint === "renew") {
+          let body;
+          try { body = await boundedJSON(request); } catch { return Response.json({ error: "invalid_request" }, { status: 400 }); }
+          if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).length !== 1
+            || !("connection_id" in body) || typeof body.connection_id !== "string") return Response.json({ error: "invalid_request" }, { status: 400 });
+          // Recheck after reading the body: rotation/revocation may have occurred.
+          const fresh = await this.#handHosts.authorize(request, publisher[1]!);
+          if (!fresh) return Response.json({ error: "unauthorized" }, { status: 401 });
+          return this.#remote.renew(body.connection_id, true, fresh);
+        }
+        return this.#remote.fetch(new Request("https://account-tools.internal/hands/host", request), scope);
+      }
+      const management = url.pathname.match(/^\/hand-hosts(?:\/([^/]+))?$/);
+      if (!management || !await this.#claim(ownerId)) return Response.json({ error: "not_found" }, { status: 404 });
+      return this.#handHosts.manage(request, management[1]);
+    }
     if (url.pathname === "/hands" || url.pathname.startsWith("/hands/")) {
       const ownerId = request.headers.get(OWNER_ASSERTION);
       if (!isUserId(ownerId) || !await this.#claim(ownerId)) {

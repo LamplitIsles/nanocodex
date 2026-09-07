@@ -19,10 +19,12 @@ import (
 type hostConfig struct {
 	Origin, CredentialFile, MachineID, Name, Waymote string
 	IncludeLoopback                                  bool
+	Frames                                           bool
 	Width, Height                                    int
 	ICERenewalInterval                               time.Duration
 	quiet                                            bool
 	published                                        func()
+	capture                                          *waymoteCapture
 }
 type hostEvent struct {
 	viewer         string
@@ -38,8 +40,12 @@ type hostEvent struct {
 	localCandidate *remoteSignal
 	agentRequest   string
 	agentResult    *agentResult
+	frame          *agentResult
 }
 type hostPeer struct {
+	viewerID       string
+	frames         bool
+	framePending   bool
 	connection     *webrtc.PeerConnection
 	control        *webrtc.DataChannel
 	candidates     []webrtc.ICECandidateInit
@@ -74,11 +80,14 @@ func serveWayland(parent context.Context, config hostConfig) error {
 		diagnostics = io.Discard
 	}
 	logger := log.New(diagnostics, "", log.LstdFlags)
-	capture, err := startWaymoteWithDiagnostics(ctx, config.Waymote, diagnostics)
-	if err != nil {
-		return err
+	capture := config.capture
+	if capture == nil {
+		capture, err = startWaymoteWithDiagnostics(ctx, config.Waymote, diagnostics)
+		if err != nil {
+			return err
+		}
+		defer capture.close()
 	}
-	defer capture.close()
 	socket, err := service.socket(ctx)
 	if err != nil {
 		return err
@@ -177,6 +186,14 @@ func serveWayland(parent context.Context, config hostConfig) error {
 		send(remoteMessage{Type: "agent_result", RequestID: job.id, agentResult: &result})
 	}
 	sendControl := func(peer *hostPeer, message controlMessage) error {
+		if peer != nil && peer.frames {
+			data, err := json.Marshal(message)
+			if err != nil {
+				return err
+			}
+			send(remoteMessage{Type: "control", ViewerID: peer.viewerID, Data: data})
+			return nil
+		}
 		if peer == nil || peer.control.ReadyState() != webrtc.DataChannelStateOpen || peer.control.BufferedAmount() > 32768 {
 			return errors.New("control channel unavailable")
 		}
@@ -212,7 +229,9 @@ func serveWayland(parent context.Context, config hostConfig) error {
 				peer.renewal()
 			}
 			delete(peers, id)
-			_ = peer.connection.Close()
+			if peer.connection != nil {
+				_ = peer.connection.Close()
+			}
 			send(remoteMessage{Type: "close_viewer", ViewerID: id})
 		}
 		motionMu.Lock()
@@ -399,6 +418,9 @@ func serveWayland(parent context.Context, config hostConfig) error {
 	defer tick.Stop()
 	agentTick := time.NewTicker(16 * time.Millisecond)
 	defer agentTick.Stop()
+	frameTick := time.NewTicker(100 * time.Millisecond)
+	defer frameTick.Stop()
+	frameInFlight := false
 	lastAuthorization := time.Now()
 	lastRenewal := time.Now()
 	connectionID := ""
@@ -414,6 +436,17 @@ func serveWayland(parent context.Context, config hostConfig) error {
 			}
 		case <-capture.done:
 			return errors.New("Wayland capture stopped")
+		case <-frameTick.C:
+			if !config.Frames || frameInFlight {
+				continue
+			}
+			for _, peer := range peers {
+				if peer.frames && peer.framePending {
+					frameInFlight = true
+					go func() { frame := snapshotDesktop(ctx, config.Width, config.Height); emit(hostEvent{frame: &frame}) }()
+					break
+				}
+			}
 		case now := <-agentTick.C:
 			if agent == nil {
 				continue
@@ -460,6 +493,9 @@ func serveWayland(parent context.Context, config hostConfig) error {
 			}
 		case <-tick.C:
 			for id, peer := range peers {
+				if peer.frames {
+					continue
+				}
 				if !peer.answered && time.Now().After(peer.answerDeadline) {
 					remove(id)
 					continue
@@ -497,6 +533,23 @@ func serveWayland(parent context.Context, config hostConfig) error {
 				apply(event)
 			}
 		case event := <-events:
+			if event.frame != nil {
+				frameInFlight = false
+				for id, peer := range peers {
+					if !peer.frames || !peer.framePending {
+						continue
+					}
+					peer.framePending = false
+					if event.frame.Status != "ok" {
+						remove(id)
+						continue
+					}
+					frame := *event.frame
+					frame.Status = ""
+					send(remoteMessage{Type: "frame", ViewerID: id, agentResult: &frame})
+				}
+				continue
+			}
 			if event.agentResult != nil {
 				if agent != nil && agent.id == event.agentRequest {
 					finishAgent(*event.agentResult)
@@ -548,7 +601,15 @@ func serveWayland(parent context.Context, config hostConfig) error {
 				}
 				connectionID = message.ConnectionID
 				lastAuthorization = time.Now()
-				send(remoteMessage{Type: "catalog", MachineID: config.MachineID, MachineName: config.Name, Surfaces: []remoteSurface{{ID: "desktop", Name: "Desktop", Kind: "vm", Width: config.Width, Height: config.Height, Controllable: true, AgentTools: true}}})
+				kind := "vm"
+				if strings.HasPrefix(service.base.Path, "/v1/hand-hosts/") {
+					kind = "desktop"
+				}
+				transport := ""
+				if config.Frames {
+					transport = "frames-v1"
+				}
+				send(remoteMessage{Type: "catalog", MachineID: config.MachineID, MachineName: config.Name, Surfaces: []remoteSurface{{ID: "desktop", Name: "Desktop", Kind: kind, Width: config.Width, Height: config.Height, Controllable: true, AgentTools: true, Transport: transport}}})
 			case "renewed":
 				lastAuthorization = time.Now()
 			case "published":
@@ -627,6 +688,10 @@ func serveWayland(parent context.Context, config hostConfig) error {
 					send(remoteMessage{Type: "close_viewer", ViewerID: message.ViewerID})
 					continue
 				}
+				if config.Frames {
+					peers[message.ViewerID] = &hostPeer{viewerID: message.ViewerID, frames: true, answered: true}
+					continue
+				}
 				// Fetch fresh TURN credentials without blocking input from existing
 				// viewers. A departing viewer cancels its pending request.
 				prepareContext, cancel := context.WithCancel(ctx)
@@ -638,9 +703,22 @@ func serveWayland(parent context.Context, config hostConfig) error {
 				}()
 			case "viewer_left":
 				remove(message.ViewerID)
+			case "frame_request":
+				if peer := peers[message.ViewerID]; peer != nil && peer.frames {
+					peer.framePending = true
+				}
+			case "input", "control":
+				if peer := peers[message.ViewerID]; peer != nil && peer.frames {
+					if len(message.Data) > 8192 {
+						remove(message.ViewerID)
+						continue
+					}
+					input, _ := decodeInput(message.Data)
+					apply(hostEvent{viewer: message.ViewerID, input: message.Data, created: time.Now(), motion: input.Kind == "move"})
+				}
 			case "signal":
 				peer := peers[message.ViewerID]
-				if peer == nil || message.Signal == nil {
+				if peer == nil || peer.frames || message.Signal == nil {
 					continue
 				}
 				signal := message.Signal

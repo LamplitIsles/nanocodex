@@ -488,6 +488,7 @@ struct InboxView: View {
                                 Text(card.status).font(.caption).foregroundStyle(card.isRunning ? Ink.amber : Ink.muted)
                             }.frame(maxWidth: .infinity, alignment: .leading).padding(.vertical, 6)
                         }.listRowBackground(model.focused?.id == card.id ? Ink.surface : Color.clear)
+                            .accessibilityIdentifier("agent-row:\(card.id)")
                     }
                 }
             }.listStyle(.plain).scrollContentBackground(.hidden)
@@ -1174,6 +1175,7 @@ private struct ConversationView: View {
     @ObservedObject var model: InboxModel
     @Environment(\.dismiss) private var dismiss
     @FocusState private var composerFocused: Bool
+    @State private var showScreens = false
     @State private var hasInitialPosition = false
     @State private var rowFrames: [String: CGRect] = [:]
     @State private var historyRestore: (id: String, anchor: UnitPoint)?
@@ -1397,13 +1399,29 @@ private struct ConversationView: View {
             #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
             #endif
-            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button { composerFocused = false; showScreens = true } label: { Image(systemName: "display") }
+                        .accessibilityLabel("Remote screens").disabled(model.remoteService == nil)
+                        .accessibilityIdentifier("conversation-remote-screens")
+                }
+                ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } }
+            }
 
         }.foregroundStyle(Ink.text).frame(minWidth: 340)
             .presentationDetents([.large]).presentationDragIndicator(.visible)
             // A downward drag while typing belongs to the keyboard, not the sheet.
             .interactiveDismissDisabled(composerFocused)
             .sheet(isPresented: $model.showContext) { ContextInboxView(model: model) }
+            .sheet(isPresented: $showScreens) {
+                NavigationStack {
+                    if let service = model.remoteService {
+                        RemoteDashboard(service: service).id(ObjectIdentifier(service))
+                            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { showScreens = false } } }
+                    }
+                }
+            }
+            .onChange(of: model.connected) { _, connected in if !connected { showScreens = false } }
     }
 }
 

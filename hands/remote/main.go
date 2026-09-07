@@ -41,10 +41,11 @@ func main() {
 		}
 		return
 	}
-	if len(os.Args) > 1 && (os.Args[1] == "wayland-host" || os.Args[1] == "desktop-host") {
+	if len(os.Args) > 1 && (os.Args[1] == "wayland-host" || os.Args[1] == "desktop-host" || os.Args[1] == "server-host") {
 		flags := flag.NewFlagSet("wayland-host", flag.ExitOnError)
 		var config hostConfig
 		workspace := flags.String("workspace", "/workspace", "desktop working directory")
+		desktopConfig := flags.String("desktop-config", "/etc/nanocodex-desktop", "labwc configuration directory")
 		flags.StringVar(&config.Origin, "url", "", "managed account service origin")
 		flags.StringVar(&config.CredentialFile, "credential-file", "", "private file containing a Hand credential")
 		flags.StringVar(&config.MachineID, "machine-id", "", "allocated machine identity")
@@ -53,10 +54,16 @@ func main() {
 		flags.IntVar(&config.Width, "width", 1600, "headless output width")
 		flags.IntVar(&config.Height, "height", 900, "headless output height")
 		flags.BoolVar(&config.IncludeLoopback, "include-loopback", false, "allow local viewers on the host network")
+		flags.BoolVar(&config.Frames, "frames", false, "use bounded HTTPS frame/input relay for restricted sandboxes")
 		_ = flags.Parse(os.Args[2:])
 		run := serveWayland
 		if os.Args[1] == "desktop-host" {
 			run = func(ctx context.Context, config hostConfig) error { return serveDesktop(ctx, config, *workspace) }
+		}
+		if os.Args[1] == "server-host" {
+			run = func(ctx context.Context, config hostConfig) error {
+				return serveDesktopSession(ctx, config, *workspace, *desktopConfig, false)
+			}
 		}
 		if err := run(ctx, config); err != nil && !errors.Is(err, context.Canceled) {
 			log.Fatal(err)

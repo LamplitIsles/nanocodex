@@ -89,6 +89,21 @@ agents and simulated actions.
 
 ## Interaction
 
+Use **Remote screens** from the inbox or a conversation to watch a published
+Hand desktop and take control. The iPhone/iPad and native Mac app share the
+`NanocodexRemote` WebRTC viewer, including video, pointer, keyboard, and control
+leases. Desktop-enabled factory VMs publish automatically; the screen list
+refreshes while open. Shell-only VM images have no graphical desktop. Cloudflare
+sandbox desktops require the managed desktop feature flag and use authenticated
+JPEG screen updates instead of WebRTC video.
+
+Backgrounding releases control and pauses the viewer while retaining its selected
+screen. Returning reconnects with the current publication generation. Transport
+failures retry with backoff for up to 90 seconds, then offer **Reconnect**. Reconnection resumes viewing;
+take control again to send input. Closing the screen cancels recovery. On phones,
+tap to click, drag to move, use two fingers to scroll, and use the text field or
+Return/Tab/Esc controls below the video.
+
 | Action | Result |
 | --- | --- |
 | Swipe left | Revisit after a new update; keep the agent in All |
@@ -473,6 +488,17 @@ NANOCODEX_CONTEXT_LIVE=1 swift test --package-path apple/NanocodexContext --filt
 ```
 
 ## Validation
+
+`InboxUITests.testRemoteScreenControlAndReconnect` uses the phone's saved account
+and an explicitly selected disposable VM with a focused terminal. Set
+`NANOCODEX_TEST_REMOTE_ORIGIN` (HTTPS) and `NANOCODEX_TEST_VM_MACHINE_ID` in the
+XCTest runner environment. It creates a
+unique file through remote keyboard input, backgrounds with an unsent draft,
+checks selection/control/draft recovery, reconnects after relaunch, and opens
+the same screen from an existing agent's conversation. Screenshots retain the
+decoded video and terminal readback. With `NANOCODEX_TEST_REMOTE_RESTART=1`, wait
+for `REMOTE_RESTART_READY` in the test log, then stop and restart that VM's
+factory; the test checks automatic recovery without reselecting the screen.
 
 `TurnControlIntegrationTests` exercises cancellation before admission against
 the managed service, including a late submission, submission replay, and repeated

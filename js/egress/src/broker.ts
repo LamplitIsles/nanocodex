@@ -1,3 +1,4 @@
+import { createSshKeyPair, sshPublicKey } from "nanocodex/tools/ssh";
 import { DurableObject } from "cloudflare:workers";
 import { Provider, ProviderRequest, secp256k1, Storage } from "accounts";
 import { http } from "viem";
@@ -30,6 +31,7 @@ import {
 import {
   type BrokeredSshIdentity,
   validateSshIdentity,
+  validateSshTarget,
   validSshIdentityReference,
 } from "./ssh";
 
@@ -380,7 +382,7 @@ export class UserCredentialBroker extends DurableObject<BrokerEnv> {
         return json({ ready: true }, 200);
       }
       if (request.method === "GET" && url.pathname === "/v1/status") {
-        return json(this.#publicStatus(), 200);
+        return json(await this.#publicStatus(), 200);
       }
       if (url.pathname === "/v1/sponsored-prompts") {
         if (request.method === "GET") {
@@ -756,8 +758,20 @@ export class UserCredentialBroker extends DurableObject<BrokerEnv> {
       const sshIdentity = url.pathname.match(/^\/v1\/ssh-identities\/([A-Za-z0-9][A-Za-z0-9._-]{0,63})$/)?.[1];
       if (sshIdentity && validSshIdentityReference(sshIdentity)) {
         if (request.method === "PUT") {
-          const identity = validateSshIdentity(await readJson(request, 72 * 1024));
-          if (!identity) return jsonError(400, "invalid_ssh_identity");
+          const body = await readJson(request, 72 * 1024);
+          let identity: BrokeredSshIdentity | undefined;
+          if (body?.generate === true) {
+            const target = validateSshTarget(body);
+            if (!target || body.private_key !== undefined) return jsonError(400, "invalid_ssh_identity");
+            // Generating must never silently rotate an already installed key.
+            if (this.#credentials.ssh?.[sshIdentity]) return jsonError(409, "ssh_identity_already_exists");
+            identity = { ...target, ...await createSshKeyPair() };
+          } else {
+            const parsed = validateSshIdentity(body);
+            if (!parsed) return jsonError(400, "invalid_ssh_identity");
+            try { identity = { ...parsed, publicKey: await sshPublicKey(parsed.privateKey) }; }
+            catch { return jsonError(400, "invalid_ssh_identity"); }
+          }
           this.#credentials.ssh = { ...this.#credentials.ssh, [sshIdentity]: identity };
           await this.#persist();
           return new Response(null, { status: 204, headers: noStoreHeaders() });
@@ -857,7 +871,7 @@ export class UserCredentialBroker extends DurableObject<BrokerEnv> {
           return jsonError(400, "invalid_request");
         }
         await this.#claimLocalBootstrap(provenance);
-        return json(this.#publicStatus(), 200);
+        return json(await this.#publicStatus(), 200);
       }
       if (request.method === "PUT" && url.pathname === "/v1/chatgpt") {
         const body = await readJson(request, 64 * 1024);
@@ -884,7 +898,7 @@ export class UserCredentialBroker extends DurableObject<BrokerEnv> {
     }
   }
 
-  #publicStatus(): Record<string, unknown> {
+  async #publicStatus(): Promise<Record<string, unknown>> {
     const login = this.#credentials.login;
     return {
       ready: this.#credentials.active !== null,
@@ -897,13 +911,16 @@ export class UserCredentialBroker extends DurableObject<BrokerEnv> {
           : {}),
         ...(login ? { login: publicLogin(login) } : {}),
       },
-      ssh: Object.entries(this.#credentials.ssh ?? {}).map(([reference, identity]) => ({
+      ssh: await Promise.all(Object.entries(this.#credentials.ssh ?? {}).map(async ([reference, identity]) => ({
         reference,
         hostname: identity.hostname,
         port: identity.port,
         username: identity.username,
         host_key_sha256: identity.hostKeySha256,
-      })),
+        // Older stored identities predate public-key metadata. Derive it in
+        // the broker; a malformed legacy key must not break the entire vault.
+        public_key: identity.publicKey ?? await sshPublicKey(identity.privateKey).catch(() => undefined),
+      }))),
       vault: Object.values(this.#credentials.vault ?? {})
         .map(publicVaultEntry)
         .sort((left, right) => right.created_at - left.created_at || compareText(left.id, right.id)),

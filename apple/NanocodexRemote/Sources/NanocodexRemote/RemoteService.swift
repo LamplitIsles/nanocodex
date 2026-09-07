@@ -1,6 +1,7 @@
 import Foundation
 
 public struct RemoteHand: Decodable, Identifiable, Sendable {
+    public enum Transport: String, Decodable, Sendable { case frames = "frames-v1" }
     public let id: String
     public let name: String
     public let kind: RemoteSurface.Kind
@@ -10,9 +11,10 @@ public struct RemoteHand: Decodable, Identifiable, Sendable {
     public let machineID: String
     public let machineName: String
     public let generation: String
+    public let transport: Transport?
     public var identity: String { machineID + ":" + id + ":" + generation }
     enum CodingKeys: String, CodingKey {
-        case id, name, kind, width, height, controllable, generation
+        case id, name, kind, width, height, controllable, generation, transport
         case machineID = "machine_id", machineName = "machine_name"
     }
 }
@@ -28,14 +30,18 @@ public final class RemoteService: @unchecked Sendable {
     private let authorize: @Sendable (inout URLRequest) -> Void
     private let session: URLSession
 
-    public init(origin: URL, authorize: @escaping @Sendable (inout URLRequest) -> Void) throws {
+    public convenience init(origin: URL, authorize: @escaping @Sendable (inout URLRequest) -> Void) throws {
+        try self.init(origin: origin, configuration: .ephemeral, authorize: authorize)
+    }
+
+    init(origin: URL, configuration: URLSessionConfiguration, authorize: @escaping @Sendable (inout URLRequest) -> Void) throws {
         guard let parts = URLComponents(url: origin, resolvingAgainstBaseURL: false), parts.host != nil,
               parts.user == nil, parts.password == nil, parts.query == nil, parts.fragment == nil,
               parts.path.isEmpty || parts.path == "/",
               parts.scheme == "https" || (parts.scheme == "http" && ["localhost", "127.0.0.1", "::1"].contains(parts.host))
         else { throw RemoteError.invalidMessage }
         self.origin = origin; self.authorize = authorize
-        let config = URLSessionConfiguration.ephemeral
+        let config = configuration
         config.httpShouldSetCookies = false; config.urlCache = nil
         config.timeoutIntervalForRequest = 10
         session = URLSession(configuration: config, delegate: RemoteNoRedirects(), delegateQueue: nil)
@@ -89,7 +95,7 @@ public final class RemoteService: @unchecked Sendable {
         var url = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)!
         url.scheme = url.scheme == "https" ? "wss" : "ws"; request.url = url.url
         let socket = session.webSocketTask(with: request)
-        socket.maximumMessageSize = 70_000
+        socket.maximumMessageSize = hand?.transport == .frames ? 750_000 : 70_000
         return socket
     }
 }
@@ -106,13 +112,14 @@ public struct RemoteMessage: Codable, Sendable {
     public var signal: RemoteSignal?
     var requestID: String?, agentID: String?, deadlineAt: Double?, input: RemoteAgentInput?
     var agentStatus: String?, jpeg: String?, width: Int?, height: Int?
+    var data: RemoteRelayData?
     public init(type: String, viewerID: String? = nil, signal: RemoteSignal? = nil,
                 machineID: String? = nil, machineName: String? = nil, surfaces: [RemoteSurface]? = nil) {
         self.type = type; self.viewerID = viewerID; self.signal = signal
         self.machineID = machineID; self.machineName = machineName; self.surfaces = surfaces
     }
     enum CodingKeys: String, CodingKey {
-        case type, generation, surfaces, signal
+        case type, generation, surfaces, signal, data
         case connectionID = "connection_id", viewerID = "viewer_id", surfaceID = "surface_id"
         case machineID = "machine_id", machineName = "machine_name"
         case requestID = "request_id", agentID = "agent_id", deadlineAt = "deadline_at", input
@@ -145,7 +152,7 @@ public final class RemoteSignaling {
             do {
                 while !Task.isCancelled && !closed {
                     let wire = try await connection.receive()
-                    guard case .string(let value) = wire, value.utf8.count <= 70_000 else { throw RemoteError.invalidMessage }
+                    guard case .string(let value) = wire, value.utf8.count <= (hand?.transport == .frames ? 750_000 : 70_000) else { throw RemoteError.invalidMessage }
                     let message = try JSONDecoder().decode(RemoteMessage.self, from: Data(value.utf8))
                     if message.type == "ready" {
                         guard let id = message.connectionID, id.count <= 128, renewal == nil else { throw RemoteError.invalidMessage }
@@ -200,7 +207,9 @@ public final class RemoteSignaling {
         watchdog = Task { [weak self] in
             do { try await Task.sleep(for: .seconds(25)) }
             catch { return }
-            self?.close(error: RemoteError.unauthorized)
+            // Missing renewal can be a network stall. Only an explicit HTTP
+            // authorization rejection should disable automatic recovery.
+            self?.close(error: RemoteError.unavailable)
         }
     }
 }

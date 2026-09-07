@@ -825,6 +825,8 @@ function preparingSandbox(initialState: "empty" | "mounted" | "occupied") {
     ...fakeSandbox(),
     mountBucket: vi.fn(async () => { mountState = "mounted"; }),
     destroy: vi.fn(async () => {}),
+    clearRemoteDesktop: vi.fn(async () => {}),
+    configureRemoteDesktop: vi.fn(async () => {}),
   };
   sandbox.exec.mockImplementation(async (command: string) => executionResult(
     command.startsWith("if mountpoint -q /workspace") ? mountState : "",
@@ -842,6 +844,8 @@ function namespaceSandbox() {
       else peerMounts.add(path);
     }),
     destroy: vi.fn(async () => {}),
+    clearRemoteDesktop: vi.fn(async () => {}),
+    configureRemoteDesktop: vi.fn(async () => {}),
   };
   sandbox.exec.mockImplementation(async (command: string) => {
     if (command.startsWith("if mountpoint -q /workspace")) {

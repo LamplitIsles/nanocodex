@@ -23,6 +23,7 @@ public struct RemoteCanvas: NSViewRepresentable {
 
 public final class MacRemoteCanvas: NSView, NSTextInputClient {
     private let video = RTCMTLNSVideoView()
+    private let snapshot = NSImageView()
     private weak var viewer: RemoteViewer?
     private var track: RTCVideoTrack?
     private var surface = CGSize(width: 16, height: 9)
@@ -36,17 +37,21 @@ public final class MacRemoteCanvas: NSView, NSTextInputClient {
         self.viewer = viewer
         super.init(frame: .zero)
         wantsLayer = true; layer?.backgroundColor = NSColor.black.cgColor
-        addSubview(video); update(viewer)
+        snapshot.imageScaling = .scaleProportionallyUpOrDown
+        addSubview(video); addSubview(snapshot); update(viewer)
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     func update(_ viewer: RemoteViewer) {
         self.viewer = viewer
         if let hand = viewer.hand { surface = CGSize(width: hand.width, height: hand.height) }
         if track !== viewer.track { track?.remove(video); track = viewer.track; track?.add(video) }
+        video.isHidden = !viewer.connected || track == nil
+        snapshot.image = viewer.frame.map { NSImage(cgImage: $0, size: .zero) }
+        snapshot.isHidden = !viewer.connected || viewer.frame == nil
         if !viewer.controlling { pressed.removeAll(); dragging = false; unmarkText() }
         needsLayout = true
     }
-    public override func layout() { super.layout(); video.frame = fitted(surface, in: bounds) }
+    public override func layout() { super.layout(); video.frame = fitted(surface, in: bounds); snapshot.frame = video.frame }
     public override func updateTrackingAreas() {
         if let tracking { removeTrackingArea(tracking) }
         let area = NSTrackingArea(rect: .zero, options: [.activeInKeyWindow, .inVisibleRect, .mouseMoved], owner: self)
@@ -110,7 +115,9 @@ public final class MacRemoteCanvas: NSView, NSTextInputClient {
         viewer?.input(kind: .releaseAll); pressed.removeAll(); dragging = false; unmarkText()
         return super.resignFirstResponder()
     }
-    func detach() { viewer?.releaseControl(); track?.remove(video); track = nil }
+    // SwiftUI dismantles this view while invalidating its graph. Session state
+    // belongs to RemoteDashboard.onDisappear; publishing here can crash it.
+    func detach() { viewer = nil; track?.remove(video); track = nil; video.isHidden = true; snapshot.image = nil; snapshot.isHidden = true }
     public func insertText(_ string: Any, replacementRange: NSRange) {
         let text = (string as? NSAttributedString)?.string ?? (string as? String ?? "")
         if !text.isEmpty, text.utf8.count <= 4096 { viewer?.input(kind: .text, text: text) }; unmarkText()
@@ -142,6 +149,7 @@ public struct RemoteCanvas: UIViewRepresentable {
 
 public final class TouchRemoteCanvas: UIView {
     private let video = RTCMTLVideoView()
+    private let snapshot = UIImageView()
     private weak var viewer: RemoteViewer?
     private var track: RTCVideoTrack?
     private var surface = CGSize(width: 16, height: 9)
@@ -150,6 +158,7 @@ public final class TouchRemoteCanvas: UIView {
     init(viewer: RemoteViewer) {
         self.viewer = viewer; super.init(frame: .zero)
         backgroundColor = .black; video.isUserInteractionEnabled = false; video.videoContentMode = .scaleAspectFit; addSubview(video)
+        snapshot.contentMode = .scaleAspectFit; snapshot.isUserInteractionEnabled = false; addSubview(snapshot)
         let tap = UITapGestureRecognizer(target: self, action: #selector(tap(_:))); addGestureRecognizer(tap)
         let drag = UIPanGestureRecognizer(target: self, action: #selector(drag(_:))); drag.maximumNumberOfTouches = 1; addGestureRecognizer(drag)
         let scroll = UIPanGestureRecognizer(target: self, action: #selector(scroll(_:))); scroll.minimumNumberOfTouches = 2; addGestureRecognizer(scroll)
@@ -161,10 +170,13 @@ public final class TouchRemoteCanvas: UIView {
         self.viewer = viewer
         if let hand = viewer.hand { surface = CGSize(width: hand.width, height: hand.height) }
         if track !== viewer.track { track?.remove(video); track = viewer.track; track?.add(video) }
+        video.isHidden = !viewer.connected || track == nil
+        snapshot.image = viewer.frame.map { UIImage(cgImage: $0) }
+        snapshot.isHidden = !viewer.connected || viewer.frame == nil
         if !viewer.controlling { dragOrigin = nil; resignFirstResponder() }
         setNeedsLayout()
     }
-    public override func layoutSubviews() { super.layoutSubviews(); video.frame = fitted(surface, in: bounds) }
+    public override func layoutSubviews() { super.layoutSubviews(); video.frame = fitted(surface, in: bounds); snapshot.frame = video.frame }
     private func point(_ point: CGPoint, clamp: Bool = false) -> CGPoint? {
         let rect = video.frame
         guard rect.width > 0, rect.height > 0, clamp || rect.contains(point) else { return nil }
@@ -208,7 +220,8 @@ public final class TouchRemoteCanvas: UIView {
     private func keys(_ presses: Set<UIPress>, down: Bool) {
         for press in presses { if let key = press.key, let code = UInt16(exactly: key.keyCode.rawValue), RemoteKey.supported(code) { viewer?.input(kind: .key, down: down, key: code) } }
     }
-    func detach() { viewer?.releaseControl(); track?.remove(video); track = nil }
+    // Keep teardown render-only; the owning dashboard closes the session.
+    func detach() { viewer = nil; track?.remove(video); track = nil; video.isHidden = true; snapshot.image = nil; snapshot.isHidden = true }
     public override func resignFirstResponder() -> Bool { viewer?.input(kind: .releaseAll); return super.resignFirstResponder() }
 }
 #endif

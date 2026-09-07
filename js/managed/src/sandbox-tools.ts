@@ -8,6 +8,7 @@ import {
   WRITE_STDIN_PARAMETERS,
 } from "nanocodex-tools/execution-contract";
 
+import { serverHandID } from "./hand-hosts";
 import { isPrivateEgressHeader } from "./managed-egress";
 import type { Sandbox } from "./sandbox-runtime";
 
@@ -149,13 +150,14 @@ export function cloudflareSandboxTools(
   namespaceMounts?: () => readonly CloudflareSandboxNamespaceMount[],
   brainWorkspace?: CloudflareBrainWorkspace,
   accountSubject?: string,
+  desktop?: { owner: string; name: string },
 ): ToolMap {
   return createCloudflareSandboxTools(
     async () => {
       // Bind before provisioning or running any user process. The SDK retains
       // this outbound handler across container sleep and Durable Object reload.
       if (accountSubject !== undefined) await sandboxHandle(namespace, sessionId).bindAccountEgress(accountSubject);
-      return namespaceMounts === undefined
+      const sandbox = await (namespaceMounts === undefined
       ? prepareSandbox(namespace, sessionId, localBucket)
       : prepareSandboxNamespace(
           namespace,
@@ -163,7 +165,9 @@ export function cloudflareSandboxTools(
           localBucket,
           namespaceMounts(),
           brainWorkspace,
-        );
+        ));
+      if (desktop) await configureDesktop(namespace, sessionId, desktop);
+      return sandbox;
     },
     publicOrigin === undefined || previewSecret === undefined
       ? undefined
@@ -203,6 +207,7 @@ export async function prepareCloudflareSandboxHand(
   localBucket = false,
   brainWorkspace?: CloudflareBrainWorkspace,
   accountSubject?: string,
+  desktop?: { owner: string; name: string },
 ): Promise<void> {
   if (accountSubject !== undefined) await sandboxHandle(namespace, resourceId).bindAccountEgress(accountSubject);
   const normalized = validateNamespaceMounts(mounts);
@@ -217,6 +222,14 @@ export async function prepareCloudflareSandboxHand(
     normalized,
     brain,
   );
+  if (desktop) await configureDesktop(namespace, resourceId, desktop);
+}
+
+async function configureDesktop(namespace: DurableObjectNamespace<Sandbox>, resourceId: string, desktop: { owner: string; name: string }) {
+  await sandboxHandle(namespace, resourceId).configureRemoteDesktop({
+    owner: desktop.owner, id: await serverHandID(desktop.owner, `cloudflare:${resourceId}`),
+    machineId: `cf:${resourceId}`, name: desktop.name,
+  });
 }
 
 export async function destroyCloudflareSandbox(
@@ -227,6 +240,7 @@ export async function destroyCloudflareSandbox(
   const sandbox = cached?.sandbox ?? sandboxHandle(namespace, sessionId);
   if (cached) await cached.promise.catch(() => {});
   try {
+    await sandboxHandle(namespace, sessionId).clearRemoteDesktop();
     await sandbox.destroy();
   } finally {
     clearSandboxPreparations(namespace, sessionId);

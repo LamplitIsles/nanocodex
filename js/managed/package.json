@@ -12,7 +12,7 @@
     "predeploy": "npm run prepare:code-evaluator",
     "deploy": "wrangler deploy --env=\"\" --config wrangler.jsonc",
     "prebuild": "npm run prepare:code-evaluator",
-    "prepare:code-evaluator": "node scripts/prepare-code-evaluator.mjs",
+    "prepare:code-evaluator": "node scripts/prepare-code-evaluator.mjs && node scripts/prepare-hand-image.mjs",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },

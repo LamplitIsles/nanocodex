@@ -56,6 +56,19 @@ or sent to native Hand subprocesses.
 
 ## Background Hands
 
+**Hands → Remote Screens** opens the shared native WebRTC viewer. Desktop-enabled
+factory VMs appear automatically once their publisher connects. The same screens
+are available from the iPhone/iPad inbox and conversations. Mac screen sharing
+is started explicitly from Remote Screens and remains owned by the app when the
+sheet closes. The Mac's screen identity is saved across reopening the picker and
+restarting the app. Shell-only VM images do not publish a desktop; Cloudflare
+sandbox desktops require the managed desktop feature flag. A disconnected viewer retries with the current publication generation,
+retains the selected screen, and offers **Reconnect** after a 90-second recovery
+window. Control must be acquired again after reconnecting.
+Mac publishing also reconnects after temporary signaling outages while keeping
+the selected display. Stop sharing remains available during recovery; quitting
+the app ends sharing.
+
 The Hands page, chat picker, and menu bar include devices connected elsewhere on
 the same account. Previously observed devices remain listed as offline after
 disconnecting. This requires the managed `/v1/account/hands` endpoint and its

@@ -32,6 +32,7 @@ import {
   type BrokeredSshIdentity,
   validateBrokeredSshRequest,
   validateSshIdentity,
+  validateSshTarget,
   validSshIdentityReference,
 } from "./ssh";
 
@@ -1945,6 +1946,10 @@ async function handleControl(request: Request, url: URL, env: EgressEnv): Promis
       return jsonError(400, "invalid_ssh_identity");
     }
     const body = await readJson(request, MAX_SSH_BODY_BYTES);
+    if (body?.generate === true) {
+      if (body.private_key !== undefined || !validateSshTarget(body)) return jsonError(400, "invalid_ssh_identity");
+      return userBroker(env, userId).fetch(target, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    }
     const identity = validateSshIdentity(body);
     if (!identity) return jsonError(400, "invalid_ssh_identity");
     return userBroker(env, userId).fetch(target, {

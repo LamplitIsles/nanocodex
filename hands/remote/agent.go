@@ -41,7 +41,7 @@ type agentJob struct {
 	cancel                context.CancelFunc
 }
 type agentResult struct {
-	Status string `json:"status"`
+	Status string `json:"status,omitempty"`
 	JPEG   string `json:"jpeg,omitempty"`
 	Width  int    `json:"width,omitempty"`
 	Height int    `json:"height,omitempty"`

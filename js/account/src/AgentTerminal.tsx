@@ -120,6 +120,7 @@ const BrowserAgentTerminal = memo(function BrowserAgentTerminal({
 }: AgentTerminalProps & {
   accountMcpConnections: readonly BrowserAccountMcpConnection[];
 }) {
+  const account = useAccountSession().account;
   const defaultSettings = terminalDefaultSettings(source);
   const [settings, setSettings] = useState(defaultSettings);
   const [conversationStarted, setConversationStarted] = useState(false);
@@ -200,15 +201,18 @@ const BrowserAgentTerminal = memo(function BrowserAgentTerminal({
       retryAgent={retryAgent}
       voice={voiceEnabled}
       welcome={welcome}
-      controls={source === "brokered" ? ({ agentReady }) => (
-        <AgentModelMenu
-          agentReady={agentReady}
-          modelLocked={conversationStarted}
-          settings={settings}
-          onFastMode={updateFastMode}
-          onModel={updateModel}
-          onThinking={updateThinking}
-        />
+      controls={source === "brokered" || account?.persistent ? ({ agentReady }) => (
+        <>
+          {source === "brokered" && <AgentModelMenu
+            agentReady={agentReady}
+            modelLocked={conversationStarted}
+            settings={settings}
+            onFastMode={updateFastMode}
+            onModel={updateModel}
+            onThinking={updateThinking}
+          />}
+          {account?.persistent && <RemoteScreens key={account.id} />}
+        </>
       ) : undefined}
       accessory={({ agentReady, submit }) => (
         <ArtifactDock

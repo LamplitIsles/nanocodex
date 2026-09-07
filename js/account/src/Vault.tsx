@@ -154,6 +154,7 @@ export function Vault() {
 
         <div className="vault-ssh">
           <SshIdentityManager
+            key={accountId}
             disabled={operation !== null}
             identities={status?.ssh ?? null}
             onChanged={load}

@@ -41,6 +41,7 @@ type remoteMessage struct {
 	AgentID      string          `json:"agent_id,omitempty"`
 	DeadlineAt   int64           `json:"deadline_at,omitempty"`
 	Input        *agentInput     `json:"input,omitempty"`
+	Data         json.RawMessage `json:"data,omitempty"`
 	*agentResult
 }
 type remoteSurface struct {
@@ -51,6 +52,7 @@ type remoteSurface struct {
 	Height       int    `json:"height"`
 	Controllable bool   `json:"controllable"`
 	AgentTools   bool   `json:"agent_tools,omitempty"`
+	Transport    string `json:"transport,omitempty"`
 }
 
 // A standalone Hand reads its credential from an owner-only file, never argv.
@@ -73,7 +75,8 @@ func newRemoteService(origin, credentialPath string) (*remoteService, error) {
 	}
 	if base.Path == "" || base.Path == "/" {
 		base.Path = "/v1/account/hands"
-	} else if !regexp.MustCompile(`^/v1/vm-host-attachments/[A-Za-z0-9_-]{43}/[0-9a-f-]{36}/hands$`).MatchString(base.Path) || base.RawPath != "" {
+	} else if !(regexp.MustCompile(`^/v1/vm-host-attachments/[A-Za-z0-9_-]{43}/[0-9a-f-]{36}/hands$`).MatchString(base.Path) ||
+		regexp.MustCompile(`^/v1/hand-hosts/[0-9a-f-]{36}/[0-9a-f-]{36}/hands$`).MatchString(base.Path)) || base.RawPath != "" {
 		return nil, errors.New("invalid allocation remote endpoint")
 	}
 	file, err := os.Open(credentialPath)

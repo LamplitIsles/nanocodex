@@ -22,6 +22,40 @@ or a second agent backend.
 - **Docs**, **Evals**, **Source**, **Commits**, and **Changelog** present the
   product reference, evaluation evidence, and published repository data.
 
+Remote Screens is available in signed-in Home chats, managed chats, and Connect.
+The browser consumes the account screen catalog for Mac, iPhone, VM, and Linux
+server publishers. Video and input use WebRTC; account requests authorize the
+signaling and renewable viewer lease. Hosts explicitly advertising
+`transport: "frames-v1"` instead use that authorized WebSocket for JPEG frames
+and the same control/input messages. This path makes no ICE requests, decodes
+and draws one requested frame at a time, and requests at most ten frames per
+second. Encoded frames are limited to 700,000 base64 characters; both JPEG
+header dimensions and decoded dimensions must match and stay within 1280×1280.
+A selected screen survives tab suspension
+and disconnects. Recovery refreshes its publication generation and retries for
+up to 90 seconds, with backoff capped at eight seconds and ten-second reconnect
+attempts. A stopped recovery offers an explicit Reconnect button.
+
+Hiding the tab pauses the connection. Losing focus, control, or the connection
+discards unsent input; resuming requires taking control again. Disconnected
+video is cleared and hidden. Screen availability still depends on the host
+publisher; this viewer does not provision a Cloudflare desktop.
+
+The viewer tests cover recovery deadlines, server publication changes, stale
+callbacks, control release, and authorization expiry. Chromium checks exercised
+real video/data channels, actual tab hide/show, discarded drafts, a 12-second
+publisher outage, and reopening the viewer. That lifecycle test uses a synthetic
+publisher. Separate live VM checks received 1600×900 video, renewed the viewer
+lease for three minutes, and used browser pointer/text/keyboard input to create
+and list a marker file in the VM terminal. A live factory restart with a
+12-second shutdown gap cleared the old frame and resumed decoded video with
+the new publication in about 18 seconds, retaining selection without acquiring
+control.
+The frame-transport Chromium fixture also exercised real JPEG decoding,
+pointer/text/keyboard input, actual tab hide/show, and a 12-second publisher
+outage with zero WebRTC peers or ICE requests. The host and broker remain
+responsible for provisioning and publishing Cloudflare desktops.
+
 ## Boundaries
 
 The Vite application has one React root and owns browser presentation, routing,
