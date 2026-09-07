@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import { HandRemoteBroker, REMOTE_VM_ASSERTION, type RemoteVMPublisher } from "./hand-remote";
 import {
   HOSTED_TOOLS_PRE_ADMISSION_UNAVAILABLE,
   HOSTED_MACHINE_TOOL_NAMES,
@@ -79,14 +80,51 @@ type AuthorizationContext = Pick<InvocationContext, "sessionId" | "subagent">;
 /** One account-owned reverse attachment shared by every managed agent in that account. */
 export class AccountHostedTools extends DurableObject<AccountHostedToolsEnv> {
   readonly #broker: HostedToolsBroker;
+  readonly #remote: HandRemoteBroker;
 
   constructor(ctx: DurableObjectState, env: AccountHostedToolsEnv) {
     super(ctx, env);
     this.#broker = new HostedToolsBroker(ctx, { resumeRetainedSockets: true });
+    this.#remote = new HandRemoteBroker(ctx);
   }
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
+    if (url.pathname === "/hands" || url.pathname.startsWith("/hands/")) {
+      const ownerId = request.headers.get(OWNER_ASSERTION);
+      if (!isUserId(ownerId) || !await this.#claim(ownerId)) {
+        return Response.json({ error: "not_found" }, { status: 404 });
+      }
+      let vm: RemoteVMPublisher | undefined;
+      const encodedVM = request.headers.get(REMOTE_VM_ASSERTION);
+      if (encodedVM !== null) {
+        try {
+          vm = JSON.parse(encodedVM);
+          if (!vm || typeof vm.machineId !== "string" || typeof vm.routeId !== "string"
+            || !Number.isSafeInteger(vm.expiresAt) || vm.expiresAt <= Date.now()) throw new Error();
+        } catch { return Response.json({ error: "forbidden" }, { status: 403 }); }
+      }
+      if (url.pathname === "/hands/renew" && request.method === "POST" && !url.search) {
+        try {
+          const reader = request.body?.getReader();
+          if (!reader) throw new Error();
+          let bytes = new Uint8Array();
+          try {
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              if (bytes.byteLength + value.byteLength > 256) throw new Error();
+              const next = new Uint8Array(bytes.byteLength + value.byteLength); next.set(bytes); next.set(value, bytes.byteLength); bytes = next;
+            }
+          } finally { await reader.cancel(); reader.releaseLock(); }
+          const body = JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes));
+          if (typeof body?.connection_id !== "string" || Object.keys(body).length !== 1) throw new Error();
+          const capabilities: unknown = JSON.parse(request.headers.get("x-nanocodex-capabilities") ?? "[]");
+          return this.#remote.renew(body.connection_id, Array.isArray(capabilities) && capabilities.includes("agents:write"), vm);
+        } catch { return Response.json({ error: "invalid_request" }, { status: 400 }); }
+      }
+      return this.#remote.fetch(request, vm);
+    }
     if (request.method === "GET" && url.pathname === "/tool-host") {
       if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
         return new Response("Expected WebSocket upgrade", { status: 426 });
@@ -104,7 +142,7 @@ export class AccountHostedTools extends DurableObject<AccountHostedToolsEnv> {
       }
       const provider = this.#broker.provider();
       return Response.json({
-        tools: provider.definitions().flatMap((definition) => {
+        tools: [...provider.definitions().flatMap((definition) => {
           const tool = provider.resolve(definition.name) as RoutedHostedTool | undefined;
           return tool?.routeToken === undefined ? [] : [{
             definition,
@@ -115,7 +153,7 @@ export class AccountHostedTools extends DurableObject<AccountHostedToolsEnv> {
             timeout_ms: tool.timeoutMs,
             route_token: tool.routeToken,
           } satisfies AccountHostedTool];
-        }),
+        }), ...this.#remote.tools()],
         machines: this.#broker.machines().map((machine) => ({
           machine,
           tools: HOSTED_MACHINE_TOOL_NAMES.flatMap((name) => {
@@ -139,6 +177,11 @@ export class AccountHostedTools extends DurableObject<AccountHostedToolsEnv> {
         || typeof invocation.name !== "string" || typeof invocation.session_id !== "string"
         || typeof invocation.call_id !== "string" || typeof invocation.route_token !== "string") {
         return Response.json({ error: "not_found" }, { status: 404 });
+      }
+      if (invocation.machine_id === undefined) {
+        const remote = await this.#remote.invoke(invocation.name, invocation.route_token,
+          invocation.input, invocation.session_id, request.signal);
+        if (remote) return remote;
       }
       const machineName = HOSTED_MACHINE_TOOL_NAMES.find((name) => name === invocation.name);
       const tool = invocation.machine_id === undefined
@@ -176,14 +219,17 @@ export class AccountHostedTools extends DurableObject<AccountHostedToolsEnv> {
   alarm(): void { this.#broker.expire(); }
 
   async webSocketMessage(socket: WebSocket, message: string | ArrayBuffer): Promise<void> {
+    if (this.#remote.owns(socket)) { this.#remote.message(socket, message); return; }
     await this.#broker.webSocketMessage(socket, message);
   }
 
   webSocketClose(socket: WebSocket, code: number, reason: string): void {
+    if (this.#remote.owns(socket)) { this.#remote.close(socket); return; }
     this.#broker.webSocketClose(socket, code, reason);
   }
 
   webSocketError(socket: WebSocket): void {
+    if (this.#remote.owns(socket)) { this.#remote.close(socket); return; }
     this.#broker.webSocketError(socket);
   }
 

@@ -12,6 +12,7 @@ struct HandsView: View {
                         Text("Your connected computers and phones, with this Mac available automatically.").font(.system(size: 14)).foregroundStyle(.secondary)
                     }
                     Spacer()
+                    Button("Remote Screens") { model.showingScreens = true }.disabled(model.remoteService == nil)
                     Menu {
                         Button("This Mac…") { model.editingHand = nil; model.showingHandSetup = true }
                         Button("Virtual Machine…") { model.editingHand = Hand(id: "vm-\(UUID().uuidString.prefix(8).lowercased())", name: "Private VM", kind: "vm", workspace: model.state.defaults["workspace"].string); model.showingHandSetup = true }

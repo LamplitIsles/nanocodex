@@ -1,6 +1,7 @@
-import { env, runInDurableObject } from "cloudflare:test";
+import { env, createExecutionContext, runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import worker from "../src/index";
 import { VmHostPool, type VmHostPoolEnv } from "../src/vm-host-pool";
 
 const OWNER_A = "11111111-1111-4111-8111-111111111111";
@@ -19,6 +20,48 @@ const ORIGIN = "https://managed.example";
 afterEach(() => vi.useRealTimers());
 
 describe("VM host pool", () => {
+  it("authenticates desktop publication and renewal through the public allocation route", async () => {
+    const stub = pool(LOCATOR);
+    const host = await connectHost(stub, HOST_A, "donor-a", 1);
+    const provision = nextFrame(host.socket);
+    const acquired = await stub.fetch("https://pool.internal/acquire", {
+      method: "POST", body: JSON.stringify(acquireBody(MOUNT_A, {
+        organization_id: OWNER_A, team_id: OWNER_B, agent_id: MOUNT_B,
+      })),
+    });
+    expect(acquired.status).toBe(201);
+    const allocation = await acquired.json<Record<string, unknown>>();
+    const frame = await provision;
+    const bearer = (frame.tool_attachment as { bearer: string }).bearer;
+    const base = `${ORIGIN}/v1/vm-host-attachments/${LOCATOR}/${allocation.allocation_id}/hands`;
+    const auth = { authorization: `Bearer ${bearer}` };
+    const call = (url: string, init: RequestInit) => worker.fetch(new Request(url, init),
+      { ...env, NANOCODEX_TURN_KEY_ID: undefined, NANOCODEX_TURN_API_TOKEN: undefined } as Parameters<typeof worker.fetch>[1], createExecutionContext());
+    expect((await call(base + "/ice", { method: "POST" })).status).toBe(401);
+    expect((await call(base + "/ice", { method: "POST", headers: { authorization: `Bearer ${"x".repeat(43)}` } })).status).toBe(404);
+    expect((await call(base + "/ice", { method: "POST", headers: auth })).status).toBe(200);
+    const response = await call(base + "/host", { headers: { ...auth, upgrade: "websocket" } });
+    expect(response.status).toBe(101);
+    const desktop = response.webSocket!, ready = nextFrame(desktop); desktop.accept();
+    const state = await ready;
+    const published = nextFrame(desktop);
+    desktop.send(JSON.stringify({ type: "catalog", machine_id: frame.machine_id, machine_name: "VM desktop",
+      surfaces: [{ id: "desktop", name: "Desktop", kind: "vm", width: 1600, height: 900, controllable: true }] }));
+    expect(await published).toMatchObject({ type: "published" });
+    const renewed = nextFrame(desktop);
+    expect((await call(base + "/renew", { method: "POST", headers: auth,
+      body: JSON.stringify({ connection_id: state.connection_id }) })).status).toBe(200);
+    await renewed;
+    const release = nextFrame(host.socket);
+    expect((await stub.fetch("https://pool.internal/release", { method: "POST",
+      body: JSON.stringify({ ...allocationIdentity(allocation, MOUNT_A), agent_id: MOUNT_B }) })).status).toBe(202);
+    await release;
+    expect((await call(base + "/ice", { method: "POST", headers: auth })).status).toBe(404);
+    expect((await call(base + "/renew", { method: "POST", headers: auth,
+      body: JSON.stringify({ connection_id: state.connection_id }) })).status).toBe(404);
+    desktop.close(); host.socket.close();
+  });
+
   it("upgrades retained host and allocation tables with public origins", async () => {
     const stub = pool(crypto.randomUUID());
     await runInDurableObject(stub, async (_pool, state) => {

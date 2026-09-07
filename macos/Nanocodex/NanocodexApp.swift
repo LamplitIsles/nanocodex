@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import NanocodexRemote
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -98,6 +99,7 @@ struct NanocodexApp: App {
                 Button("Agent Control Panel") { delegate.showControlPanel() }.keyboardShortcut("p", modifiers: [.command, .shift])
                 Button("Stop Current Turn") { Task { await model.cancel() } }.keyboardShortcut(".").disabled(!model.isRunning)
                 Button("Hands") { model.screen = .hands }.keyboardShortcut("h", modifiers: [.command, .shift])
+                Button("Remote Screens") { model.showingScreens = true }.disabled(model.remoteService == nil)
                 Button("Connections") { model.openAccount() }
                 Button("Refresh") { Task { await model.refresh() } }.keyboardShortcut("r")
             }
@@ -119,8 +121,17 @@ struct ContentView: View {
         }
         .toolbar {
             ToolbarItem(placement: .principal) { Text("Nanocodex").font(.system(size: 13, weight: .medium)).foregroundStyle(.secondary) }
+            ToolbarItem { RemoteSharingIndicator(host: model.remoteMacHost, phoneHost: model.remotePhoneHost) }
         }
         .sheet(isPresented: $model.showingSettings) { SettingsView() }
+        .sheet(isPresented: $model.showingScreens) {
+            VStack {
+                HStack { Spacer(); Button("Done") { model.showingScreens = false } }.padding([.top, .trailing])
+                if let service = model.remoteService {
+                    RemoteDashboard(service: service, host: model.remoteMacHost, phoneHost: model.remotePhoneHost).id(ObjectIdentifier(service))
+                }
+            }.frame(minWidth: 840, minHeight: 600)
+        }
     }
     private var workspace: some View {
         HStack(spacing: 0) {

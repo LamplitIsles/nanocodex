@@ -35,6 +35,7 @@ import {
 import { clientFailureMessage } from "./clientFailure";
 import { AgentModelMenu } from "./AgentModelMenu";
 import { attachManagedBrowserHand } from "./managedBrowserHand";
+import { RemoteScreens } from "./RemoteScreens";
 import { managedTerminalAgent, openManagedAgent } from "./managedAgentRuntime";
 
 export type { AgentTerminalMode, AgentTerminalState } from "nanocodex-terminal";
@@ -345,6 +346,7 @@ export const ManagedAgentTerminal = memo(function ManagedAgentTerminal({
             onThinking={(thinking) => updateManagedSettings({ thinking })}
           />
           <ManagedAgentSchedules agent={managed} />
+          <RemoteScreens key={managed.id} />
         </>
       )}
       accessory={({ agentReady, submit }) => browserHand ? (

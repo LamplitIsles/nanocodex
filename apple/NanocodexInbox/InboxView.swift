@@ -4,6 +4,7 @@ import UniformTypeIdentifiers
 import ImageIO
 import AVKit
 import InboxCore
+import NanocodexRemote
 import NanocodexVoice
 import NanocodexContext
 import NanocodexUI
@@ -33,6 +34,7 @@ struct InboxView: View {
     @GestureState(resetTransaction: Transaction(animation: .snappy(duration: 0.28))) private var sidebarDrag: CGFloat = 0
     @State private var showScheduledJobs = false
     @State private var showSettings = false
+    @State private var showScreens = false
     @FocusState private var composerFocused: Bool
 
     private let newThreadPullThreshold: CGFloat = 160
@@ -71,6 +73,14 @@ struct InboxView: View {
         }
         .foregroundStyle(Ink.text)
         .tint(Ink.accent)
+        .sheet(isPresented: $showScreens) {
+            NavigationStack {
+                if let service = model.remoteService {
+                    RemoteDashboard(service: service).id(ObjectIdentifier(service))
+                        .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { showScreens = false } } }
+                }
+            }
+        }
         .sheet(isPresented: $showThread, onDismiss: { model.closeThread() }) { ConversationView(model: model).tint(Ink.accent) }
         .sheet(isPresented: Binding(get: { model.showContext && !showThread }, set: { model.showContext = $0 })) { ContextInboxView(model: model).tint(Ink.accent) }
         .onChange(of: model.focused?.activeTurns ?? []) { _, turns in
@@ -78,7 +88,7 @@ struct InboxView: View {
         }
         .onChange(of: model.focusedConversationIdentity) { _, _ in drag = 0; upwardDrag = 0; cardDrag = nil; composerFocused = false }
         .onChange(of: model.connected) { _, connected in
-            if !connected { showScheduledJobs = false; showSettings = false; showAgents = false; showThread = false }
+            if !connected { showScreens = false; showScheduledJobs = false; showSettings = false; showAgents = false; showThread = false }
         }
     }
 
@@ -214,6 +224,10 @@ struct InboxView: View {
             ScrollView(.horizontal) { filters }
                 .scrollIndicators(.hidden)
                 .clipShape(Capsule())
+            Button { showScreens = true } label: {
+                Image(systemName: "display").frame(width: 44, height: 44)
+                    .background(.regularMaterial, in: Circle())
+            }.accessibilityLabel("Remote screens").disabled(model.remoteService == nil)
             ConnectionStatusView(status: model.connection, retry: { model.retryConnection() }, signIn: { showSettings = true })
         }.foregroundStyle(Ink.text).buttonStyle(.plain).frame(height: 44)
             .shadow(color: .black.opacity(0.09), radius: 12, y: 4)

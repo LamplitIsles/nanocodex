@@ -2,9 +2,9 @@ name: Apple apps
 on:
   push:
     branches: [master]
-    paths: ['Cargo.toml', 'Cargo.lock', 'crates/experimental/nanocodex-voice-protocol/**', 'crates/experimental/nanocodex-voice-ffi/**', 'apple/**', 'macos/**', 'js/desktop-runtime/**', 'js/nanocodex/**', 'js/nanocodex-tools/**', 'js/nanocodex-vite/**', 'pnpm-lock.yaml', 'pnpm-workspace.yaml', 'turbo.json', '.github/workflows/apple-inbox.yml']
+    paths: ['Cargo.toml', 'Cargo.lock', 'crates/experimental/nanocodex-voice-protocol/**', 'crates/experimental/nanocodex-voice-ffi/**', 'apple/**', 'macos/**', 'hands/remote/**', 'js/desktop-runtime/**', 'js/nanocodex/**', 'js/nanocodex-tools/**', 'js/nanocodex-vite/**', 'pnpm-lock.yaml', 'pnpm-workspace.yaml', 'turbo.json', '.github/workflows/apple-inbox.yml']
   pull_request:
-    paths: ['Cargo.toml', 'Cargo.lock', 'crates/experimental/nanocodex-voice-protocol/**', 'crates/experimental/nanocodex-voice-ffi/**', 'apple/**', 'macos/**', 'js/desktop-runtime/**', 'js/nanocodex/**', 'js/nanocodex-tools/**', 'js/nanocodex-vite/**', 'pnpm-lock.yaml', 'pnpm-workspace.yaml', 'turbo.json', '.github/workflows/apple-inbox.yml']
+    paths: ['Cargo.toml', 'Cargo.lock', 'crates/experimental/nanocodex-voice-protocol/**', 'crates/experimental/nanocodex-voice-ffi/**', 'apple/**', 'macos/**', 'hands/remote/**', 'js/desktop-runtime/**', 'js/nanocodex/**', 'js/nanocodex-tools/**', 'js/nanocodex-vite/**', 'pnpm-lock.yaml', 'pnpm-workspace.yaml', 'turbo.json', '.github/workflows/apple-inbox.yml']
 permissions:
   contents: read
 concurrency:
@@ -35,6 +35,11 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Build shared Rust voice core
         run: pnpm build:voice-core
+      - name: Remote companion protocol
+        run: go test -race ./...
+        working-directory: hands/remote
+      - name: Native remote protocol
+        run: swift test --package-path apple/NanocodexRemote --filter RemoteProtocolTests
       - name: Build shared desktop runtime and dependencies
         run: pnpm exec turbo run build --filter=@nanocodex/desktop-runtime
       - name: Prepare bundled Mac runtime

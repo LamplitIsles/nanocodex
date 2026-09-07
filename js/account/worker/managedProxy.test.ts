@@ -53,12 +53,22 @@ test("the account hand WebSocket stays on the managed service boundary", async (
   assert.equal(forwarded, request);
 });
 
+test("interactive screen routes retain their exact managed boundary", () => {
+  for (const suffix of ["", "/screens", "/host", "/view", "/renew", "/ice"]) {
+    assert.equal(isManagedRoutePath("/v1/account/hands" + suffix), true);
+  }
+  for (const suffix of ["/", "/host/extra", "/input", "/command", "-other"]) {
+    assert.equal(isManagedRoutePath("/v1/account/hands" + suffix), false);
+  }
+});
+
 test("VM host WebSockets stay on their exact managed service boundaries", () => {
   for (const path of [
     "/v1/account/vm-host",
     "/v1/agents/agent-1/vm-host",
     "/v1/system/vm-host",
     `/v1/vm-host-attachments/${"p".repeat(43)}/11111111-1111-4111-8111-111111111111/tool-host`,
+    ...["host", "ice", "renew"].map(endpoint => `/v1/vm-host-attachments/${"p".repeat(43)}/11111111-1111-4111-8111-111111111111/hands/${endpoint}`),
   ]) {
     assert.equal(isManagedRoutePath(path), true, path);
   }
@@ -68,6 +78,7 @@ test("VM host WebSockets stay on their exact managed service boundaries", () => 
     "/v1/system/vm-host/",
     "/v1/system/vm-host/extra",
     `/v1/vm-host-attachments/${"p".repeat(43)}/11111111-1111-4111-8111-111111111111/tool-host/extra`,
+    `/v1/vm-host-attachments/${"p".repeat(43)}/11111111-1111-4111-8111-111111111111/hands/view`,
   ]) {
     assert.equal(isManagedRoutePath(path), false, path);
   }

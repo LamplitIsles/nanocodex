@@ -2,6 +2,42 @@ import XCTest
 
 final class InboxUITests: XCTestCase {
     override func setUp() { super.setUp(); continueAfterFailure = false }
+    func testRemoteScreenControlAndReconnect() throws {
+        guard let origin = ProcessInfo.processInfo.environment["NANOCODEX_TEST_REMOTE_ORIGIN"] else {
+            throw XCTSkip("Requires signing into the isolated local account and a published Wayland test desktop")
+        }
+        XCTAssertTrue(URL(string: origin)?.host?.hasSuffix(".localhost") == true)
+        let app = XCUIApplication(); app.launch()
+        let screens = app.buttons["Remote screens"]
+        XCTAssertTrue(screens.waitForExistence(timeout: 20)); screens.tap()
+        let desktopName = ProcessInfo.processInfo.environment["NANOCODEX_TEST_REMOTE_MACHINE_NAME"] ?? "Wayland desktop test"
+        let desktop = app.buttons.containing(.staticText, identifier: desktopName).firstMatch
+        XCTAssertTrue(desktop.waitForExistence(timeout: 15)); desktop.tap()
+        let control = app.buttons["Take control"]
+        XCTAssertTrue(control.waitForExistence(timeout: 10))
+        let connected = XCTNSPredicateExpectation(predicate: NSPredicate(format: "enabled == true"), object: control)
+        XCTAssertEqual(XCTWaiter.wait(for: [connected], timeout: 25), .completed)
+        control.tap()
+        XCTAssertTrue(app.buttons["Release control"].waitForExistence(timeout: 5))
+        let canvas = app.otherElements["remote-canvas"]
+        XCTAssertTrue(canvas.waitForExistence(timeout: 5)); canvas.tap()
+        let remoteReturn = app.buttons.matching(NSPredicate(format: "label == %@", "Return")).firstMatch
+        remoteReturn.tap()
+        let text = app.textFields["Type on remote screen"]
+        text.tap(); text.typeText("touch /workspace/ios-native-control-evidence")
+        app.buttons["Send"].tap(); remoteReturn.tap()
+        capture(app, "remote-ios-control")
+        app.buttons["Release control"].tap()
+        app.buttons["Done"].tap(); app.terminate(); app.launch()
+        XCTAssertTrue(screens.waitForExistence(timeout: 20)); screens.tap()
+        XCTAssertTrue(desktop.waitForExistence(timeout: 15)); desktop.tap()
+        XCTAssertTrue(control.waitForExistence(timeout: 10))
+        let reconnected = XCTNSPredicateExpectation(predicate: NSPredicate(format: "enabled == true"), object: control)
+        XCTAssertEqual(XCTWaiter.wait(for: [reconnected], timeout: 25), .completed)
+        control.tap(); XCTAssertTrue(app.buttons["Release control"].waitForExistence(timeout: 5))
+        capture(app, "remote-ios-reconnected")
+        app.buttons["Release control"].tap(); app.buttons["Done"].tap()
+    }
 
     @MainActor
     func testLiveTerminalProgressAndFailure() async throws {

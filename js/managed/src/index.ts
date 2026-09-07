@@ -1,4 +1,6 @@
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
+import { remoteICE } from "./hand-remote-ice";
+import { REMOTE_VM_ASSERTION, type RemoteVMPublisher } from "./hand-remote";
 import {
   getWorkspace,
   withWorkspace,
@@ -329,6 +331,8 @@ export interface Env extends
   HostPrincipalEnv {
   NANOCODEX_SESSIONS: DurableObjectNamespace<DurableAgentSession>;
   NANOCODEX_ACCOUNT_TOOLS: DurableObjectNamespace<AccountHostedTools>;
+  NANOCODEX_TURN_KEY_ID?: string;
+  NANOCODEX_TURN_API_TOKEN?: string;
   NANOCODEX_VM_HOST_POOLS: DurableObjectNamespace<VmHostPool>;
   NANOCODEX_ROOMS: DurableObjectNamespace<MultiplayerRoom>;
   NANOCODEX_MULTIPLAYER_QUOTA: DurableObjectNamespace<MultiplayerQuota>;
@@ -1259,7 +1263,7 @@ async function managedFetch(
       return json({ service: "nanocodex", runtime: "cloudflare-durable-objects", status: "ok" });
     }
     const leasedVmHost = url.pathname.match(
-      /^\/v1\/vm-host-attachments\/([A-Za-z0-9_-]{43})\/([0-9a-f-]{36})\/tool-host$/,
+      /^\/v1\/vm-host-attachments\/([A-Za-z0-9_-]{43})\/([0-9a-f-]{36})\/(tool-host|hands\/(?:host|ice|renew))$/,
     );
     if (leasedVmHost) {
       return routeVmHostToolAttachment(
@@ -1268,6 +1272,7 @@ async function managedFetch(
         url,
         leasedVmHost[1]!,
         leasedVmHost[2]!,
+        leasedVmHost[3]!,
       );
     }
     if (url.pathname === "/v1/system/vm-host") {
@@ -1309,6 +1314,28 @@ async function managedFetch(
         locator,
         publicOrigin: url.origin,
       });
+    }
+    if (url.pathname.startsWith("/v1/account/hands/")) {
+      const principal = trustedAgentPrincipal ?? await authenticate(request, env, url);
+      if (!principal) return json({ error: "unauthorized" }, { status: 401 });
+      if (principal.connectGrant || !principal.capabilities.includes("agents:read")
+        || !principal.capabilities.includes("tools:use")
+        || (url.pathname.endsWith("/host") && !principal.capabilities.includes("agents:write"))) {
+        return json({ error: "forbidden" }, { status: 403 });
+      }
+      if (principal.kind !== "api_key" && (request.method !== "GET" || request.headers.has("upgrade"))
+        && request.headers.get("origin") !== url.origin) return json({ error: "forbidden_origin" }, { status: 403 });
+      if (url.pathname === "/v1/account/hands/ice") {
+        if (request.method !== "POST" || url.search) return json({ error: "invalid_request" }, { status: 400 });
+        return remoteICE(env, principal.userId);
+      }
+      const headers = new Headers(request.headers);
+      headers.delete(REMOTE_VM_ASSERTION);
+      forwardPrincipalAssertions(headers, principal);
+      return env.NANOCODEX_ACCOUNT_TOOLS.getByName(principal.userId).fetch(
+        `https://account-tools.internal${url.pathname.slice("/v1/account".length)}${url.search}`,
+        new Request(request, { headers }),
+      );
     }
     if (url.pathname === "/v1/account/tool-host") {
       if (url.search !== "") return json({ error: "invalid_request" }, { status: 400 });
@@ -2131,9 +2158,13 @@ async function routeVmHostToolAttachment(
   url: URL,
   poolLocator: string,
   allocationId: string,
+  endpoint: string,
 ): Promise<Response> {
-  if (url.search !== "" || request.method !== "GET"
-    || request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
+  const remoteHTTP = endpoint === "hands/ice" || endpoint === "hands/renew";
+  if (url.search !== "" || (remoteHTTP && request.method !== "POST")) {
+    return json({ error: "invalid_request" }, { status: 400 });
+  }
+  if (!remoteHTTP && (request.method !== "GET" || request.headers.get("upgrade")?.toLowerCase() !== "websocket")) {
     return new Response("Expected WebSocket upgrade", { status: 426 });
   }
   const bearer = request.headers.get("authorization")?.match(/^Bearer ([A-Za-z0-9_-]{43})$/)?.[1];
@@ -2159,6 +2190,8 @@ async function routeVmHostToolAttachment(
   if (!validVmHostAttachmentGrant(grant) || grant.allocation_id !== allocationId) {
     return json({ error: "attachment_unavailable" }, { status: 503 });
   }
+  // ICE and renewals require the same live allocation grant as publication.
+  if (endpoint === "hands/ice") return remoteICE(env, grant.owner_id);
   const headers = new Headers(request.headers);
   headers.delete("authorization");
   headers.delete("cookie");
@@ -2168,6 +2201,13 @@ async function routeVmHostToolAttachment(
   headers.set(SESSION_TEAM_ASSERTION, grant.team_id);
   headers.set(SESSION_AUTHORIZATION_EPOCH_ASSERTION, String(grant.authorization_epoch));
   headers.set(SESSION_CAPABILITIES_ASSERTION, JSON.stringify(["agents:write", "tools:use"]));
+  if (endpoint.startsWith("hands/")) {
+    headers.set(REMOTE_VM_ASSERTION, JSON.stringify({ machineId: grant.machine_id,
+      routeId: grant.route_id, expiresAt: grant.lease_expires_at } satisfies RemoteVMPublisher));
+    return env.NANOCODEX_ACCOUNT_TOOLS.getByName(grant.owner_id).fetch(
+      `https://account-tools.internal/${endpoint}`, new Request(request, { headers }),
+    );
+  }
   headers.set("x-nanocodex-vm-machine-id", grant.machine_id);
   headers.set("x-nanocodex-vm-lease-expires-at", String(grant.lease_expires_at));
   headers.set("x-nanocodex-vm-route-id", grant.route_id);

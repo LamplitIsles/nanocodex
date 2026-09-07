@@ -16,7 +16,7 @@ use crate::{
     image::{host_resolver_configuration, reflink_or_sparse_copy},
     tools::{
         DEFAULT_SHUTDOWN_TIMEOUT, DEFAULT_STARTUP_TIMEOUT, VmToolSession, VmToolSessionError,
-        VmTools,
+        VmToolSessionHandle, VmTools,
     },
 };
 
@@ -128,6 +128,13 @@ impl VmWorkspace {
     #[must_use]
     pub fn tools(&self) -> VmTools {
         self.session.tools()
+    }
+
+    /// Returns a trusted guest-control capability for owner-managed services.
+    /// Drop this capability and finish its requests before shutting down the VM.
+    #[must_use]
+    pub fn control(&self) -> VmToolSessionHandle {
+        self.session.handle()
     }
 
     /// Returns a normal Nanocodex tool builder with workspace effects routed

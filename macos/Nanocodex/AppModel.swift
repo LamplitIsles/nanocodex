@@ -2,6 +2,7 @@ import AppKit
 import SwiftUI
 import InboxCore
 import NanocodexVoice
+import NanocodexRemote
 
 @MainActor
 final class AppModel: ObservableObject {
@@ -50,6 +51,10 @@ final class AppModel: ObservableObject {
     @Published var showingSearch = false
     @Published var showingHandSetup = false
     @Published var showingRemoteSetup = false
+    @Published var showingScreens = false
+    @Published private(set) var remoteService: RemoteService?
+    private(set) var remoteMacHost = RemoteMacHost()
+    private(set) var remotePhoneHost = RemoteMacHost()
     @Published var editingHand: Hand?
     @Published var settings = AgentSettings()
     @Published var selectedHandForLogs: Hand?
@@ -68,7 +73,16 @@ final class AppModel: ObservableObject {
     private var observation = Set<String>()
     private var didStart = false
     private let isolatedSession: Bool
-    private var currentCredential: AccountKeychain.Credential?
+    private var currentCredential: AccountKeychain.Credential? {
+        didSet {
+            resetRemoteSharing()
+            if let credential = currentCredential, let origin = URL(string: credential.baseUrl) {
+                remoteService = try? RemoteService(origin: origin) { request in
+                    request.setValue("Bearer " + credential.apiKey, forHTTPHeaderField: "Authorization")
+                }
+            }
+        }
+    }
     private var signInPreviousCredential: AccountKeychain.Credential?
     private var signInPreviousSavedCredential: AccountKeychain.Credential?
     private var signInChangedAccount = false
@@ -745,8 +759,8 @@ final class AppModel: ObservableObject {
                 throw error
             }
             signInChangedAccount = true
-            currentCredential = credential
             resetAccount(); apply(next)
+            currentCredential = credential
             signInCommitted = true
         }
         try await runtime.request("completeSignIn")
@@ -790,6 +804,7 @@ final class AppModel: ObservableObject {
         voice.stop(); voice.transcriptFeed.clear(); preparingVoiceTabID = nil
         accountHandDiscovery?.cancel(); accountHandDiscovery = nil
         defaultHandConnection?.cancel(); defaultHandConnection = nil
+        resetRemoteSharing(); showingScreens = false
         persistence?.cancel()
         timelineProjections.removeAll()
         requestedEditorTabID = nil; readingPositions = [:]; expandedMessages = [:]; draftSettings = [:]; inboxOrder = []; pinnedPaneID = nil; workspaceFilter = .inbox; workspaceMode = "single"; tiledTabIDs = []; showingPanePicker = false; paneWidth = 0
@@ -867,12 +882,13 @@ final class AppModel: ObservableObject {
         backgroundActivityStopped = true; backgroundActivity.stop()
         voice.stop(); await voice.finishStopping()
         defaultHandConnection?.cancel(); defaultHandConnection = nil
+        await remoteMacHost.stop(); await remotePhoneHost.stop(); remoteService?.close()
         persistence?.cancel()
         try? await cancelPhoneSignIn()
         _ = try? await runtime.request("saveLayout", [try Self.layoutPayload(TabLayout(tabs: tabs, activeTabId: activeTabID, tabPosition: tabPosition, theme: theme, workspaceMode: workspaceMode, paneWidth: paneWidth, tiledTabIDs: tiledTabIDs, pendingMessages: pending), scope: state.accountScope)])
         runtime.stop()
     }
-    func shutdown() { backgroundActivityStopped = true; backgroundActivity.stop(); voice.stop(); defaultHandConnection?.cancel(); accountHandDiscovery?.cancel(); persistence?.cancel(); runtime.stop() }
+    func shutdown() { resetRemoteSharing(); backgroundActivityStopped = true; backgroundActivity.stop(); voice.stop(); defaultHandConnection?.cancel(); accountHandDiscovery?.cancel(); persistence?.cancel(); runtime.stop() }
 
     private func connectDefaultHand() {
         defaultHandConnection?.cancel()
@@ -888,5 +904,12 @@ final class AppModel: ObservableObject {
                 }
             }
         }
+    }
+    private func resetRemoteSharing() {
+        remoteService?.close(); remoteService = nil
+        let mac = remoteMacHost, phone = remotePhoneHost
+        mac.revokeControl(); phone.revokeControl()
+        remoteMacHost = RemoteMacHost(); remotePhoneHost = RemoteMacHost()
+        Task { await mac.stop(); await phone.stop() }
     }
 }

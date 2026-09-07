@@ -244,6 +244,13 @@ impl AttachmentTarget {
     pub const fn endpoint(&self) -> &Url {
         &self.endpoint
     }
+
+    /// Returns the transport credential for a trusted, allocation-owned companion.
+    /// Never include this value in arguments, logs, or model-visible metadata.
+    #[must_use]
+    pub fn bearer(&self) -> &str {
+        &self.bearer
+    }
 }
 
 impl fmt::Debug for AttachmentTarget {

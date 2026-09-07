@@ -6,11 +6,14 @@ use std::{
 
 use fs2::FileExt as _;
 use nanocodex_managed::ManagedError;
-use nanocodex_tools::{Tools, attachment::AttachmentMachine};
+use nanocodex_tools::{
+    Tools,
+    attachment::{AttachmentMachine, AttachmentTarget},
+};
 use nanocodex_vm::{
     VmWorkspace, VmWorkspaceError,
     host::VmProcessConfig,
-    tools::{GuestRuntimeDisk, VmToolSessionError},
+    tools::{GuestRuntimeDisk, VmCommand, VmCommandOutput, VmToolSessionError},
 };
 use tokio::time::sleep;
 
@@ -20,12 +23,27 @@ pub(crate) use super::vm_hand_config::VmHandConfig;
 const DEFAULT_KRUNFW_DIRECTORY: &str = ".cache/libkrunfw/libkrunfw";
 const CAPABILITY_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const CAPABILITY_DRAIN_INTERVAL: Duration = Duration::from_millis(10);
+const DESKTOP_CREDENTIAL: &str = "/run/nanocodex-remote/credential";
+const DESKTOP_EXECUTABLE: &str = "/usr/local/bin/nanocodex-remote";
+
+struct VmDesktop {
+    task: Option<tokio::task::JoinHandle<Result<VmCommandOutput, VmToolSessionError>>>,
+}
+
+impl Drop for VmDesktop {
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
+}
 
 pub(crate) struct VmHand {
     workspace: VmWorkspace,
     tools: Tools,
     machine: AttachmentMachine,
     _root_lock: Option<File>,
+    desktop: Option<VmDesktop>,
 }
 
 impl VmHand {
@@ -95,6 +113,7 @@ impl VmHand {
             tools,
             machine,
             _root_lock: root_lock,
+            desktop: None,
         })
     }
 
@@ -135,7 +154,144 @@ impl VmHand {
         self.tools.clone()
     }
 
-    pub(crate) async fn shutdown(self) -> Result<(), ManagedError> {
+    /// Images containing the companion opt into an owned interactive desktop.
+    /// Existing shell-only images retain their previous startup contract.
+    pub(crate) async fn start_desktop(
+        &mut self,
+        target: &AttachmentTarget,
+    ) -> Result<(), ManagedError> {
+        let control = self.workspace.control();
+        let present = control
+            .command(
+                VmCommand::new("/bin/sh")
+                    .arg("-c")
+                    .arg("test -x /usr/local/bin/nanocodex-remote")
+                    .timeout(Duration::from_secs(5)),
+            )
+            .await
+            .map_err(|_| configuration("failed to inspect VM desktop image"))?;
+        if present.exit_code != 0 {
+            return Ok(());
+        }
+        let mut endpoint = target.endpoint().clone();
+        let path = endpoint
+            .path()
+            .strip_suffix("/tool-host")
+            .filter(|path| path.starts_with("/v1/vm-host-attachments/"))
+            .ok_or_else(|| configuration("VM desktop requires an allocation attachment"))?;
+        let path = format!("{path}/hands");
+        let scheme = if endpoint.scheme() == "wss" {
+            "https"
+        } else {
+            "http"
+        };
+        endpoint
+            .set_scheme(scheme)
+            .map_err(|()| configuration("invalid VM desktop endpoint"))?;
+        endpoint.set_path(&path);
+        control
+            .create_directory("/run/nanocodex-remote", 0o700, None)
+            .await
+            .map_err(|_| configuration("failed to prepare private VM desktop directory"))?;
+        control
+            .write_file(
+                DESKTOP_CREDENTIAL,
+                target.bearer().as_bytes().to_vec(),
+                0o600,
+            )
+            .await
+            .map_err(|_| configuration("failed to deliver VM desktop credential"))?;
+        let clean = control
+            .command(
+                VmCommand::new("/bin/rm")
+                    .arg("-f")
+                    .arg(format!("{DESKTOP_CREDENTIAL}.ready"))
+                    .timeout(Duration::from_secs(5)),
+            )
+            .await
+            .map_err(|_| configuration("failed to clear VM desktop readiness"))?;
+        if clean.exit_code != 0 {
+            return Err(configuration("failed to clear VM desktop readiness"));
+        }
+        let command = VmCommand::new(DESKTOP_EXECUTABLE)
+            .arg("desktop-host")
+            .arg("--url")
+            .arg(endpoint.to_string())
+            .arg("--credential-file")
+            .arg(DESKTOP_CREDENTIAL)
+            .arg("--machine-id")
+            .arg(self.machine.id())
+            .arg("--name")
+            .arg(self.machine.name())
+            .arg("--workspace")
+            .arg(self.workspace.guest_workspace())
+            .timeout(Duration::from_secs(365 * 24 * 60 * 60))
+            .max_output_bytes(64 * 1024);
+        let runner = self.workspace.control();
+        self.desktop = Some(VmDesktop {
+            task: Some(tokio::spawn(async move { runner.command(command).await })),
+        });
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if self
+                .desktop
+                .as_ref()
+                .and_then(|desktop| desktop.task.as_ref())
+                .is_some_and(tokio::task::JoinHandle::is_finished)
+            {
+                return Err(configuration("VM desktop exited before readiness"));
+            }
+            if control
+                .read_file(format!("{DESKTOP_CREDENTIAL}.ready"))
+                .await
+                .is_ok_and(|value| value == b"ready\n")
+            {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(configuration(
+                    "VM desktop compositor did not become ready within 30 seconds",
+                ));
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    pub(crate) async fn refresh_desktop(
+        &self,
+        target: &AttachmentTarget,
+    ) -> Result<(), ManagedError> {
+        if self.desktop.is_some() {
+            self.workspace
+                .control()
+                .write_file(
+                    DESKTOP_CREDENTIAL,
+                    target.bearer().as_bytes().to_vec(),
+                    0o600,
+                )
+                .await
+                .map_err(|_| configuration("failed to refresh VM desktop credential"))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn shutdown(mut self) -> Result<(), ManagedError> {
+        if let Some(mut desktop) = self.desktop.take() {
+            let _ = self
+                .workspace
+                .control()
+                .write_file(DESKTOP_CREDENTIAL, Vec::new(), 0o600)
+                .await;
+            if let Some(mut task) = desktop.task.take() {
+                if tokio::time::timeout(Duration::from_secs(5), &mut task)
+                    .await
+                    .is_err()
+                {
+                    task.abort();
+                    let _ = task.await;
+                }
+            }
+        }
         drop(self.tools);
         let started_at = Instant::now();
         loop {

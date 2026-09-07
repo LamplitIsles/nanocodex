@@ -1,6 +1,7 @@
 import SwiftUI
 import PhotosUI
 import UniformTypeIdentifiers
+import NanocodexRemote
 import Security
 import CryptoKit
 import os
@@ -103,6 +104,7 @@ final class InboxModel: ObservableObject {
     private var handBackgroundDeadline: Task<Void, Never>?
     private var handRefreshing = false
     #endif
+    @Published private(set) var remoteService: RemoteService?
     private var polling: Task<Void, Never>?
     private var streaming: Task<Void, Never>?
     private var streamReceivedFrame = false
@@ -452,6 +454,9 @@ final class InboxModel: ObservableObject {
         reset()
         client = candidate
         accountCredential = credential
+        remoteService = try RemoteService(origin: URL(string: credential.origin)!) { request in
+            request.setValue("Bearer " + credential.apiKey, forHTTPHeaderField: "Authorization")
+        }
         scope = SHA256.hash(data: Data((credential.origin + ":" + String(credential.apiKey.prefix(21))).utf8)).map { String(format: "%02x", $0) }.joined()
         configureDeviceHand(credential)
         activateContext()
@@ -500,6 +505,7 @@ final class InboxModel: ObservableObject {
         do { try ContextStore.shared().activate(nil) } catch { contextError = error.localizedDescription }
         contextItems = []; contextRoutes = [:]; contextEnabled = false; selectedContext = [:]; excludedContext = [:]; showContext = false; automaticContext = [:]
         voice.stop(); voice.transcriptFeed.clear(); accountCredential = nil; unlistedAgents = []; unavailableAgents = []; historyCursors = [:]
+        remoteService?.close(); remoteService = nil
         connectionAttempt = UUID(); generation = UUID(); observation = UUID(); polling?.cancel(); streaming?.cancel(); client?.close(); client = nil
         projection?.cancel(); projection = nil; eventBytes = []; retainedBytes = 0; navigation = []; deferred = [:]
         observedAgentID = nil; threadLoading = false; threadError = nil

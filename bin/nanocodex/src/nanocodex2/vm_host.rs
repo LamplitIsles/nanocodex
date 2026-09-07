@@ -1273,7 +1273,7 @@ mod supported {
                 config.rootfs = private_root.clone();
                 config.machine_id = spec.identity.machine_id.clone();
                 config.machine_name = spec.identity.machine_id;
-                let hand = vm_hand::VmHand::start_config(&config)
+                let mut hand = vm_hand::VmHand::start_config(&config)
                     .await
                     .map_err(vm_hand_start_failure)?;
                 if cancellation.is_cancelled() {
@@ -1290,7 +1290,16 @@ mod supported {
                         ProvisionFailure::unproven(error)
                     });
                 }
-                match connect_vm_attachment(&hand, spec.attachment_target).await {
+                let attached = async {
+                    if !config.vm_no_network {
+                        hand.start_desktop(&spec.attachment_target)
+                            .await
+                            .map_err(|error| VmHostError::Resource(error.to_string()))?;
+                    }
+                    connect_vm_attachment(&hand, spec.attachment_target).await
+                }
+                .await;
+                match attached {
                     Ok(attachment) => {
                         if cancellation.is_cancelled() {
                             let stopped = VmAllocation { hand, attachment }.stop().await;
@@ -1367,13 +1376,17 @@ mod supported {
             target: AttachmentTarget,
             cancellation: OperationCancellation,
         ) -> Result<(), VmHostError> {
-            let attachment = connect_vm_attachment(&self.hand, target).await?;
+            let attachment = connect_vm_attachment(&self.hand, target.clone()).await?;
             if cancellation.is_cancelled() {
                 let detached = attachment
                     .detach()
                     .await
                     .map_err(|error| VmHostError::Resource(error.to_string()));
                 return combine_pair(Err(VmHostError::Cancelled), detached);
+            }
+            if let Err(error) = self.hand.refresh_desktop(&target).await {
+                let _ = attachment.detach().await;
+                return Err(VmHostError::Resource(error.to_string()));
             }
             let previous = std::mem::replace(&mut self.attachment, attachment);
             if let Err(error) = previous.detach().await {

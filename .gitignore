@@ -55,6 +55,8 @@ trials/
 /reverse-me
 __pycache__/
 *.pyc
+/apple/build*/
+/macos/build*/
 
 # Generated outputs left at former workspace paths.
 /js/bindings/pkg-node/
