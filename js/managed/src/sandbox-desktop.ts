@@ -49,7 +49,9 @@ export class SandboxDesktop {
     const running = process && ["running", "starting"].includes(process.status);
     if (running && state.credential && (state.expiresAt ?? 0) > Date.now() + 86_400_000) return;
     // Check the built image before issuing or rotating authority.
-    const prepared = await this.runtime.exec(`test -x /usr/local/bin/nanocodex-remote && test ! -L ${DIRECTORY} && install -d -m 0700 ${DIRECTORY}`, { cwd: "/workspace" });
+    // Cloudflare creates /dev at runtime without /dev/shm. wlroots uses
+    // POSIX shared-memory files for keyboard maps, so image-time setup is lost.
+    const prepared = await this.runtime.exec(`test -x /usr/local/bin/nanocodex-remote && test ! -L /dev/shm && install -d -m 1777 /dev/shm && test ! -L ${DIRECTORY} && install -d -m 0700 ${DIRECTORY}`, { cwd: "/workspace" });
     if (!prepared.success) throw new Error("sandbox desktop image is unavailable");
     if (!state.credential || (state.expiresAt ?? 0) <= Date.now() + 86_400_000) {
       const response = await this.manage(state, "PUT");
