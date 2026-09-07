@@ -9,6 +9,74 @@ import { bindBrowser } from "../tools/browser/index.mjs";
 import * as datasets from "../tools/dataset.mjs";
 import * as standard from "../tools/standard.mjs";
 
+import { createBrowserVoice } from "../internal.mjs";
+
+test("WASM voice scans bounded workspace children concurrently and keeps their order", async () => {
+  const module = await readFile(new URL("../pkg-web/nanocodex_bg.wasm", import.meta.url));
+  const agent = await Agent.create({
+    module, harness: false,
+    transport: Transport.openAi({ apiKey: "test-key", websocketWarmup: false }),
+  });
+  const original = globalThis.nanocodexHost;
+  const pending = new Map();
+  let cleaningUp = false;
+  let bothStarted;
+  const started = new Promise((resolve) => { bothStarted = resolve; });
+  globalThis.nanocodexHost = { ...original, listWorkspace: async (path) => {
+    if (cleaningUp) return "[]";
+    if (path === ".") return JSON.stringify([
+      { kind: "directory", path: "b" }, { kind: "directory", path: "a" },
+      { kind: "directory", path: "node_modules" },
+    ]);
+    return new Promise((resolve) => {
+      pending.set(path, resolve);
+      if (pending.size === 2) bothStarted();
+    });
+  } };
+  const voice = await createBrowserVoice(agent, "cove");
+  let timer;
+  let starting;
+  try {
+    const instructions = "Speak Greek. ".repeat(400);
+    voice.configure(JSON.stringify({ voice: "maple", pace: "slow", updates: "results", acknowledgements: false, instructions }));
+    starting = voice.start();
+    await Promise.race([started, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error("workspace child requests were serialized")), 1_000);
+    })]);
+    clearTimeout(timer);
+    assert.deepEqual([...pending.keys()], ["a", "b"]);
+    pending.get("b")(JSON.stringify([{ kind: "file", path: "b/second.txt" }]));
+    pending.get("a")(JSON.stringify([{ kind: "file", path: "a/first.txt" }]));
+    await starting;
+    const body = JSON.parse(JSON.parse(await voice.callBody("v=offer")).call_body);
+    assert.match(body.session.instructions, /- a\/\n  - first.txt\n- b\/\n  - second.txt/);
+    assert.equal(body.session.audio.output.voice, "maple");
+    assert.equal(body.session.delegation.ack_filler, false);
+    assert.match(body.session.instructions, /unhurried/);
+    assert.ok(body.session.instructions.endsWith(instructions.trim()));
+    assert.throws(() => voice.configure('{"voice":"cove"}'), /new call/);
+    assert.equal(JSON.parse(JSON.parse(voice.appendSpeech("Read this." )).frames[0]).channel, "speakable");
+    const appendedText = JSON.parse(JSON.parse(voice.appendText("developer", "Selected a file.")).frames[0]);
+    assert.equal(appendedText.type, "session.context.append");
+    assert.equal(appendedText.content[0].text, "Selected a file.");
+    assert.equal("channel" in appendedText, false);
+    assert.throws(() => voice.appendContext("bad\0context"), /contain NUL/);
+    const longContext = "🦊".repeat(4096);
+    const contextFrames = JSON.parse(voice.appendContext(longContext)).frames.map((frame) => JSON.parse(frame));
+    assert.equal(contextFrames.map((frame) => frame.content[0].text).join(""), longContext);
+    assert.ok(contextFrames.every((frame) => Buffer.byteLength(frame.content[0].text) <= 500));
+  } finally {
+    clearTimeout(timer);
+    cleaningUp = true;
+    for (const resolve of pending.values()) resolve("[]");
+    await starting?.catch(() => {});
+    await voice.stop();
+    voice.free();
+    globalThis.nanocodexHost = original;
+    agent.dispose();
+  }
+});
+
 const SUBAGENT_TOOL_NAMES = Object.freeze([
   "submit_result",
   "spawn_agent",

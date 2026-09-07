@@ -111,7 +111,11 @@ test("Worker Agent retains and proxies the Rust browser voice handle", async () 
   const agent = await createWorkerAgent({ sessionId: "root", harness: false }, { worker });
   const voice = await createBrowserVoice(agent, "cove");
 
+  await voice.configure('{"voice":"cove","updates":"results"}');
   await voice.start();
+  await voice.appendSpeech("Speak this.");
+  await voice.appendText("developer", "Selected README.md");
+  await voice.appendContext("Background update");
   const call = JSON.parse(await voice.callBody("v=offer"));
   assert.equal(JSON.parse(call.call_body).session.audio.output.voice, "cove");
   assert.deepEqual(
@@ -134,7 +138,11 @@ test("Worker Agent retains and proxies the Rust browser voice handle", async () 
 
   assert.deepEqual(fixture.log.filter(([kind]) => kind.startsWith("voice-")), [
     ["voice-create", "root", "cove"],
+    ["voice-configure", "root", '{"voice":"cove","updates":"results"}'],
     ["voice-start", "root"],
+    ["voice-speech", "root", "Speak this."],
+    ["voice-text", "root", "developer", "Selected README.md"],
+    ["voice-context", "root", "Background update"],
     ["voice-call", "root", "v=offer"],
     ["voice-complete", "root", "v=answer", "/v1/live/rtc_test"],
     ["voice-sideband", "root", "rtc_test"],
@@ -1791,6 +1799,10 @@ function createFixture(options = {}) {
       browserVoice(voice) {
         log.push(["voice-create", sessionId, voice]);
         return {
+          async configure(settings) { log.push(["voice-configure", sessionId, settings]); },
+          async appendSpeech(text) { log.push(["voice-speech", sessionId, text]); return "{}"; },
+          async appendText(role, text) { log.push(["voice-text", sessionId, role, text]); return "{}"; },
+          async appendContext(text) { log.push(["voice-context", sessionId, text]); return "{}"; },
           async start() { log.push(["voice-start", sessionId]); },
           callBody(sdp) {
             log.push(["voice-call", sessionId, sdp]);

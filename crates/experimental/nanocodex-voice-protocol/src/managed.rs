@@ -12,6 +12,7 @@ pub struct ManagedVoiceProtocol {
     context_cursor: String,
     bootstrap_input: Option<String>,
     bootstrap_complete: bool,
+    explicit_playback: bool,
     follow_up: bool,
     awaiting_first_turn_done: bool,
     prefetch_query: String,
@@ -37,6 +38,7 @@ impl ManagedVoiceProtocol {
             context_cursor: "0".to_owned(),
             bootstrap_input: None,
             bootstrap_complete: false,
+            explicit_playback: false,
             follow_up: false,
             awaiting_first_turn_done: false,
             prefetch_query: String::new(),
@@ -49,6 +51,7 @@ impl ManagedVoiceProtocol {
             self.context_cursor = "0".to_owned();
             self.bootstrap_input = None;
             self.bootstrap_complete = false;
+            self.explicit_playback = false;
             self.follow_up = false;
             self.awaiting_first_turn_done = false;
             self.prefetch_query.clear();
@@ -93,7 +96,7 @@ impl ManagedVoiceProtocol {
                 });
             }
         }
-        if !self.bootstrap_complete {
+        if !self.bootstrap_complete && !self.explicit_playback {
             update
                 .effects
                 .transcripts
@@ -122,6 +125,7 @@ impl ManagedVoiceProtocol {
             })
         });
         if let Some(input) = query {
+            self.explicit_playback = false;
             self.awaiting_first_turn_done = utterance.is_none();
             self.bootstrap_input = Some(input.clone());
             if let Some(delegation) = &mut update.delegation {
@@ -173,8 +177,18 @@ impl ManagedVoiceProtocol {
 
     pub fn sideband_opened(&self) -> BrowserVoiceEffects {
         let mut effects = self.protocol.sideband_opened();
-        effects.playback_enabled = Some(self.session_id.is_empty() || self.bootstrap_complete);
+        effects.playback_enabled =
+            Some(self.session_id.is_empty() || self.bootstrap_complete || self.explicit_playback);
         effects
+    }
+
+    /// Explicit speech can play before the first utterance without satisfying
+    /// the first-utterance retrieval gate or admitting a coding-agent turn.
+    pub fn append_speech(&mut self, text: &str) -> Result<BrowserVoiceEffects, String> {
+        let mut effects = self.protocol.append_speech(text)?;
+        self.explicit_playback = true;
+        effects.playback_enabled = Some(true);
+        Ok(effects)
     }
 
     const fn with_playback(&mut self, mut effects: BrowserVoiceEffects) -> BrowserVoiceEffects {
@@ -212,35 +226,103 @@ impl ManagedVoiceProtocol {
     /// JSON is just the binding ABI; all protocol decisions remain in this crate.
     pub fn dispatch(&mut self, command: &Value) -> Result<Value, String> {
         let effects = match command["op"].as_str().unwrap_or_default() {
+            "configure" => {
+                if !self.session_id.is_empty() {
+                    return Err("voice settings require a new call".to_owned());
+                }
+                let settings = serde_json::from_value(command["settings"].clone())
+                    .map_err(|error| format!("invalid voice settings: {error}"))?;
+                self.protocol.configure(settings)?;
+                return Ok(serde_json::to_value(self.protocol.settings())
+                    .map_err(|error| error.to_string())?);
+            }
+            "settings" => {
+                return serde_json::to_value(self.protocol.settings())
+                    .map_err(|error| error.to_string());
+            }
+            "session" => {
+                return self.protocol.settings().chatgpt_session(
+                    command["instructions"]
+                        .as_str()
+                        .unwrap_or(&crate::chatgpt_realtime_instructions("there")),
+                );
+            }
+            "speech" => self.append_speech(command["text"].as_str().unwrap_or_default())?,
+            "append_context" => self
+                .protocol
+                .append_context(command["text"].as_str().unwrap_or_default())?,
+            "text" => self.protocol.append_text(
+                serde_json::from_value(command["role"].clone())
+                    .map_err(|_| "invalid voice text role")?,
+                command["text"].as_str().unwrap_or_default(),
+            )?,
             "catalog" => return Ok(json!(crate::CHATGPT_REALTIME_VOICES)),
-            "bind" => { self.bind_session(command["session_id"].as_str().unwrap_or_default()); return Ok(Value::Null); }
+            "bind" => {
+                self.bind_session(command["session_id"].as_str().unwrap_or_default());
+                return Ok(Value::Null);
+            }
             "realtime" => {
                 let update = self.realtime_message(&command["event"].to_string());
-                return Ok(json!({ "effects": update.effects, "prefetch": update.prefetch, "delegation": update.delegation.map(|delegation|
-                    json!({ "id": delegation.id, "formatted_input": format_delegation(&delegation) })) }));
+                return Ok(
+                    json!({ "effects": update.effects, "prefetch": update.prefetch, "delegation": update.delegation.map(|delegation|
+                    json!({ "id": delegation.id, "formatted_input": format_delegation(&delegation) })) }),
+                );
             }
             "agent" => self.agent_event(&command["event"].to_string()),
             "managed" => self.managed_event(&command["envelope"]),
-            "context" => self.protocol.context(command["text"].as_str().unwrap_or_default()),
+            "context" => self
+                .protocol
+                .context(command["text"].as_str().unwrap_or_default()),
             "flush" => self.flush(command["final"].as_bool().unwrap_or_default()),
             "opened" => self.sideband_opened(),
-            "closed" => self.protocol.sideband_closed(command["connected_ms"].as_u64().unwrap_or_default()),
-            "ack" => { self.protocol.frames_sent(command["count"].as_u64().unwrap_or_default().min(128) as usize); return Ok(Value::Null); }
-            "tail" => return Ok(json!(realtime_tail_delegation(&self.protocol.take_transcript_tail()))),
+            "closed" => self
+                .protocol
+                .sideband_closed(command["connected_ms"].as_u64().unwrap_or_default()),
+            "ack" => {
+                self.protocol
+                    .frames_sent(command["count"].as_u64().unwrap_or_default().min(128) as usize);
+                return Ok(Value::Null);
+            }
+            "tail" => {
+                return Ok(json!(realtime_tail_delegation(
+                    &self.protocol.take_transcript_tail()
+                )));
+            }
             "close" => self.protocol.close_effects(),
             "instructions" => {
                 let mut text = crate::chatgpt_realtime_instructions("there");
-                if let Some(context) = managed_startup_context(&command["context"]) { text.push_str("\n\n"); text.push_str(&context); }
-                return Ok(json!(text));
+                if let Some(context) = managed_startup_context(&command["context"]) {
+                    text.push_str("\n\n");
+                    text.push_str(&context);
+                }
+                return Ok(json!(self.protocol.settings().instructions(&text)));
             }
-            "startup_context" => return Ok(json!(managed_startup_context(&command["context"]).map(|text| json!({
-                "type": "session.context.append", "channel": "commentary", "content": [{ "type": "input_text", "text": text }],
-            })))),
+            "startup_context" => {
+                let frames = managed_startup_context(&command["context"])
+                    .map(|text| crate::browser::session_context_frames(&text, "commentary"))
+                    .unwrap_or_default();
+                return Ok(json!(frames));
+            }
             "delegation" => {
-                let transcript = command["transcript"].as_array().into_iter().flatten().map(|item|
-                    crate::TranscriptEntry::new(item["speaker"].as_str().unwrap_or_default(), item["text"].as_str().unwrap_or_default())).collect::<Vec<_>>();
-                return Ok(if command["tail"].as_bool() == Some(true) { json!(realtime_tail_delegation(&transcript)) }
-                    else { json!(realtime_delegation(command["input"].as_str().unwrap_or_default(), &transcript)) });
+                let transcript = command["transcript"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|item| {
+                        crate::TranscriptEntry::new(
+                            item["speaker"].as_str().unwrap_or_default(),
+                            item["text"].as_str().unwrap_or_default(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                return Ok(if command["tail"].as_bool() == Some(true) {
+                    json!(realtime_tail_delegation(&transcript))
+                } else {
+                    json!(realtime_delegation(
+                        command["input"].as_str().unwrap_or_default(),
+                        &transcript
+                    ))
+                });
             }
             _ => return Err("unknown voice protocol operation".to_owned()),
         };
@@ -355,6 +437,59 @@ fn memory_update(result: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_startup_context_uses_codex_wire_chunks_without_losing_selected_context() {
+        let history = (0..6)
+            .map(|index| json!({
+                "role": if index % 2 == 0 { "user" } else { "assistant" },
+                "content": [{"text": format!("FIRST {index} {} LAST {index}", "Ελληνικά 🦊 ".repeat(40))}]
+            }))
+            .collect::<Vec<_>>();
+        let context = json!({"history": history});
+        let expected = managed_startup_context(&context).unwrap();
+        assert!(expected.len() > 2_000);
+        let mut voice = ManagedVoiceProtocol::new("cove").unwrap();
+        let result = voice
+            .dispatch(&json!({"op":"startup_context","context":context}))
+            .unwrap();
+        let frames = result.as_array().unwrap();
+        assert!(frames.len() > 1);
+        let mut reconstructed = String::new();
+        for frame in frames {
+            assert_eq!(frame["type"], "session.context.append");
+            assert_eq!(frame["channel"], "commentary");
+            let text = frame["content"][0]["text"].as_str().unwrap();
+            assert!(text.len() <= 500);
+            reconstructed.push_str(text);
+        }
+        assert_eq!(reconstructed, expected);
+        assert_eq!(
+            voice
+                .dispatch(&json!({"op":"startup_context","context":null}))
+                .unwrap(),
+            json!([])
+        );
+    }
+
+    #[test]
+    fn explicit_speech_unlocks_playback_without_skipping_first_utterance_retrieval() {
+        let mut voice = ManagedVoiceProtocol::new("cove").unwrap();
+        voice.bind_session("call-1");
+        assert_eq!(voice.sideband_opened().playback_enabled, Some(false));
+        let speech = voice.append_speech("Voice is connected.").unwrap();
+        assert_eq!(speech.playback_enabled, Some(true));
+        assert_eq!(voice.sideband_opened().frames, speech.frames);
+        assert_eq!(voice.sideband_opened().playback_enabled, Some(true));
+        let transcript = voice.realtime_message(
+            r#"{"type":"output_transcript.added","item":{"text":"Voice is connected."}}"#,
+        );
+        assert_eq!(transcript.effects.transcripts.len(), 1);
+        let first = voice.realtime_message(r#"{"type":"turn.done","turn":{"role":"user","transcript":"What is my project called?"}}"#);
+        assert!(first.delegation.unwrap().bootstrap);
+        assert_eq!(first.effects.playback_enabled, Some(false));
+        assert_eq!(voice.sideband_opened().playback_enabled, Some(false));
+    }
     #[test]
     fn partial_speech_only_prefetches_and_final_speech_still_owns_admission() {
         let mut voice = voice();

@@ -84,6 +84,15 @@ function VoiceConsumer(agent: DefaultAgent | ManagedAgent | ConnectAgent | undef
   void voice.start({ voice: "juniper" });
   void voice.stop();
   void voice.cancel();
+  void voice.start({ voice: "maple", pace: "fast", updates: "results", acknowledgements: false, instructions: "Speak Greek.", handoffMode: "bem_tags" });
+  const speech: Promise<void> = voice.speak("Read this aloud.");
+  void speech;
+  void voice.appendText("Selected file: README.md", { role: "developer" });
+  void voice.appendContext("The current file changed.");
+  // @ts-expect-error Platform VAD settings are not subscription voice settings.
+  void voice.start({ turnDetection: "semantic_vad" });
+  // @ts-expect-error Text roles are restricted to the subscription protocol roles.
+  void voice.appendText("Hello", { role: "system" });
   // @ts-expect-error platform-only voices are not accepted by ChatGPT V3.
   void voice.start({ voice: "marin" });
   return voice.isActive ? voice.voice : voice.status;

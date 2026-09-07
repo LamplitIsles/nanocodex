@@ -2,7 +2,9 @@
 
 mod browser;
 mod managed;
+mod settings;
 mod transcript;
+pub use settings::{VoiceHandoffMode, VoicePace, VoiceSettings, VoiceTextRole, VoiceUpdates};
 
 pub use managed::{
     ManagedVoiceProtocol, bootstrap_plan, format_delegation, managed_startup_context,
@@ -17,8 +19,8 @@ pub use browser::{
     BrowserRealtimeCallResult, BrowserVoiceEffects, BrowserVoiceProtocol, BrowserVoiceUpdate,
     CHATGPT_REALTIME_MODEL, CHATGPT_REALTIME_VOICE, CHATGPT_REALTIME_VOICES, VoiceHistoryEntry,
     VoicePrefetch, build_browser_startup_context, build_chatgpt_realtime_call,
-    decode_chatgpt_realtime_call, preferred_physical_input,
-    realtime_message_requires_agent_admission, valid_realtime_call_id,
+    build_chatgpt_realtime_call_with_settings, decode_chatgpt_realtime_call,
+    preferred_physical_input, realtime_message_requires_agent_admission, valid_realtime_call_id,
 };
 
 /// Builds the exact Codex Realtime side-agent instructions.

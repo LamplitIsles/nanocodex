@@ -926,23 +926,56 @@ final class InboxUITests: XCTestCase {
             XCTAssertTrue(app.buttons["start-voice"].waitForExistence(timeout: 10))
             let began = ProcessInfo.processInfo.systemUptime
             app.buttons["start-voice"].tap()
-            XCTAssertTrue(app.buttons["mute-voice"].waitForExistence(timeout: 10))
+            if pass == 1 {
+                let permission = XCUIApplication(bundleIdentifier: "com.apple.springboard").alerts.firstMatch
+                if permission.waitForExistence(timeout: 2), permission.label.localizedCaseInsensitiveContains("microphone") {
+                    if permission.buttons["Allow"].exists { permission.buttons["Allow"].tap() }
+                    else if permission.buttons["OK"].exists { permission.buttons["OK"].tap() }
+                }
+            }
+            guard app.buttons["mute-voice"].waitForExistence(timeout: 10) else {
+                capture(app, "voice-live-admission-failed-\(pass)")
+                let message = app.staticTexts["voice-error"].exists ? app.staticTexts["voice-error"].label : "Voice controls did not appear"
+                if app.buttons["end-voice"].exists { app.buttons["end-voice"].tap() }
+                XCTFail(message)
+                return
+            }
             // Exercise microphone activation on the first call. The second
             // retains the distinct muted-during-connection readiness path.
             if pass == 2, app.buttons["mute-voice"].label == "Mute microphone" { app.buttons["mute-voice"].tap() }
             let readyStatuses = pass == 1 ? ["Listening", "Speaking", "Working on it"] : ["Microphone muted"]
-            let connected = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label IN %@", readyStatuses), object: app.staticTexts["voice-status"])
+            let connected = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label IN %@", readyStatuses + ["Voice paused"]), object: app.staticTexts["voice-status"])
             let result = XCTWaiter.wait(for: [connected], timeout: 55)
-            if result != .completed { capture(app, "voice-live-start-failed-\(pass)") }
-            XCTAssertEqual(result, .completed,
-                           app.staticTexts["voice-error"].exists ? app.staticTexts["voice-error"].label : "Voice did not become active; status: \(app.staticTexts["voice-status"].label)")
+            guard result == .completed, readyStatuses.contains(app.staticTexts["voice-status"].label) else {
+                capture(app, "voice-live-start-failed-\(pass)")
+                let message = app.staticTexts["voice-error"].exists ? app.staticTexts["voice-error"].label : "Voice did not become active; status: \(app.staticTexts["voice-status"].label)"
+                if app.buttons["end-voice"].exists { app.buttons["end-voice"].tap() }
+                XCTFail(message)
+                return
+            }
             print("VOICE_UI_READY pass=\(pass) started_muted=\(pass == 2) elapsed_ms=\(Int((ProcessInfo.processInfo.systemUptime - began) * 1_000))")
-            XCTAssertTrue(app.descendants(matching: .any).matching(identifier: "voice-orb").firstMatch.exists)
+            XCTAssertTrue(app.descendants(matching: .any).matching(identifier: "voice-orb").firstMatch.waitForExistence(timeout: 3))
             if pass == 1 {
                 XCTAssertEqual(app.buttons["mute-voice"].label, "Mute microphone")
                 capture(app, "voice-live-connected-unmuted")
                 app.buttons["mute-voice"].tap()
                 XCTAssertEqual(app.buttons["mute-voice"].label, "Unmute microphone")
+            }
+            // Also require audio on the call that was muted during startup:
+            // ambient microphone input must not be needed to trigger speech.
+            app.buttons["voice-settings"].tap()
+            let testAudio = app.buttons["test-voice-audio"]
+            XCTAssertTrue(testAudio.waitForExistence(timeout: 5))
+            if !testAudio.isHittable { app.swipeUp() }
+            testAudio.tap()
+            let audio = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label == %@", "Audio received"), object: app.staticTexts["voice-audio-result"])
+            let audioResult = XCTWaiter.wait(for: [audio], timeout: 20)
+            capture(app, "voice-live-spoken-audio-\(pass)")
+            app.buttons["Cancel"].tap()
+            if audioResult != .completed {
+                app.buttons["end-voice"].tap()
+                XCTFail("Connected voice must deliver audible media for an explicit test phrase on call \(pass)")
+                return
             }
             capture(app, "voice-live-connected-\(pass)")
             app.buttons["close-voice"].tap()

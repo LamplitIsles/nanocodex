@@ -18,7 +18,7 @@ import {
   type UseVoiceParameters,
   type UseVoiceReturnType,
 } from "nanocodex-react";
-import { X } from "lucide-react";
+import { SlidersHorizontal, X } from "lucide-react";
 import { TerminalComposer } from "./TerminalComposer.js";
 import { TerminalTranscriptSurface } from "./TerminalTranscriptSurface.js";
 import type { VoiceTerminalEntry } from "./TerminalTranscriptSurface.js";
@@ -230,7 +230,7 @@ export function AgentTerminalView({
       composer={composer === undefined ? (
         <TerminalComposer
           controls={(voice || controls) ? <>
-            {voice ? <VoiceControl agentReady={agentStatus === "ready"} voice={voiceState} initialVoice={voiceOptions?.voice} /> : null}
+            {voice ? <VoiceControl agentReady={agentStatus === "ready"} voice={voiceState} initialSettings={voiceOptions} /> : null}
             {controls?.({ agentReady: agentStatus === "ready" })}
           </> : undefined}
           draft={touchDraft}
@@ -274,14 +274,36 @@ export function VoiceControl({
   agentReady,
   voice,
   initialVoice,
+  initialSettings,
 }: {
   agentReady: boolean;
   voice: UseVoiceReturnType;
   initialVoice?: NonNullable<UseVoiceReturnType["voice"]> | undefined;
+  initialSettings?: Voice.Settings | undefined;
 }) {
   const engaged = voice.isActive || voice.isConnecting;
-  const [selectedVoice, setSelectedVoice] = useState(voice.voice ?? initialVoice ?? Voice.defaultVoice);
+  const [settings, setSettings] = useState<Voice.Settings>(() => ({ ...savedVoiceSettings(), ...initialSettings }));
+  const [selectedVoice, setSelectedVoice] = useState(voice.voice ?? initialVoice ?? settings.voice ?? Voice.defaultVoice);
+  const [showSettings, setShowSettings] = useState(false);
+  const [settingsError, setSettingsError] = useState<string>();
+  const [applying, setApplying] = useState(false);
   const statusText = voice.statusText ?? (voice.isActive ? voice.voice : undefined);
+  const saveSettings = async () => {
+    const next = { ...settings, voice: selectedVoice };
+    if (next.instructions?.includes("\0")) {
+      setSettingsError("Speaking preferences cannot contain NUL characters.");
+      return;
+    }
+    setApplying(true);
+    setSettingsError(undefined);
+    try {
+      try { globalThis.localStorage?.setItem("nanocodex.voice.settings", JSON.stringify(next)); } catch { /* Storage may be disabled. */ }
+      if (engaged) { await voice.stop(); await voice.start(next); }
+      setShowSettings(false);
+    } catch (error) {
+      setSettingsError(error instanceof Error ? error.message : String(error));
+    } finally { setApplying(false); }
+  };
   return <>
     <button
       className="agent-voice-button"
@@ -289,7 +311,7 @@ export function VoiceControl({
       aria-label={engaged ? "Stop voice" : "Start voice"}
       aria-pressed={engaged}
       disabled={!agentReady}
-      onClick={() => { void voice.toggle({ voice: selectedVoice }).catch(() => {}); }}
+      onClick={() => { void voice.toggle({ ...settings, voice: selectedVoice }).catch(() => {}); }}
     >
       <svg aria-hidden="true" viewBox="0 0 24 24">
         <path d="M12 15a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v6a3 3 0 0 0 3 3Zm-7-3a1 1 0 1 1 2 0 5 5 0 0 0 10 0 1 1 0 1 1 2 0 7 7 0 0 1-6 6.92V21h3a1 1 0 1 1 0 2H8a1 1 0 1 1 0-2h3v-2.08A7 7 0 0 1 5 12Z" />
@@ -307,6 +329,46 @@ export function VoiceControl({
         {name[0]!.toUpperCase() + name.slice(1)}
       </option>)}
     </select>
+    <div className="agent-voice-preferences">
+      <button type="button" aria-label="Voice settings" aria-expanded={showSettings}
+        onClick={() => { setShowSettings(!showSettings); }}>
+        <SlidersHorizontal aria-hidden="true" />
+      </button>
+      {showSettings ? <div className="agent-voice-settings" role="group" aria-label="Voice preferences">
+        <label>Voice for this call<select value={selectedVoice} onChange={(event) => {
+          setSelectedVoice(event.target.value as Voice.VoiceName);
+        }}>
+          {Voice.voices.map((name) => <option key={name} value={name}>{name[0]!.toUpperCase() + name.slice(1)}</option>)}
+        </select></label>
+        <label>Pace<select value={settings.pace ?? "natural"} onChange={(event) => {
+          setSettings({ ...settings, pace: event.target.value as Voice.Settings["pace"] });
+        }}>
+          <option value="slow">Relaxed</option><option value="natural">Natural</option><option value="fast">Brisk</option>
+        </select></label>
+        <label>Spoken updates<select value={settings.updates ?? "auto"} onChange={(event) => {
+          setSettings({ ...settings, updates: event.target.value as Voice.Settings["updates"] });
+        }}>
+          <option value="auto">As useful</option><option value="results">Results and blockers</option><option value="silent">Only when asked</option>
+        </select></label>
+        <label>Acknowledge requests<select value={settings.acknowledgements === undefined ? "auto" : String(settings.acknowledgements)} onChange={(event) => {
+          setSettings({ ...settings, acknowledgements: event.target.value === "auto" ? undefined : event.target.value === "true" });
+        }}>
+          <option value="auto">Automatic</option><option value="true">On</option><option value="false">Off</option>
+        </select></label>
+        <label>Speaking style<textarea value={settings.instructions ?? ""} rows={3}
+          placeholder="Keep answers short and speak Greek unless I ask otherwise."
+          onChange={(event) => { setSettings({ ...settings, instructions: event.target.value }); }} /></label>
+        {settingsError ? <span role="alert">{settingsError}</span> : null}
+        {voice.isActive ? <button type="button" onClick={() => {
+          void voice.speak("Voice is connected. You should hear this sentence.").catch((error: unknown) => {
+            setSettingsError(error instanceof Error ? error.message : String(error));
+          });
+        }}>Test voice</button> : null}
+        <button type="button" aria-label="Save voice settings" disabled={applying} onClick={() => { void saveSettings(); }}>
+          {applying ? "Applying…" : engaged ? "Apply and reconnect" : "Save"}
+        </button>
+      </div> : null}
+    </div>
     {voice.isActive ? (
       <button
         className="agent-voice-cancel-button"
@@ -332,6 +394,22 @@ export function VoiceControl({
       </div>
     ) : null}
   </>;
+}
+
+function savedVoiceSettings(): Voice.Settings {
+  try {
+    const value: unknown = JSON.parse(globalThis.localStorage?.getItem("nanocodex.voice.settings") ?? "{}");
+    if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+    const settings = value as Voice.Settings;
+    return {
+      voice: Voice.voices.includes(settings.voice!) ? settings.voice : undefined,
+      instructions: typeof settings.instructions === "string"
+        && !settings.instructions.includes("\0") ? settings.instructions : undefined,
+      pace: ["slow", "natural", "fast"].includes(settings.pace!) ? settings.pace : undefined,
+      updates: ["auto", "results", "silent"].includes(settings.updates!) ? settings.updates : undefined,
+      acknowledgements: typeof settings.acknowledgements === "boolean" ? settings.acknowledgements : undefined,
+    };
+  } catch { return {}; }
 }
 
 type PromptTiming = {

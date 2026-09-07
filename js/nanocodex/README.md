@@ -160,6 +160,11 @@ workspace or MCP configuration to an Agent that already receives them through
 Browser consumers can attach Codex's ChatGPT Realtime voice lifecycle to the
 same retained Agent. The resource owns microphone, speaker, WebRTC, sideband,
 and delegation cleanup; stopping voice does not cancel an active coding turn.
+Snapshots update each speaker's transcript row as speech arrives, using a stable
+`id` and `isPartial` flag. Completion replaces that row. `transcript.delta` events
+carry the current partial text; `transcript` events retain completed-turn semantics.
+Internal Realtime envelopes are projected into spoken text before publication.
+Transcript updates continue while a delegation waits for durable admission.
 
 The one-operation-at-a-time action surface is the canonical imperative API:
 
@@ -172,6 +177,26 @@ await Actions.voice.start(voice); // defaults to Codex's `cove` voice
 await Actions.voice.stop(voice);
 await Actions.voice.destroy(voice);
 ```
+
+Subscription voice preferences use the same Rust policy in browsers and native
+apps. `start` and `create` accept `voice`, `instructions`, `pace` (`slow`,
+`natural`, `fast`), `updates` (`auto`, `results`, `silent`), and optional
+`acknowledgements`. Pace and style are speaking instructions. Update preferences
+also select how coding-agent commentary and results reach the voice model.
+Advanced consumers can set `handoffMode` to `thinking`, `commentary`, or
+`bem_tags`; an explicit `updates` preference takes precedence. Apply changed
+settings by stopping and starting a call. The shared terminal provides a saved
+Voice settings panel with an Apply and reconnect action.
+
+During an active call, `Actions.voice.speak(voice, text)` queues explicit speech,
+`appendText(voice, text, { role: "developer" })` adds text using Codex's
+subscription adapter (which treats all roles as context), and
+`appendContext(voice, text)` adds background commentary without
+requesting speech. Context and speech are split into provider-sized messages.
+These commands retain frames until sent and preserve them
+across a sideband reconnect. They are also methods on the resource and on
+`useVoice` from `nanocodex-react`. These settings use ChatGPT subscription voice;
+custom voices and Platform audio configuration are not accepted.
 
 `Voice.create(...)` remains the equivalent namespaced resource constructor, and
 `Voice.voices` is the exact ChatGPT V3 voice catalog. The constructor accepts a

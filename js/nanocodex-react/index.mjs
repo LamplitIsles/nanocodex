@@ -107,6 +107,8 @@ export function useVoice(agent, parameters = {}) {
     () => agent && enabled
       ? Actions.voice.create(agent, {
           ...(parameters.voice === undefined ? {} : { voice: parameters.voice }),
+          instructions: parameters.instructions, pace: parameters.pace, updates: parameters.updates,
+          handoffMode: parameters.handoffMode, acknowledgements: parameters.acknowledgements,
           ...(parameters.callUrl === undefined ? {} : { callUrl: parameters.callUrl }),
           ...(parameters.sidebandUrl === undefined ? {} : { sidebandUrl: parameters.sidebandUrl }),
           ...(parameters.captureMicrophone === undefined
@@ -125,6 +127,7 @@ export function useVoice(agent, parameters = {}) {
       parameters.captureMicrophone,
       parameters.sidebandUrl,
       parameters.voice,
+      parameters.instructions, parameters.pace, parameters.updates, parameters.handoffMode, parameters.acknowledgements,
     ],
   );
   useEffect(() => () => {
@@ -147,6 +150,9 @@ export function useVoice(agent, parameters = {}) {
     isError: snapshot.status === "error",
     isIdle: snapshot.status === "idle",
     cancel: resource?.cancel ?? (async () => false),
+    speak: resource?.speak ?? unavailable,
+    appendText: resource?.appendText ?? unavailable,
+    appendContext: resource?.appendContext ?? unavailable,
     start: resource?.start ?? unavailable,
     stop: resource?.stop ?? (async () => {}),
     toggle: resource?.toggle ?? unavailable,

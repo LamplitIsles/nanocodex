@@ -196,7 +196,7 @@ test("ready voice control separates transport, coding-turn cancel, status, and f
   });
   assert.deepEqual(
     renderer.root.findAllByType("button").map((button) => button.props["aria-label"]),
-    ["Start voice"],
+    ["Start voice", "Voice settings"],
   );
   const picker = renderer.root.findByProps({ "aria-label": "Voice" });
   assert.deepEqual(picker.findAllByType("option").map((option) => option.props.value),
@@ -259,6 +259,37 @@ test("ready voice control separates transport, coding-turn cancel, status, and f
   })));
   assert.equal(renderer.root.findAllByProps({ role: "status" }).length, 0);
   assert.equal(renderer.root.findAllByProps({ role: "alert" }).length, 0);
+  await act(async () => renderer.unmount());
+});
+
+test("voice preferences reconnect an active call with the saved subscription settings", async () => {
+  const calls = [];
+  let renderer;
+  await act(async () => {
+    renderer = TestRenderer.create(React.createElement(VoiceControl, {
+      agentReady: true,
+      voice: voiceSnapshot({ isActive: true, voice: "cove",
+        stop: async () => { calls.push("stop"); },
+        start: async (settings) => { calls.push(settings); },
+      }),
+    }));
+  });
+  await act(async () => renderer.root.findByProps({ "aria-label": "Voice settings" }).props.onClick());
+  const group = renderer.root.findByProps({ "aria-label": "Voice preferences" });
+  const select = (label) => group.findAllByType("label").find((node) => node.children[0] === label).findByType("select");
+  await act(async () => select("Voice for this call").props.onChange({ target: { value: "maple" } }));
+  await act(async () => select("Pace").props.onChange({ target: { value: "fast" } }));
+  await act(async () => select("Spoken updates").props.onChange({ target: { value: "results" } }));
+  await act(async () => select("Acknowledge requests").props.onChange({ target: { value: "false" } }));
+  await act(async () => group.findByType("textarea").props.onChange({ target: { value: "bad\0text" } }));
+  await act(async () => group.findByProps({ "aria-label": "Save voice settings" }).props.onClick());
+  assert.equal(calls.length, 0, "Invalid preferences must not interrupt a call");
+  assert.ok(group.findByProps({ role: "alert" }));
+  const instructions = "Speak Greek. ".repeat(400);
+  await act(async () => group.findByType("textarea").props.onChange({ target: { value: instructions } }));
+  await act(async () => group.findByProps({ "aria-label": "Save voice settings" }).props.onClick());
+  assert.deepEqual(calls, ["stop", { voice: "maple", pace: "fast", updates: "results", acknowledgements: false, instructions }]);
+  assert.equal(renderer.root.findAllByProps({ "aria-label": "Voice preferences" }).length, 0);
   await act(async () => renderer.unmount());
 });
 

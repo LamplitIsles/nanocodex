@@ -122,6 +122,7 @@ export class BrowserVoiceSession {
     const coreReady = Promise.resolve(this.#options.core).then(async (core) => {
       if (this.#closed || this.#closing.signal.aborted) { core.free(); return; }
       this.#core = core;
+      if (this.#options.settings) await core.configure(JSON.stringify(this.#options.settings));
       await this.#options.beforeAgentTurn?.();
       if (this.#closed || this.#closing.signal.aborted) return;
       return core;
@@ -264,6 +265,17 @@ export class BrowserVoiceSession {
     if (!this.#closed && this.#core) {
       this.#applyLive(() => this.#core.agentEvent(JSON.stringify(envelope)));
     }
+  }
+
+  command(method, ...args) {
+    if (this.#closed || !this.#core) return Promise.reject(new Error("voice is not active"));
+    const next = this.#inbound.then(() => {
+      if (this.#closed || !this.#core) throw new Error("voice is not active");
+      return this.#core[method](...args);
+    }).then((effects) => this.#apply(effects));
+    // Invalid app input rejects the command without ending an otherwise healthy call.
+    this.#inbound = next.catch(() => {});
+    return next;
   }
 
   cancel() {

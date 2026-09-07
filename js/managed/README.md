@@ -88,6 +88,9 @@ storage ownership.
   prior sessions using that question, including new calls in existing chats.
   Durable receipts retain each call's bounded lookups across retries. Existing
   first-turn environment and account context remains developer context.
+  Voice start and stop retain the full session context without a conversation
+  size rejection. Replies above 512 KiB are archived directly in R2 for exact
+  replay instead of being inserted into a SQLite row.
   Successful memory puts and deletes emit authorized `managed.voice.context`
   events; Rust validates call scope, deduplicates cursors, and queues background
   context through reconnects. Retrieved context is data, never instructions.

@@ -5,7 +5,7 @@ import type { Config } from "nanocodex/browser";
 import type {
   Options as VoiceOptions,
   Snapshot as VoiceSnapshot,
-  VoiceName,
+  Settings as VoiceSettings,
 } from "nanocodex/browser/voice";
 import type { ReactNode } from "react";
 export * as Voice from "nanocodex/browser/voice";
@@ -104,9 +104,12 @@ export type UseVoiceReturnType = VoiceSnapshot & Readonly<{
   isError: boolean;
   isIdle: boolean;
   cancel(): Promise<boolean>;
-  start(options?: { voice?: VoiceName | undefined }): Promise<void>;
+  speak(text: string): Promise<void>;
+  appendText(text: string, options?: { role?: "user" | "developer" | "assistant" }): Promise<void>;
+  appendContext(text: string): Promise<void>;
+  start(options?: VoiceSettings): Promise<void>;
   stop(): Promise<void>;
-  toggle(options?: { voice?: VoiceName | undefined }): Promise<void>;
+  toggle(options?: VoiceSettings): Promise<void>;
 }>;
 export function useVoice(
   agent: DefaultAgent | ManagedAgent | ConnectAgent | undefined,

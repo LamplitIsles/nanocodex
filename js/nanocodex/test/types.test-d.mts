@@ -43,6 +43,23 @@ import {
 } from "../index.mjs";
 import type { WorkspaceEntry as BrowserWorkspaceEntry } from "../browser/workspace.mjs";
 import type { WorkspaceEntry as NodeWorkspaceEntry } from "../node/workspace.mjs";
+import type { Event as VoiceEvent, Transcript as VoiceTranscript } from "../browser/Voice.mjs";
+
+function checkVoiceTranscript(event: VoiceEvent, transcript: VoiceTranscript) {
+  const speaker: "user" | "assistant" = transcript.speaker;
+  if (event.type === "transcript.delta") {
+    const id: string = event.id;
+    const partial: true = event.isPartial;
+    void id; void partial;
+  }
+  if (event.type === "transcript") {
+    const partial: false | undefined = event.isPartial;
+    void partial;
+  }
+  // @ts-expect-error Voice snapshots are immutable.
+  transcript.text = "replace";
+  void speaker;
+}
 
 const toolsCapability: ToolsCapability = await createTools();
 const hostedMachine: HostedMachine = {

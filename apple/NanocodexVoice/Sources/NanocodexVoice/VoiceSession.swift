@@ -79,6 +79,7 @@ public struct VoiceTranscript: Identifiable, Equatable, Sendable {
 }
 
 @MainActor public final class VoiceSession: ObservableObject {
+    @Published public var settings = VoiceSettings.load() { didSet { settings.save() } }
     public enum Phase: Equatable { case idle, connecting, active, ended, failed }
     @Published public private(set) var phase: Phase = .idle
     @Published public private(set) var isMuted = false
@@ -130,7 +131,7 @@ public struct VoiceTranscript: Identifiable, Equatable, Sendable {
     private var controlConnected = false
     private var conversationReady = false
     private var agentEventsReady = false
-    private var startupContextFrame: JSON?
+    private var startupContextFrames: [JSON] = []
     private var startedTurnID: String?
     private var activeTurnID: String?
     private var routePending = false
@@ -163,6 +164,25 @@ public struct VoiceTranscript: Identifiable, Equatable, Sendable {
         peer?.close()
         startup?.cancel(); startupDeadline?.cancel(); negotiation?.cancel(); eventPreparation?.cancel(); admission?.cancel()
         incoming?.cancel(); agentEvents?.cancel(); meter?.cancel(); recovery?.cancel(); flushTask?.cancel(); prefetchTask?.cancel(); writer?.cancel(); routing?.cancel()
+    }
+
+    public func speak(_ text: String) throws {
+        guard phase == .active, let protocolState else { throw VoiceFailure.connection }
+        apply(try protocolState.appendSpeech(text), token: generation)
+    }
+
+    public func appendText(_ text: String, role: String = "user") throws {
+        guard phase == .active, let protocolState else { throw VoiceFailure.connection }
+        apply(try protocolState.appendText(text, role: role), token: generation)
+    }
+
+    public func appendContext(_ text: String) throws {
+        guard phase == .active, let protocolState else { throw VoiceFailure.connection }
+        apply(try protocolState.appendContext(text), token: generation)
+    }
+
+    public func restart(using configuration: @escaping @MainActor () async throws -> VoiceConfiguration) {
+        begin(configuration: configuration, captureMicrophone: true)
     }
 
     public func start(configuration: VoiceConfiguration) {
@@ -225,7 +245,9 @@ public struct VoiceTranscript: Identifiable, Equatable, Sendable {
         transport = voiceTransport
         let id = ManagedVoiceProtocol.sessionID()
         sessionID = id
-        protocolState = try ManagedVoiceProtocol(voice: configuration.voice)
+        var callSettings = settings
+        callSettings.voice = configuration.voice
+        protocolState = try ManagedVoiceProtocol(settings: callSettings)
         protocolState?.bindSession(id)
         let audio = VoicePeer(captureMicrophone: captureMicrophone) { [weak self] signal in
             Task { @MainActor in self?.receive(signal, token: token) }
@@ -240,7 +262,7 @@ public struct VoiceTranscript: Identifiable, Equatable, Sendable {
                 let sdp = try await audio.offer()
                 try self.check(token)
                 voiceTiming("call.begin")
-                let call = try await voiceTransport.call(sdp: sdp, instructions: ManagedVoiceProtocol.instructions(), voice: configuration.voice, sessionID: id)
+                let call = try await voiceTransport.call(sdp: sdp, instructions: ManagedVoiceProtocol.instructions(), sessionID: id, settings: callSettings)
                 try self.check(token)
                 voiceTiming("call.end")
                 self.startRealtimeEvents(audio, token: token)
@@ -278,13 +300,14 @@ public struct VoiceTranscript: Identifiable, Equatable, Sendable {
     }
 
     private func prepareConversation(_ transport: ManagedVoiceTransport, sessionID: String, priorCleanup: Task<Void, Never>?, token: UUID) async throws {
+        if priorCleanup != nil { voiceTiming("lifecycle.prior-cleanup.wait") }
         try await waitForCleanup(priorCleanup)
         try check(token)
         voiceTiming("lifecycle.start.begin")
         let context = try await transport.start(sessionID: sessionID, operationID: UUID().uuidString.lowercased())
         try check(token)
         voiceTiming("lifecycle.start.end")
-        startupContextFrame = ManagedVoiceProtocol.startupContextFrame(context)
+        startupContextFrames = ManagedVoiceProtocol.startupContextFrames(context)
     }
 
     private func waitForCleanup(_ prior: Task<Void, Never>?) async throws {
@@ -301,12 +324,19 @@ public struct VoiceTranscript: Identifiable, Equatable, Sendable {
 
     private func startMeter(_ audio: VoicePeer, token: UUID) {
         meter = Task { [weak self, audio] in
+            var samples = 0
             while !Task.isCancelled {
                 let stats = await audio.statistics()
                 guard let self, self.generation == token else { return }
                 self.inputLevel = self.isMuted ? 0 : min(1, max(0, stats.inputLevel))
                 self.outputLevel = min(1, max(0, stats.outputLevel))
                 self.audioBytesSent = stats.bytesSent; self.audioBytesReceived = stats.bytesReceived
+                #if DEBUG
+                if samples.isMultiple(of: 5), ProcessInfo.processInfo.environment["NANOCODEX_VOICE_TIMING"] == "1" {
+                    print("VOICE_AUDIO sent=\(stats.bytesSent) received=\(stats.bytesReceived) input=\(stats.inputLevel) output=\(stats.outputLevel)")
+                }
+                #endif
+                samples += 1
                 do { try await Task.sleep(for: .milliseconds(200)) } catch { return }
             }
         }
@@ -344,9 +374,9 @@ public struct VoiceTranscript: Identifiable, Equatable, Sendable {
     private func becomeActiveIfReady() {
         guard peerConnected && controlConnected && conversationReady && agentEventsReady else { return }
         do {
-            if let startupContextFrame {
-                try peer?.send(startupContextFrame)
-                self.startupContextFrame = nil
+            if !startupContextFrames.isEmpty {
+                for frame in startupContextFrames { try peer?.send(frame) }
+                startupContextFrames = []
                 voiceTiming("context.sent")
             }
             peer?.activateMicrophone(); phase = .active; isReconnecting = false
@@ -376,6 +406,10 @@ public struct VoiceTranscript: Identifiable, Equatable, Sendable {
         }
         #if DEBUG
         receivedRealtimeTypesForTesting.insert(event["type"].string)
+        if ProcessInfo.processInfo.environment["NANOCODEX_VOICE_TIMING"] == "1" {
+            let type = event["type"].string
+            if type.range(of: "^[a-z_.]{1,80}$", options: .regularExpression) != nil { print("VOICE_EVENT \(type)") }
+        }
         #endif
         guard let update = protocolState?.realtimeMessage(event) else { return }
         if let prefetch = update.prefetch, let transport, let sessionID {
@@ -583,7 +617,7 @@ public struct VoiceTranscript: Identifiable, Equatable, Sendable {
         let oldTransport = transport, oldSessionID = sessionID
         let tail = protocolState?.takeTranscriptTail()
         transport = nil; protocolState = nil; sessionID = nil
-        peerConnected = false; controlConnected = false; conversationReady = false; agentEventsReady = false; startupContextFrame = nil; isReconnecting = false
+        peerConnected = false; controlConnected = false; conversationReady = false; agentEventsReady = false; startupContextFrames = []; isReconnecting = false
         activeTurnID = nil; startedTurnID = nil; isWorking = false; isMuted = false
         inputLevel = 0; outputLevel = 0; audioBytesSent = 0; audioBytesReceived = 0
         transcripts = []; partialTranscriptIDs = [:]; errorMessage = nil
@@ -594,14 +628,20 @@ public struct VoiceTranscript: Identifiable, Equatable, Sendable {
             cleanup = Task {
                 // Serialize start/stop receipts, without waiting on microphone,
                 // configuration or WebRTC callbacks from an abandoned startup.
+                voiceTiming("cleanup.admission.wait")
                 await oldAdmission?.value
+                voiceTiming("cleanup.routing.wait")
                 await oldRouting?.value
+                voiceTiming("cleanup.transcript.begin")
                 for (input, operation) in pendingDelegations {
                     _ = try? await oldTransport.delegate(sessionID: oldSessionID, operationID: operation, input: input)
                 }
                 if let tail { _ = try? await oldTransport.delegate(sessionID: oldSessionID, operationID: UUID().uuidString.lowercased(), input: tail) }
+                voiceTiming("lifecycle.stop.begin")
                 _ = try? await oldTransport.stop(sessionID: oldSessionID, operationID: UUID().uuidString.lowercased())
+                voiceTiming("lifecycle.stop.end")
                 await oldTransport.close()
+                voiceTiming("cleanup.end")
             }
         }
     }

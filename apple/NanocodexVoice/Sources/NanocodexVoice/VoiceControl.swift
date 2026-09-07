@@ -9,7 +9,7 @@ public struct NanocodexVoiceControl: View {
     private let onReturnToChat: @MainActor () -> Void
     @State private var presented = false
     @State private var returningToChat = false
-    @AppStorage("nanocodex.voice") private var selectedVoice = "cove"
+    @State private var showingSettings = false
 
     public init(session: VoiceSession, onReturnToChat: @escaping @MainActor () -> Void = {}, onStart: @escaping @MainActor () async throws -> VoiceConfiguration) {
         self.session = session; self.onStart = onStart; self.onReturnToChat = onReturnToChat
@@ -27,13 +27,6 @@ public struct NanocodexVoiceControl: View {
             }.buttonStyle(.plain)
                 .accessibilityLabel(session.isEngaged ? "Open voice in \(session.conversationTitle ?? "conversation")" : "Start voice")
                 .accessibilityIdentifier("start-voice")
-                .contextMenu {
-                    Picker("Voice", selection: $selectedVoice) {
-                        ForEach(ManagedVoiceProtocol.voices, id: \.self) { voice in
-                            Text(voice.capitalized).tag(voice)
-                        }
-                    }
-                }
             if session.isEngaged {
                 Button { session.stop() } label: {
                     Image(systemName: "xmark").font(.system(size: 15, weight: .medium))
@@ -46,13 +39,15 @@ public struct NanocodexVoiceControl: View {
         #else
         .sheet(isPresented: $presented, onDismiss: returnToChatIfNeeded) { panel }
         #endif
+        .contextMenu { Button("Voice settings") { showingSettings = true } }
+        .sheet(isPresented: $showingSettings) { VoiceSettingsView(session: session, onStart: configuration) }
     }
     private var panel: some View {
-        VoicePanel(session: session, selectedVoice: $selectedVoice, onStart: configuration) { returningToChat = true }
+        VoicePanel(session: session, onStart: configuration) { returningToChat = true }
     }
     private func configuration() async throws -> VoiceConfiguration {
         var result = try await onStart()
-        result.voice = ManagedVoiceProtocol.voices.contains(selectedVoice) ? selectedVoice : "cove"
+        result.voice = session.settings.voice
         return result
     }
     private func returnToChatIfNeeded() {
@@ -105,12 +100,12 @@ public struct NanocodexVoiceTranscript: View {
 
 private struct VoicePanel: View {
     @ObservedObject var session: VoiceSession
-    @Binding var selectedVoice: String
     let onStart: @MainActor () async throws -> VoiceConfiguration
     let onReturnToChat: @MainActor () -> Void
     @Environment(\.dismiss) private var dismiss
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.colorScheme) private var colorScheme
+    @State private var showingSettings = false
 
     private var background: Color { colorScheme == .dark ? Color(white: 0.075) : .white }
     private var loading: Bool { session.phase == .connecting || session.isReconnecting }
@@ -127,7 +122,6 @@ private struct VoicePanel: View {
                     } else if session.phase == .active {
                         VoiceOrb(input: session.inputLevel, output: session.outputLevel, muted: session.isMuted)
                             .frame(width: min(230, geometry.size.width * 0.5), height: min(230, geometry.size.width * 0.5))
-                            .accessibilityIdentifier("voice-orb")
                             .transition(.opacity.combined(with: .scale(scale: 0.88)))
                     } else {
                         VStack(spacing: 18) {
@@ -153,15 +147,10 @@ private struct VoicePanel: View {
                         Text("Voice").font(.subheadline.weight(.medium)).foregroundStyle(.secondary)
                             .accessibilityIdentifier("voice-panel")
                         Spacer()
-                        Menu {
-                            Picker("Voice for the next call", selection: $selectedVoice) {
-                                ForEach(ManagedVoiceProtocol.voices, id: \.self) { voice in
-                                    Text(voice.capitalized).tag(voice)
-                                }
-                            }
-                        } label: {
-                            Image(systemName: "slider.horizontal.3").frame(width: 48, height: 48)
-                        }.accessibilityLabel("Choose voice").accessibilityIdentifier("choose-voice")
+                        Button { showingSettings = true } label: {
+                            Image(systemName: "slider.horizontal.3").font(.system(size: 18, weight: .medium))
+                                .frame(width: 48, height: 48)
+                        }.buttonStyle(.plain).accessibilityLabel("Voice settings").accessibilityIdentifier("voice-settings")
                     }.padding(.horizontal, 20).padding(.top, 8)
                     Spacer()
                     Text(session.status).font(.caption).foregroundStyle(.secondary)
@@ -203,8 +192,89 @@ private struct VoicePanel: View {
         #if os(macOS)
         .frame(width: 480, height: 680)
         #endif
+        .sheet(isPresented: $showingSettings) { VoiceSettingsView(session: session, onStart: onStart) }
     }
     private func returnToChat() { onReturnToChat(); dismiss() }
+}
+
+private struct VoiceSettingsView: View {
+    @ObservedObject var session: VoiceSession
+    let onStart: @MainActor () async throws -> VoiceConfiguration
+    @Environment(\.dismiss) private var dismiss
+    @State private var draft = VoiceSettings()
+    @State private var error: String?
+    @State private var testingAudio = false
+    @State private var receivedTestAudio = false
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Picker("Voice", selection: $draft.voice) {
+                    ForEach(ManagedVoiceProtocol.voices, id: \.self) { Text($0.capitalized).tag($0) }
+                }.accessibilityIdentifier("voice-selection")
+                Picker("Pace", selection: $draft.pace) {
+                    Text("Relaxed").tag(VoiceSettings.Pace.slow)
+                    Text("Natural").tag(VoiceSettings.Pace.natural)
+                    Text("Brisk").tag(VoiceSettings.Pace.fast)
+                }
+                Picker("Spoken updates", selection: $draft.updates) {
+                    Text("As useful").tag(VoiceSettings.Updates.auto)
+                    Text("Results and blockers").tag(VoiceSettings.Updates.results)
+                    Text("Only when asked").tag(VoiceSettings.Updates.silent)
+                }
+                Picker("Acknowledge requests", selection: $draft.acknowledgements) {
+                    Text("Automatic").tag(Optional<Bool>.none)
+                    Text("On").tag(Optional(true))
+                    Text("Off").tag(Optional(false))
+                }
+                Section("Speaking style") {
+                    TextEditor(text: $draft.instructions).frame(minHeight: 80)
+                        .accessibilityLabel("Speaking preferences")
+                    Text("For example: Keep answers short and speak Greek unless I ask otherwise.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                if session.phase == .active {
+                    Section {
+                        Button("Test voice") {
+                            do {
+                                try session.speak("Voice is connected. You should hear this sentence.")
+                                testingAudio = true; receivedTestAudio = false
+                            }
+                            catch { self.error = error.localizedDescription }
+                        }.accessibilityIdentifier("test-voice-audio")
+                        if testingAudio {
+                            Text(receivedTestAudio ? "Audio received" : "Waiting for audio…")
+                                .accessibilityIdentifier("voice-audio-result")
+                        }
+                        Text("Hear a test phrase using the current voice. Save changes to try a different voice.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                if let error { Text(error).foregroundStyle(.red).accessibilityIdentifier("voice-settings-error") }
+            }
+            .navigationTitle("Voice settings")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(session.isEngaged ? "Apply and reconnect" : "Save") {
+                        do {
+                            _ = try ManagedVoiceProtocol(settings: draft)
+                            session.settings = draft
+                            if session.isEngaged { session.restart(using: onStart) }
+                            dismiss()
+                        } catch { self.error = error.localizedDescription }
+                    }.accessibilityIdentifier("save-voice-settings")
+                }
+            }
+        }
+        .onAppear { draft = session.settings }
+        .onChange(of: session.outputLevel) { _, level in
+            if testingAudio, level > 0.015 { receivedTestAudio = true }
+        }
+        #if os(macOS)
+        .frame(width: 480, height: 480)
+        #endif
+    }
 }
 
 private struct VoiceSpinnerStyle: ProgressViewStyle {
@@ -286,6 +356,9 @@ private struct VoiceOrb: View {
             .scaleEffect(1 + energy * 0.05 + (reduceMotion ? 0 : sin(time * 0.7) * 0.006))
         }
         .animation(reduceMotion ? nil : .easeOut(duration: 0.2), value: energy)
-        .accessibilityElement(children: .ignore).accessibilityLabel(muted ? "Voice ready, microphone muted" : "Voice ready")
+        .accessibilityRepresentation {
+            Text(muted ? "Voice ready, microphone muted" : "Voice ready")
+                .accessibilityIdentifier("voice-orb")
+        }
     }
 }

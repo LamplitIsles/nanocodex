@@ -205,6 +205,13 @@ to three attempts on the same call. Only this failure before voice admission get
 a fresh operation identity; transport retries keep their identity, and ambiguous
 operations remain fenced. Ending voice cancels pending startup recovery.
 
+Voice settings on iPhone, iPad, and Mac save the built-in voice, pace, speaking
+style, spoken-update preference, and acknowledgement preference. Changing them
+during a call reconnects voice while preserving the agent's work. Existing
+saved voice choices migrate to these settings. Rust builds the subscription
+session and validates all preferences; `VoiceSession.speak`, `appendText`, and
+`appendContext` expose the same retained control queue as browser consumers.
+
 Image attachments follow Codex's local-image flow: keep a prepared JPEG with the
 agent's draft, then send it as inline image content through the existing managed
 turn endpoint. Camera opens the native still-photo capture screen on iPhone and
@@ -534,9 +541,11 @@ The native Debug demo suite additionally exercises long-thread reading during ne
 service journey (`NANOCODEX_VOICE_LIVE=1` and an account `NC_API_KEY`). It creates
 and deletes its own agent and checks receive-only native WebRTC, authenticated
 data-channel control, background context, mute, immediate stop, and cancellation
-during startup. `NANOCODEX_VOICE_TIMING=1` additionally records startup stages,
-HTTP timings, and media round-trip time without SDP, payloads, or credentials.
+during startup. `NANOCODEX_VOICE_TIMING=1` additionally records startup and cleanup
+stages, HTTP timings, event types, playback state, and audio transport statistics
+without SDP, transcripts, payloads, or credentials.
 It never captures microphone audio or claims to validate spoken interaction.
 `InboxUITests.testLiveVoiceConnectsMinimizesAndStops` checks two real voice
-connections, minimizing, and ending on a signed-in iPhone with
-`NANOCODEX_VOICE_UI_LIVE=1`. It mutes the microphone during startup.
+connections, received test-phrase audio, minimizing, and ending on a signed-in
+iPhone with `NANOCODEX_VOICE_UI_LIVE=1`. The first call activates the microphone;
+the second is muted during startup and must still receive test-phrase audio.

@@ -253,7 +253,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
-function validRealtimeSession(value: unknown): boolean {
+export function validRealtimeSession(value: unknown): boolean {
   if (!isRecord(value)
     || !exactKeys(value, ["audio", "delegation", "instructions", "model"])
     || value.model !== REALTIME_MODEL
@@ -261,7 +261,8 @@ function validRealtimeSession(value: unknown): boolean {
     || !value.instructions
     || encodedBytes(value.instructions) > MAX_INSTRUCTIONS_BYTES
     || !isRecord(value.delegation)
-    || !exactKeys(value.delegation, ["type"])
+    || !(exactKeys(value.delegation, ["type"]) || (exactKeys(value.delegation, ["type", "ack_filler"])
+      && typeof value.delegation.ack_filler === "boolean"))
     || value.delegation.type !== "client"
     || !isRecord(value.audio)
     || !exactKeys(value.audio, ["output"])

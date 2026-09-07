@@ -162,7 +162,21 @@ test("the public managed voice carries exact SSE cursors into Rust memory update
   });
   const voice = Voice.create(agent, { captureMicrophone: async () => fakeMicrophone([]) });
   try {
-    await voice.start();
+    await voice.start({ voice: "maple", pace: "fast", updates: "results", instructions: "Speak Greek.", acknowledgements: false });
+    const provider = fixture.request.session;
+    assert.equal(provider.model, "gpt-live-1-codex");
+    assert.equal(provider.audio.output.voice, "maple");
+    assert.deepEqual(provider.delegation, { type: "client", ack_filler: false });
+    assert.match(provider.instructions, /Speak briskly/);
+    assert.match(provider.instructions, /Speak Greek\./);
+    await voice.speak("Read this aloud.");
+    await voice.appendText("Selected README.md", { role: "developer" });
+    await voice.appendContext("The editor selection changed.");
+    const frames = fixture.sideband.sent.map((frame) => JSON.parse(frame));
+    assert.ok(frames.some((frame) => frame.channel === "speakable" && frame.content[0].text === "Read this aloud."));
+    assert.ok(frames.some((frame) => frame.type === "session.context.append" && frame.content[0].text === "Selected README.md" && !("channel" in frame)));
+    await assert.rejects(voice.speak(" "), /voice text/);
+    assert.equal(voice.getSnapshot().status, "active");
     await waitFor(() => events !== undefined);
     const cursor = "9007199254740993";
     const event = { cursor, created_at: 1, turn_id: null, type: "event", event: {
@@ -251,9 +265,10 @@ test("the public resource is a thin binding over the Rust voice controller", asy
 
     await Actions.voice.start(voice, { voice: "juniper" });
     assert.equal(Actions.voice.getSnapshot(voice).status, "active");
-    assert.deepEqual(calls.slice(0, 5), [
+    assert.deepEqual(calls.slice(0, 6), [
       ["microphone"],
       ["browserVoice", "juniper"],
+      ["configure", { voice: "juniper" }],
       ["fence"],
       ["start"],
       ["callBody", "v=offer"],
@@ -813,6 +828,7 @@ test("Rust playback permission follows successful frame delivery and reconnect r
 
 function fakeVoiceCore(calls, overrides = {}) {
   return {
+    async configure(settings) { calls.push(["configure", JSON.parse(settings)]); },
     async start() { calls.push(["start"]); },
     async callBody(sdp) {
       calls.push(["callBody", sdp]);

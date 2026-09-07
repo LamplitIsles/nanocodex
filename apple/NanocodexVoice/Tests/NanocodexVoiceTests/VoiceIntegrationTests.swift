@@ -47,7 +47,9 @@ final class VoiceIntegrationTests: XCTestCase {
                     "text": .string("The sample project is called Juniper. Wait for me to speak before replying.")
                 ])])
             ])])])
-            try voice.sendRealtimeForTesting(XCTUnwrap(ManagedVoiceProtocol.startupContextFrame(context)))
+            for frame in ManagedVoiceProtocol.startupContextFrames(context) {
+                try voice.sendRealtimeForTesting(frame)
+            }
             // A no-op update proves the control channel accepts writes and
             // returns protocol acknowledgements without changing call behavior.
             try voice.sendRealtimeForTesting(.object(["type": .string("session.update"), "session": .object([:])]))

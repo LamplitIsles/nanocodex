@@ -163,6 +163,11 @@ final class VoicePeer: NSObject, RTCPeerConnectionDelegate, RTCDataChannelDelega
     func setPlaybackEnabled(_ value: Bool) {
         let connection = lock.withLock { playbackEnabled = value; return closed ? nil : peer }
         for receiver in connection?.receivers ?? [] { receiver.track?.isEnabled = value }
+        #if DEBUG
+        if ProcessInfo.processInfo.environment["NANOCODEX_VOICE_TIMING"] == "1" {
+            print("VOICE_PLAYBACK enabled=\(value) receivers=\(connection?.receivers.count ?? 0)")
+        }
+        #endif
     }
 
     func send(_ frame: JSON) throws {
@@ -171,6 +176,11 @@ final class VoicePeer: NSObject, RTCPeerConnectionDelegate, RTCDataChannelDelega
         let current = lock.withLock { closed ? nil : channel }
         guard let current, current.readyState == .open, current.bufferedAmount <= 512 * 1024,
               current.sendData(RTCDataBuffer(data: data, isBinary: false)) else { throw VoiceFailure.connection }
+        #if DEBUG
+        if ProcessInfo.processInfo.environment["NANOCODEX_VOICE_TIMING"] == "1" {
+            print("VOICE_SEND type=\(frame["type"].string) channel=\(frame["channel"].string) bytes=\(data.count)")
+        }
+        #endif
     }
 
     /// The capture track and peer stop before protocol cleanup can suspend.

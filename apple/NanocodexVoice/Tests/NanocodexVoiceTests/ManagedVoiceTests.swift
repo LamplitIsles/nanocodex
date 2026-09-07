@@ -70,7 +70,8 @@ final class ManagedVoiceTests: XCTestCase {
         let reply = voice.agentEvent(.object(["type": .string("assistant.message"), "payload": .object(["text": .string("Saved it.")])]))
         XCTAssertEqual(reply.frames.first?["type"].string, "delegation.context.append")
         XCTAssertEqual(reply.frames.first?["delegation_item_id"].string, "lookup")
-        XCTAssertTrue(voice.context(String(repeating: "🦊", count: 2049)).frames.isEmpty)
+        let longContext = String(repeating: "🦊", count: 4096)
+        XCTAssertEqual(voice.context(longContext).frames.map { $0["content"].array[0]["text"].string }.joined(), longContext)
     }
 
     func testDurableLifecycleRetriesSameIdentityAndValidatesReceipts() async throws {
@@ -127,6 +128,50 @@ final class ManagedVoiceTests: XCTestCase {
         let call = try await transport.call(sdp: "v=0\r\noffer", instructions: "Use the coding agent.", sessionID: session)
         XCTAssertEqual(call.sdp, "v=0\r\nanswer"); XCTAssertEqual(call.callID, "rtc_owned")
         await transport.close()
+    }
+
+    func testSubscriptionSettingsUseSharedRustSessionAndReconnectQueue() throws {
+        let settings = VoiceSettings(voice: "maple", instructions: "Speak Greek.", pace: .slow,
+                                     updates: .results, acknowledgements: false)
+        let session = try ManagedVoiceProtocol.session(instructions: "Use the coding agent.", settings: settings)
+        XCTAssertEqual(session["model"].string, "gpt-live-1-codex")
+        XCTAssertEqual(session["audio"]["output"]["voice"].string, "maple")
+        XCTAssertEqual(session["delegation"]["ack_filler"], .bool(false))
+        XCTAssertTrue(session["instructions"].string.hasPrefix("Use the coding agent."))
+        XCTAssertTrue(session["instructions"].string.hasSuffix("Speak Greek."))
+        let voice = try ManagedVoiceProtocol(settings: settings)
+        let speech = try voice.appendSpeech("Read this aloud.")
+        XCTAssertEqual(speech.frames.first?["channel"].string, "speakable")
+        let context = try voice.appendText("The user selected a different file.", role: "developer")
+        XCTAssertEqual(context.frames.first?["type"].string, "session.context.append")
+        XCTAssertEqual(context.frames.first?["content"].array.first?["text"].string, "The user selected a different file.")
+        XCTAssertEqual(voice.sidebandOpened().frames, speech.frames + context.frames)
+        voice.framesSent(2)
+        XCTAssertTrue(voice.sidebandOpened().frames.isEmpty)
+        XCTAssertThrowsError(try voice.appendText("Invalid role", role: "system"))
+        let longSpeech = String(repeating: "🦊", count: 4096)
+        XCTAssertEqual(try voice.appendSpeech(longSpeech).frames.map { $0["content"].array[0]["text"].string }.joined(), longSpeech)
+        XCTAssertNoThrow(try ManagedVoiceProtocol(settings: VoiceSettings(instructions: longSpeech)))
+        XCTAssertThrowsError(try ManagedVoiceProtocol(settings: VoiceSettings(voice: "voice_custom")))
+    }
+
+    func testLongStartupHistoryUsesBoundedFramesAndRetainsItsSelectedContext() throws {
+        let history: [JSON] = (0..<6).map { index in .object([
+            "role": .string(index.isMultiple(of: 2) ? "user" : "assistant"),
+            "content": .array([.object([
+                "text": .string("FIRST \(index) " + String(repeating: "Ελληνικά 🦊 ", count: 40) + " LAST \(index)")
+            ])])
+        ]) }
+        let context: JSON = .object(["history": .array(history)])
+        let frames = ManagedVoiceProtocol.startupContextFrames(context)
+        XCTAssertGreaterThan(frames.count, 1)
+        let chunks = frames.map { $0["content"].array[0]["text"].string }
+        XCTAssertGreaterThan(chunks.joined().utf8.count, 2_000)
+        XCTAssertTrue(chunks.allSatisfy { $0.utf8.count <= 500 })
+        XCTAssertTrue(frames.allSatisfy { $0["type"].string == "session.context.append" && $0["channel"].string == "commentary" })
+        XCTAssertTrue(ManagedVoiceProtocol.instructions(context: context).hasSuffix(chunks.joined()))
+        XCTAssertTrue(chunks.joined().contains("FIRST"))
+        XCTAssertTrue(chunks.joined().contains("LAST"))
     }
 
     func testStartRecoversEgressTimeoutWithFreshOperationAndSameVoiceSession() async throws {
@@ -335,12 +380,12 @@ final class ManagedVoiceTests: XCTestCase {
         XCTAssertTrue(natural.contains("Continue our work"))
         XCTAssertFalse(natural.contains("realtime_delegation")); XCTAssertFalse(natural.contains("transcript_tail_flush"))
         XCTAssertFalse(natural.contains("Synthetic handoff"))
-        let frame = try XCTUnwrap(ManagedVoiceProtocol.startupContextFrame(voiceContext))
+        let frame = try XCTUnwrap(ManagedVoiceProtocol.startupContextFrames(voiceContext).first)
         XCTAssertEqual(frame["type"].string, "session.context.append")
         XCTAssertEqual(frame["channel"].string, "commentary")
         XCTAssertTrue(frame["content"].array[0]["text"].string.contains("Continue our work"))
         XCTAssertFalse(frame["content"].array[0]["text"].string.contains("realtime_delegation"))
-        XCTAssertNil(ManagedVoiceProtocol.startupContextFrame(.null))
+        XCTAssertTrue(ManagedVoiceProtocol.startupContextFrames(.null).isEmpty)
         for _ in 0..<8 { XCTAssertNoThrow(try ManagedVoiceTransport.validateSession(ManagedVoiceProtocol.sessionID())) }
     }
 

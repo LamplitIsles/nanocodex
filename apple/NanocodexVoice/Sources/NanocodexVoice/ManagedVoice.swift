@@ -63,15 +63,12 @@ public actor ManagedVoiceTransport {
         try checkOpen()
     }
 
-    public func call(sdp: String, instructions: String, voice: String = "cove", sessionID: String) async throws -> ManagedVoiceCall {
+    public func call(sdp: String, instructions: String, voice: String = "cove", sessionID: String, settings: VoiceSettings? = nil) async throws -> ManagedVoiceCall {
         try checkOpen(); try Self.validateSession(sessionID)
         guard !sdp.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, sdp.utf8.count <= 32_768,
               !instructions.isEmpty, instructions.utf8.count <= 32_768, ManagedVoiceProtocol.voices.contains(voice) else { throw ManagedError.invalidResponse }
-        let body: JSON = .object(["sdp": .string(sdp), "session": .object([
-            "model": .string("gpt-live-1-codex"), "instructions": .string(instructions),
-            "audio": .object(["output": .object(["voice": .string(voice)])]),
-            "delegation": .object(["type": .string("client")])
-        ])])
+        let session = try ManagedVoiceProtocol.session(instructions: instructions, settings: settings ?? VoiceSettings(voice: voice))
+        let body: JSON = .object(["sdp": .string(sdp), "session": session])
         let encoded = try JSONEncoder().encode(body)
         guard encoded.count <= 65_536 else { throw ManagedError.invalidResponse }
         var request = try http.request(path("calls"), method: "POST", body: encoded, key: credential.apiKey)

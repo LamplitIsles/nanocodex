@@ -542,6 +542,10 @@ async function dispatch(message, state) {
     releaseWorkerResult(results, args[0]);
     return;
   }
+  if (method === "voice.configure") return required(voices, args[0], "voice").configure(args[1]);
+  if (method === "voice.appendSpeech") return required(voices, args[0], "voice").appendSpeech(args[1]);
+  if (method === "voice.appendText") return required(voices, args[0], "voice").appendText(args[1], args[2]);
+  if (method === "voice.appendContext") return required(voices, args[0], "voice").appendContext(args[1]);
   if (method === "voice.start") return required(voices, args[0], "voice").start();
   if (method === "voice.callBody") return required(voices, args[0], "voice").callBody(args[1]);
   if (method === "voice.completeCall") {
@@ -793,6 +797,10 @@ class WorkerConnection {
     const connection = this;
     let released = false;
     return {
+      configure: (settings) => connection.rpc("voice.configure", [voiceId, settings]),
+      appendSpeech: (text) => connection.rpc("voice.appendSpeech", [voiceId, text]),
+      appendText: (role, text) => connection.rpc("voice.appendText", [voiceId, role, text]),
+      appendContext: (text) => connection.rpc("voice.appendContext", [voiceId, text]),
       start: () => connection.rpc("voice.start", [voiceId]),
       callBody: (sdp) => connection.rpc("voice.callBody", [voiceId, sdp]),
       completeCall: (body, location) => connection.rpc(

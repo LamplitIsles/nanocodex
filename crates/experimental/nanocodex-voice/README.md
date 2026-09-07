@@ -44,6 +44,14 @@ item prefixes, thinking/commentary/BEM routing, configurable BEM prefixes,
 delegation acknowledgement filler, startup-context policy, and tail-flush
 policy. Defaults follow Codex for the selected authentication mode.
 
+For ChatGPT subscriptions, `VoiceSessionBuilder::settings(VoiceSettings)` applies
+the same preferences used by managed browser and Apple clients: the nine
+built-in voices, extra speaking instructions, pace, background updates, handoff
+routing, and acknowledgement filler. Pace and style append to the existing
+instructions. Settings validate the subscription voice catalog and do not add
+Platform audio options or custom voices. Non-default update preferences select
+the appropriate handoff routing and take precedence over `handoff_mode`.
+
 ```rust,no_run
 use nanocodex::{Nanocodex, OpenAi};
 use nanocodex_voice::{VoiceAgentControl, VoiceEvent, VoiceSessionBuilder};

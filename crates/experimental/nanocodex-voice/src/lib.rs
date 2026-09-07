@@ -27,7 +27,10 @@ use nanocodex_voice_protocol::{
 };
 use tokio::sync::{mpsc, oneshot};
 
-pub use nanocodex_voice_protocol::{REALTIME_END_INSTRUCTIONS, REALTIME_START_INSTRUCTIONS};
+pub use nanocodex_voice_protocol::{
+    REALTIME_END_INSTRUCTIONS, REALTIME_START_INSTRUCTIONS, VoiceHandoffMode, VoicePace,
+    VoiceSettings, VoiceUpdates,
+};
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod audio;
@@ -420,6 +423,25 @@ impl VoiceSessionBuilder {
             audio: AudioConfig::default(),
             agent_control: VoiceAgentControl::default(),
         }
+    }
+
+    /// Applies the same user-facing preferences as native and browser clients.
+    ///
+    /// # Errors
+    /// Rejects invalid voice names and speaking preferences before starting devices.
+    pub fn settings(mut self, settings: VoiceSettings) -> Result<Self, RealtimeError> {
+        settings
+            .validate_chatgpt()
+            .map_err(RealtimeError::InvalidConfiguration)?;
+        self.voice = Some(settings.voice.parse()?);
+        self.instructions = Arc::from(settings.instructions(&self.instructions));
+        self.delegation_ack_filler = settings.acknowledgements;
+        self.codex_response_handoff_mode = match settings.effective_handoff_mode() {
+            VoiceHandoffMode::Thinking => RealtimeResponseHandoffMode::Thinking,
+            VoiceHandoffMode::Commentary => RealtimeResponseHandoffMode::Commentary,
+            VoiceHandoffMode::BemTags => RealtimeResponseHandoffMode::BemTags,
+        };
+        Ok(self)
     }
 
     /// Replaces the voice model's developer instructions.

@@ -111,6 +111,7 @@ export function create(agent, options = {}) {
       core,
       sessionId,
       voice: selectedVoice,
+      settings: voiceSettings({ ...options, ...parameters, voice: selectedVoice }),
       ...(transport?.call === undefined ? {} : { call: transport.call }),
       ...(transport?.sidebandUrl === undefined ? {} : { sidebandUrl: transport.sidebandUrl }),
       ...(options.callUrl === undefined ? {} : { callUrl: options.callUrl }),
@@ -218,6 +219,11 @@ export function create(agent, options = {}) {
     eventListeners.clear();
   }
 
+  function command(method, ...args) {
+    if (!session || snapshot.status !== "active") return Promise.reject(new Error("voice is not active"));
+    return session.command(method, ...args);
+  }
+
   resource = Object.freeze({
     cancel: async () => {
       if (!session) return false;
@@ -228,6 +234,9 @@ export function create(agent, options = {}) {
       return session.cancel();
     },
     destroy,
+    speak: (text) => command("appendSpeech", text),
+    appendText: (text, { role = "user" } = {}) => command("appendText", role, text),
+    appendContext: (text) => command("appendContext", text),
     getSnapshot: () => snapshot,
     onEvent(listener) {
       if (typeof listener !== "function") throw new TypeError("voice event listener must be a function");
@@ -274,4 +283,9 @@ function browserLocationOrigin() {
   } catch {
     return undefined;
   }
+}
+
+function voiceSettings(options) {
+  return Object.fromEntries(["voice", "instructions", "pace", "updates", "handoffMode", "acknowledgements"]
+    .filter((key) => options[key] !== undefined).map((key) => [key, options[key]]));
 }

@@ -42,12 +42,26 @@ public final class ManagedVoiceProtocol: @unchecked Sendable {
     private let handle: UInt64
     public static var voices: [String] { staticCommand(["op": .string("catalog")]).array.map(\.string) }
 
-    public init(voice: String = "cove") throws {
+    public init(voice: String = "cove", settings: VoiceSettings? = nil) throws {
         let bytes = Array(voice.utf8)
         handle = bytes.withUnsafeBufferPointer { nc_voice_create($0.baseAddress, $0.count) }
         guard handle != 0 else { throw ManagedError.invalidResponse }
+        if let settings { _ = try command(["op": .string("configure"), "settings": settings.json]) }
     }
     deinit { nc_voice_destroy(handle) }
+    public static func session(instructions: String, settings: VoiceSettings) throws -> JSON {
+        try Self(settings: settings).command(["op": .string("session"), "instructions": .string(instructions)])
+    }
+    public func appendSpeech(_ text: String) throws -> ManagedVoiceEffects {
+        try effects(command(["op": .string("speech"), "text": .string(text)]))
+    }
+    public func appendContext(_ text: String) throws -> ManagedVoiceEffects {
+        try effects(command(["op": .string("append_context"), "text": .string(text)]))
+    }
+    public func appendText(_ text: String, role: String = "user") throws -> ManagedVoiceEffects {
+        try effects(command(["op": .string("text"), "role": .string(role), "text": .string(text)]))
+    }
+
     public static func sessionID() -> String {
         var value = UUID().uuid
         var bytes = withUnsafeBytes(of: &value) { Array($0) }
@@ -60,9 +74,8 @@ public final class ManagedVoiceProtocol: @unchecked Sendable {
     public static func instructions(context: JSON = .null) -> String {
         staticCommand(["op": .string("instructions"), "context": context]).string
     }
-    static func startupContextFrame(_ context: JSON) -> JSON? {
-        let frame = staticCommand(["op": .string("startup_context"), "context": context])
-        return frame == .null ? nil : frame
+    static func startupContextFrames(_ context: JSON) -> [JSON] {
+        staticCommand(["op": .string("startup_context"), "context": context]).array
     }
     static func delegation(input: String, transcript: [ManagedVoiceTranscript], tail: Bool = false) -> String {
         staticCommand(["op": .string("delegation"), "input": .string(input), "tail": .bool(tail),

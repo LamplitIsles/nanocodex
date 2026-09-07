@@ -33,7 +33,7 @@ private final class RedirectBlocker: NSObject, URLSessionTaskDelegate, @unchecke
     func urlSession(_ session: URLSession, task: URLSessionTask, didFinishCollecting metrics: URLSessionTaskMetrics) {
         #if DEBUG
         guard ProcessInfo.processInfo.environment["NANOCODEX_VOICE_TIMING"] == "1",
-              let operation = task.originalRequest?.url?.lastPathComponent, ["start", "calls"].contains(operation),
+              let operation = task.originalRequest?.url?.lastPathComponent, ["start", "stop", "delegate", "calls"].contains(operation),
               let transaction = metrics.transactionMetrics.last else { return }
         func milliseconds(_ start: Date?, _ end: Date?) -> Int {
             guard let start, let end else { return 0 }
@@ -86,6 +86,11 @@ final class HTTPTransport: @unchecked Sendable {
         catch let error as ManagedError { throw error }
         catch {
             if Task.isCancelled { throw CancellationError() }
+            #if DEBUG
+            if ProcessInfo.processInfo.environment["NANOCODEX_VOICE_TIMING"] == "1" {
+                print("VOICE_HTTP_FAILURE operation=\(request.url?.lastPathComponent ?? "unknown") domain=\((error as NSError).domain) code=\((error as NSError).code)")
+            }
+            #endif
             throw ManagedError(code: "network_error", message: "We could not reach Nanocodex. Check your connection and try again.")
         }
     }

@@ -38,8 +38,16 @@ export type Event =
   | Readonly<{ type: "transcript.delta"; speaker: "user" | "assistant"; text: string; id: string; isPartial: true }>
   | Readonly<{ type: "error"; error: Error }>
   | Readonly<{ type: "stopped" }>;
-export type Options = Readonly<{
+export type Settings = Readonly<{
   voice?: VoiceName | undefined;
+  /** Additional speaking preferences; base assistant instructions are retained. */
+  instructions?: string | undefined;
+  pace?: "slow" | "natural" | "fast" | undefined;
+  updates?: "auto" | "results" | "silent" | undefined;
+  handoffMode?: "thinking" | "commentary" | "bem_tags" | undefined;
+  acknowledgements?: boolean | undefined;
+}>;
+export type Options = Settings & Readonly<{
   callUrl?: string | URL | undefined;
   sidebandUrl?(callId: string, sessionId: string): string | URL | Promise<string | URL>;
   captureMicrophone?(): Promise<MediaStream>;
@@ -47,12 +55,17 @@ export type Options = Readonly<{
 }>;
 export type Voice = Readonly<{
   cancel(): Promise<boolean>;
+  /** Speak explicitly during an active call, independent of background update preferences. */
+  speak(text: string): Promise<void>;
+  /** Codex subscription voice treats every API role as context text. */
+  appendText(text: string, options?: { role?: "user" | "developer" | "assistant" }): Promise<void>;
+  appendContext(text: string): Promise<void>;
   destroy(): Promise<void>;
   getSnapshot(): Snapshot;
   onEvent(listener: (event: Event) => void): () => void;
-  start(options?: { voice?: VoiceName | undefined }): Promise<void>;
+  start(options?: Settings): Promise<void>;
   stop(): Promise<void>;
   subscribe(listener: () => void): () => void;
-  toggle(options?: { voice?: VoiceName | undefined }): Promise<void>;
+  toggle(options?: Settings): Promise<void>;
 }>;
 export function create(agent: DefaultAgent | ManagedAgent | ConnectAgent, options?: Options): Voice;

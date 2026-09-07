@@ -50,7 +50,7 @@ use nanocodex_subagents::{
 use nanocodex_voice_protocol::{
     BrowserVoiceEffects, BrowserVoiceProtocol, REALTIME_END_INSTRUCTIONS,
     REALTIME_START_INSTRUCTIONS, TranscriptEntry, VoiceHistoryEntry, build_browser_startup_context,
-    build_chatgpt_realtime_call, decode_chatgpt_realtime_call, preferred_physical_input,
+    build_chatgpt_realtime_call_with_settings, decode_chatgpt_realtime_call, preferred_physical_input,
     realtime_delegation, realtime_message_requires_agent_admission, realtime_tail_delegation,
     valid_realtime_call_id,
 };
@@ -1899,6 +1899,76 @@ pub struct WasmBrowserVoice {
 
 #[wasm_bindgen(js_class = BrowserVoice)]
 impl WasmBrowserVoice {
+    /// Sets subscription voice preferences before starting a call.
+    ///
+    /// # Errors
+    /// Rejects invalid settings or changes to an active call.
+    pub fn configure(&self, settings_json: &str) -> Result<(), JsValue> {
+        if self.started.get() {
+            return Err(js_error("voice settings require a new call"));
+        }
+        let settings = serde_json::from_str(settings_json).map_err(js_error)?;
+        self.protocol
+            .borrow_mut()
+            .configure(settings)
+            .map_err(js_error)
+    }
+
+    /// Queues explicitly speakable text in the current conversation.
+    ///
+    /// # Errors
+    /// Rejects inactive sessions, invalid text, or a full output queue.
+    #[wasm_bindgen(js_name = appendSpeech)]
+    pub fn append_speech(&self, text: &str) -> Result<String, JsValue> {
+        if !self.started.get() {
+            return Err(js_error("voice has not started"));
+        }
+        encode_voice_effects(
+            &self
+                .protocol
+                .borrow_mut()
+                .append_speech(text)
+                .map_err(js_error)?,
+        )
+    }
+
+    /// Appends text through Codex's subscription context adapter.
+    ///
+    /// # Errors
+    /// Rejects inactive sessions, invalid roles/text, or a full output queue.
+    #[wasm_bindgen(js_name = appendText)]
+    pub fn append_text(&self, role: &str, text: &str) -> Result<String, JsValue> {
+        if !self.started.get() {
+            return Err(js_error("voice has not started"));
+        }
+        let role = serde_json::from_value(serde_json::json!(role)).map_err(js_error)?;
+        encode_voice_effects(
+            &self
+                .protocol
+                .borrow_mut()
+                .append_text(role, text)
+                .map_err(js_error)?,
+        )
+    }
+
+    /// Adds background context without requesting speech or consuming a delegation.
+    ///
+    /// # Errors
+    /// Rejects an inactive session or invalid text.
+    #[wasm_bindgen(js_name = appendContext)]
+    pub fn append_context(&self, text: &str) -> Result<String, JsValue> {
+        if !self.started.get() {
+            return Err(js_error("voice has not started"));
+        }
+        encode_voice_effects(
+            &self
+                .protocol
+                .borrow_mut()
+                .append_context(text)
+                .map_err(js_error)?,
+        )
+    }
+
     /// Begins Codex's Realtime lifecycle and builds bounded browser startup context in Rust.
     ///
     /// # Errors
@@ -1939,9 +2009,9 @@ impl WasmBrowserVoice {
         }
         let protocol = self.protocol.borrow();
         let thread_id = self.agent.session_id().to_string();
-        let call_body = build_chatgpt_realtime_call(
+        let call_body = build_chatgpt_realtime_call_with_settings(
             sdp,
-            protocol.voice(),
+            protocol.settings(),
             self.startup_context.borrow().as_deref(),
         )
         .map_err(js_error)?;
@@ -2203,6 +2273,76 @@ pub struct WasmManagedBrowserVoice {
 
 #[wasm_bindgen(js_class = ManagedBrowserVoice)]
 impl WasmManagedBrowserVoice {
+    /// Sets subscription voice preferences before starting a call.
+    ///
+    /// # Errors
+    /// Rejects invalid settings or changes to an active call.
+    pub fn configure(&self, settings_json: &str) -> Result<(), JsValue> {
+        if self.started.get() || self.call_prepared.get() {
+            return Err(js_error("voice settings require a new call"));
+        }
+        let settings = serde_json::from_str(settings_json).map_err(js_error)?;
+        self.protocol
+            .borrow_mut()
+            .configure(settings)
+            .map_err(js_error)
+    }
+
+    /// Queues explicitly speakable text in the current conversation.
+    ///
+    /// # Errors
+    /// Rejects inactive sessions, invalid text, or a full output queue.
+    #[wasm_bindgen(js_name = appendSpeech)]
+    pub fn append_speech(&self, text: &str) -> Result<String, JsValue> {
+        if !self.started.get() {
+            return Err(js_error("voice has not started"));
+        }
+        encode_voice_effects(
+            &self
+                .protocol
+                .borrow_mut()
+                .append_speech(text)
+                .map_err(js_error)?,
+        )
+    }
+
+    /// Appends text through Codex's subscription context adapter.
+    ///
+    /// # Errors
+    /// Rejects inactive sessions, invalid roles/text, or a full output queue.
+    #[wasm_bindgen(js_name = appendText)]
+    pub fn append_text(&self, role: &str, text: &str) -> Result<String, JsValue> {
+        if !self.started.get() {
+            return Err(js_error("voice has not started"));
+        }
+        let role = serde_json::from_value(serde_json::json!(role)).map_err(js_error)?;
+        encode_voice_effects(
+            &self
+                .protocol
+                .borrow_mut()
+                .append_text(role, text)
+                .map_err(js_error)?,
+        )
+    }
+
+    /// Adds background context without requesting speech or consuming a delegation.
+    ///
+    /// # Errors
+    /// Rejects an inactive session or invalid text.
+    #[wasm_bindgen(js_name = appendContext)]
+    pub fn append_context(&self, text: &str) -> Result<String, JsValue> {
+        if !self.started.get() {
+            return Err(js_error("voice has not started"));
+        }
+        encode_voice_effects(
+            &self
+                .protocol
+                .borrow_mut()
+                .append_context(text)
+                .map_err(js_error)?,
+        )
+    }
+
     /// Creates an idle managed browser voice protocol core.
     ///
     /// # Errors
@@ -2259,9 +2399,9 @@ impl WasmManagedBrowserVoice {
         let session_id = managed_voice_session_id(managed_session_id)?;
         self.protocol.borrow_mut().bind_session(&session_id);
         let protocol = self.protocol.borrow();
-        let call_body = build_chatgpt_realtime_call(
+        let call_body = build_chatgpt_realtime_call_with_settings(
             sdp,
-            protocol.voice(),
+            protocol.settings(),
             self.startup_context.borrow().as_deref(),
         )
         .map_err(js_error)?;

@@ -279,7 +279,8 @@ const MAX_CLIENT_MESSAGE_BYTES = 1024 * 1024;
 const MAX_PRE_ADMISSION_CANCELLATIONS = 64;
 const MAX_REQUEST_BODY_BYTES = 1024 * 1024;
 const MAX_REALTIME_REQUEST_BYTES = 64 * 1024;
-const MAX_REALTIME_CONTEXT_BYTES = 1024 * 1024;
+// Storage placement only: larger exact-replay receipts go directly to R2.
+const INLINE_REALTIME_RESPONSE_BYTES = 512 * 1024;
 const DISPATCH_INPUT_CHUNK_CODE_UNITS = 256_000;
 const MAX_RETRY_DELAY_MS = 60_000;
 const MAX_IMPORT_BATCHES_PER_CREATE = 4;
@@ -4769,7 +4770,7 @@ export class DurableAgentSession extends DurableComputerSession {
               );
             }
             const context = await agent.session.realtime.start();
-            assertBoundedRealtimeContext(context);
+            assertRealtimeContext(context);
             this.ctx.storage.sql.exec(
               `INSERT INTO managed_realtime_session (
                  singleton, voice_session_id, authorization_json, updated_at
@@ -4924,26 +4925,29 @@ export class DurableAgentSession extends DurableComputerSession {
         try {
           const result = await this.#serializeRealtimeOperation(operation);
           const response = JSON.stringify(result);
-          if (
-            encoder.encode(response).byteLength >
-            MAX_REALTIME_CONTEXT_BYTES + MAX_REALTIME_REQUEST_BYTES
-          ) {
-            throw new ManagedRequestError(
-              413,
-              "response_too_large",
-              "realtime response exceeds the managed limit",
+          if (encoder.encode(response).byteLength > INLINE_REALTIME_RESPONSE_BYTES) {
+            await this.#realtimeArchive.complete({
+              voice_session_id: request.voiceSessionId,
+              operation_id: request.operationId,
+              kind,
+              request_hash: requestHash,
+              state: "completed",
+              response_json: response,
+              created_at: now,
+              updated_at: Date.now(),
+            });
+          } else {
+            this.ctx.storage.sql.exec(
+              `UPDATE managed_realtime_operations
+               SET state = 'completed', blocked = 0, response_json = ?, updated_at = ?
+               WHERE voice_session_id = ? AND operation_id = ? AND request_hash = ?`,
+              response,
+              Date.now(),
+              request.voiceSessionId,
+              request.operationId,
+              requestHash,
             );
           }
-          this.ctx.storage.sql.exec(
-            `UPDATE managed_realtime_operations
-           SET state = 'completed', blocked = 0, response_json = ?, updated_at = ?
-           WHERE voice_session_id = ? AND operation_id = ? AND request_hash = ?`,
-            response,
-            Date.now(),
-            request.voiceSessionId,
-            request.operationId,
-            requestHash,
-          );
           if (this.#realtimeArchive.needsSeal()) {
             void this.#sealRealtimeArchive(false).catch(() => {});
             void this.#scheduleNextAlarm().catch(() => {});
@@ -8798,7 +8802,7 @@ export class DurableAgentSession extends DurableComputerSession {
   ): Promise<AgentSessionContext> {
     this.#startupContext.clearPrefetch();
     const context = await agent.session.realtime.end();
-    assertBoundedRealtimeContext(context);
+    assertRealtimeContext(context);
     this.ctx.storage.sql.exec(
       "DELETE FROM managed_realtime_session WHERE singleton = 1 AND voice_session_id = ?",
       voiceSessionId,
@@ -9190,7 +9194,7 @@ function asciiJsonHeaderValue(value: unknown): string {
   );
 }
 
-function assertBoundedRealtimeContext(context: AgentSessionContext): void {
+function assertRealtimeContext(context: AgentSessionContext): void {
   if (
     typeof context.workspace !== "string" ||
     !Array.isArray(context.history)
@@ -9199,14 +9203,6 @@ function assertBoundedRealtimeContext(context: AgentSessionContext): void {
       502,
       "invalid_agent_context",
       "agent returned an invalid session context",
-    );
-  }
-  const encoded = JSON.stringify(context);
-  if (encoder.encode(encoded).byteLength > MAX_REALTIME_CONTEXT_BYTES) {
-    throw new ManagedRequestError(
-      413,
-      "context_too_large",
-      `agent session context exceeds ${MAX_REALTIME_CONTEXT_BYTES} bytes`,
     );
   }
 }
