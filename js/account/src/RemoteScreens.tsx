@@ -40,7 +40,10 @@ function ScreensDialog({ onClose }: { onClose(): void }) {
       <button type="button" aria-label="Close remote screens" onClick={onClose}><X size={18} /></button></header>
     {selected ? <Screen key={`${selected.machine_id}:${selected.id}`} hand={selected} onBack={() => setSelected(undefined)} /> : <div className="remote-screen-list">
       {error && <p role="alert">{error}</p>}
-      {!hands.length && !error && <p>Start screen sharing on a connected Hand to view and control it here.</p>}
+      {!hands.length && !error && <p role={query.isPending && accountId ? "status" : undefined}>
+        {!accountId ? "Sign in to view your remote screens." : query.isPending ? "Loading remote screens…"
+          : "Start screen sharing on a connected Hand to view and control it here."}
+      </p>}
       {hands.map(hand => <button type="button" key={`${hand.machine_id}:${hand.id}`} data-testid={`remote-screen:${hand.machine_id}:${hand.id}`} onClick={() => setSelected(hand)}>
         <Monitor size={22} aria-hidden="true" /><span><strong>{hand.machine_name}</strong><small>{hand.name}</small></span>
         <small>{hand.controllable ? "View and control" : "View only"}</small>

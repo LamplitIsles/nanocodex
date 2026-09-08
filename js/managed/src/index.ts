@@ -6816,26 +6816,26 @@ export class DurableAgentSession extends DurableComputerSession {
         parameters: { type: "object", additionalProperties: false },
         handler: (_input: unknown, context: ToolContext) => currentAccountInfo(context),
       }]),
-      ...(multiplayer ? [] : [accountConnectorsTool({
+      ...(multiplayer ? [] : [accountConnectorsTool((context) => ({
         broker: this.env.NANOCODEX,
         userId: session.owner_id,
         sessionId: session.session_id,
         publicOrigin: session.public_origin,
         canManage: () => {
-          const authorization = this.#activeTurnAuthorization();
+          const authorization = this.#authorizationForToolContext(context);
           return authorization !== undefined
             && authorization.connectGrant === undefined
             && authorization.capabilities.includes("organization:write");
         },
         allowedConnectors: () => {
-          const authorization = this.#activeTurnAuthorization();
+          const authorization = this.#authorizationForToolContext(context);
           return authorization === undefined ? [] : accountConnectorProjection(authorization);
         },
         allowedConnectorConnections: () => {
-          const authorization = this.#activeTurnAuthorization();
+          const authorization = this.#authorizationForToolContext(context);
           return authorization === undefined ? {} : accountConnectionProjection(authorization);
         },
-      })]),
+      }))]),
       ...(this.env.NANOCODEX_X ? [browseX({
         fetch: (input, init) => this.env.NANOCODEX_X!.fetch(String(input), init),
       })] : []),
