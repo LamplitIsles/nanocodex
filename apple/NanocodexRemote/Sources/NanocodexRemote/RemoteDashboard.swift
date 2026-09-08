@@ -111,7 +111,7 @@ public struct RemoteDashboard: View {
                                 Image(systemName: hand.kind == .phone ? "iphone" : "display")
                                 VStack(alignment: .leading) { Text(hand.machineName); Text(hand.name).font(.caption).foregroundStyle(.secondary) }
                                 Spacer(); Text(hand.controllable ? "View and control" : "View only").font(.caption)
-                            }.padding(.vertical, 4)
+                            }.padding(.vertical, 4).contentShape(Rectangle())
                         }.buttonStyle(.plain)
                             .accessibilityIdentifier("remote-screen:\(hand.machineID):\(hand.id)")
                     }

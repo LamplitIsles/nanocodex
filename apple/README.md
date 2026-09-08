@@ -491,6 +491,17 @@ NANOCODEX_CONTEXT_LIVE=1 swift test --package-path apple/NanocodexContext --filt
 
 ## Validation
 
+`RemoteScreenLifecycleUITests.testPublishedScreenSurvivesRepeatedPresentation`
+uses the app's saved account and an explicitly selected published screen. Set
+`NANOCODEX_TEST_REMOTE_MACHINE_ID` and `NANOCODEX_TEST_REMOTE_SURFACE_ID` in the
+XCTest runner environment. It opens, selects, returns to the screen list,
+reselects, and dismisses the viewer four times, including one background/foreground
+resume. It checks that viewing resumes without acquiring control or sending
+input, and retains screenshots from the first and last cycles. This covers
+the UIKit canvas teardown that previously published session state during
+SwiftUI invalidation and could abort the app. Renderer teardown now only
+detaches the renderer; the dashboard owns closing the session.
+
 `InboxUITests.testRemoteScreenControlAndReconnect` uses the phone's saved account
 and an explicitly selected disposable VM with a focused terminal. Set
 `NANOCODEX_TEST_REMOTE_ORIGIN` (HTTPS) and `NANOCODEX_TEST_VM_MACHINE_ID` in the

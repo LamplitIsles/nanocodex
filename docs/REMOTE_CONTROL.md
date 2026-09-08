@@ -263,6 +263,9 @@ with macOS Login Items. Its login, laptop Hand, automatic screen-sharing, and
 keep-awake settings are enabled. Closing the window left both the native Hand
 and controllable screen published; the browser decoded the live Mac afterward.
 This verifies registration and background availability, not a computer reboot.
+After the final app update while the Mac was locked, unlocking restored its
+screen publication automatically without restarting the app. The production
+browser reached Watching and rendered the live 1920×1080 display.
 
 The deployed browser discovered Mac, VM, and Cloudflare screens. It rendered a
 fresh Cloudflare desktop, created a marker through text/key input, recovered its
