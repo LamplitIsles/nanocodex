@@ -368,14 +368,15 @@ private struct ConversationOverview: View {
             .navigationTitle("Conversations (\(model.cards.count))")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
+                ToolbarItemGroup(placement: .bottomBar) {
                     Button {
                         model.newAgent()
                         dismiss()
                     } label: { Image(systemName: "plus") }
                     .accessibilityLabel("New conversation").accessibilityIdentifier("new-conversation-overview")
+                    Spacer()
+                    Button("Done") { dismiss() }
                 }
-                ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } }
             }
         }
         .presentationDetents([.large]).presentationDragIndicator(.visible)
