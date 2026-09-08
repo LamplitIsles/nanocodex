@@ -741,7 +741,7 @@ impl VmHostConnection {
         self.socket
             .send(Message::Text(encoded.into()))
             .await
-            .map_err(|_| protocol("VM host WebSocket send failed"))
+            .map_err(|error| vm_host_socket_error("send", error))
     }
 }
 
@@ -855,8 +855,30 @@ fn vm_host_handshake_error(error: WebSocketError) -> ManagedError {
         WebSocketError::Http(response) if matches!(response.status().as_u16(), 401 | 403) => {
             configuration("VM host authentication was rejected")
         }
-        _ => protocol("VM host WebSocket handshake failed"),
+        error => vm_host_socket_error("handshake", error),
     }
+}
+
+fn vm_host_socket_error(action: &str, error: WebSocketError) -> ManagedError {
+    // Error bodies can carry peer text, request URLs or authorization headers.
+    // Keep only transport categories and numeric status/OS codes in diagnostics.
+    let detail = match error {
+        WebSocketError::Io(error) => {
+            format!("I/O {:?}; OS code {:?}", error.kind(), error.raw_os_error())
+        }
+        WebSocketError::Protocol(
+            tokio_tungstenite::tungstenite::error::ProtocolError::ResetWithoutClosingHandshake,
+        ) => "peer reset without close handshake".to_owned(),
+        WebSocketError::ConnectionClosed => "connection closed".to_owned(),
+        WebSocketError::AlreadyClosed => "already closed".to_owned(),
+        WebSocketError::Tls(_) => "TLS error".to_owned(),
+        WebSocketError::Http(response) => format!("HTTP {}", response.status().as_u16()),
+        WebSocketError::Capacity(_) | WebSocketError::WriteBufferFull(_) => {
+            "capacity exceeded".to_owned()
+        }
+        _ => "protocol error".to_owned(),
+    };
+    protocol(format!("VM host WebSocket {action} failed ({detail})"))
 }
 
 async fn send_message(
@@ -871,7 +893,7 @@ async fn send_message(
     socket
         .send(Message::Text(encoded.into()))
         .await
-        .map_err(|_| protocol("VM host WebSocket send failed"))
+        .map_err(|error| vm_host_socket_error("send", error))
 }
 
 async fn read_text(socket: &mut Socket) -> Result<Option<String>, ManagedError> {
@@ -886,11 +908,11 @@ async fn read_text(socket: &mut Socket) -> Result<Option<String>, ManagedError> 
             Some(Ok(Message::Ping(payload))) => socket
                 .send(Message::Pong(payload))
                 .await
-                .map_err(|_| protocol("VM host WebSocket pong failed"))?,
+                .map_err(|error| vm_host_socket_error("pong", error))?,
             Some(Ok(Message::Pong(_))) => {}
             Some(Ok(Message::Close(_))) | None => return Ok(None),
             Some(Ok(_)) => return Err(protocol("VM host control requires text JSON frames")),
-            Some(Err(_)) => return Err(protocol("VM host WebSocket receive failed")),
+            Some(Err(error)) => return Err(vm_host_socket_error("receive", error)),
         }
     }
 }
@@ -1293,6 +1315,42 @@ message_kind!(ErrorKind, "error");
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn socket_diagnostics_classify_reset_without_peer_text() {
+        let error = super::vm_host_socket_error(
+            "receive",
+            super::WebSocketError::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "Bearer private-fixture-value",
+            )),
+        )
+        .to_string();
+        assert!(error.contains("ConnectionReset"));
+        assert!(!error.contains("private-fixture-value"));
+        let reset = super::vm_host_socket_error(
+            "receive",
+            super::WebSocketError::Protocol(
+                tokio_tungstenite::tungstenite::error::ProtocolError::ResetWithoutClosingHandshake,
+            ),
+        )
+        .to_string();
+        assert!(reset.contains("peer reset without close handshake"));
+    }
+
+    #[test]
+    fn socket_diagnostics_omit_http_headers_and_body() {
+        let response = tokio_tungstenite::tungstenite::http::Response::builder()
+            .status(503)
+            .header("authorization", "Bearer private-fixture-value")
+            .body(Some(b"private-fixture-body".to_vec()))
+            .unwrap();
+        let error =
+            super::vm_host_socket_error("handshake", super::WebSocketError::Http(response.into()))
+                .to_string();
+        assert!(error.contains("HTTP 503"));
+        assert!(!error.contains("private-fixture"));
+    }
+
     use super::*;
     use serde_json::json;
 

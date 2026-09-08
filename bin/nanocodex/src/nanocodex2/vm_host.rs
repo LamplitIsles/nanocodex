@@ -1376,17 +1376,23 @@ mod supported {
             target: AttachmentTarget,
             cancellation: OperationCancellation,
         ) -> Result<(), VmHostError> {
-            let attachment = connect_vm_attachment(&self.hand, target.clone()).await?;
+            let attachment = refresh_desktop_before_attachment(
+                async {
+                    self.hand
+                        .refresh_desktop(&target)
+                        .await
+                        .map_err(|error| VmHostError::Resource(error.to_string()))
+                },
+                connect_vm_attachment(&self.hand, target.clone()),
+                &cancellation,
+            )
+            .await?;
             if cancellation.is_cancelled() {
                 let detached = attachment
                     .detach()
                     .await
                     .map_err(|error| VmHostError::Resource(error.to_string()));
                 return combine_pair(Err(VmHostError::Cancelled), detached);
-            }
-            if let Err(error) = self.hand.refresh_desktop(&target).await {
-                let _ = attachment.detach().await;
-                return Err(VmHostError::Resource(error.to_string()));
             }
             let previous = std::mem::replace(&mut self.attachment, attachment);
             if let Err(error) = previous.detach().await {
@@ -1407,6 +1413,25 @@ mod supported {
                 shutdown: shutdown.map_err(|error| VmHostError::Resource(error.to_string())),
             }
         }
+    }
+
+    // Both routes use the newly issued, epoch-bound allocation capability.
+    // Deliver it to the retained desktop before waiting for the tools socket,
+    // so screen publication can recover during that independent handshake.
+    async fn refresh_desktop_before_attachment<D, A, T>(
+        desktop: D,
+        attachment: A,
+        cancellation: &OperationCancellation,
+    ) -> Result<T, VmHostError>
+    where
+        D: Future<Output = Result<(), VmHostError>>,
+        A: Future<Output = Result<T, VmHostError>>,
+    {
+        cancellation.check()?;
+        desktop.await?;
+        cancellation.check()?;
+        tracing::info!(target: "nanocodex2", "VM desktop credential refreshed before tools reconnect");
+        attachment.await
     }
 
     async fn connect_vm_attachment(
@@ -2839,6 +2864,115 @@ mod supported {
 
             assert!(clone_private_root_blocking(&template, &clone).is_err());
             assert_eq!(fs::read(&template).unwrap(), b"template");
+        }
+
+        #[tokio::test]
+        async fn desktop_credential_refresh_does_not_wait_for_tools_handshake() {
+            let (rotated, observed) = tokio::sync::oneshot::channel();
+            let (ready, handshake) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(async move {
+                refresh_desktop_before_attachment(
+                    async {
+                        rotated.send(()).unwrap();
+                        Ok(())
+                    },
+                    async {
+                        handshake.await.unwrap();
+                        Ok(42)
+                    },
+                    &OperationCancellation::default(),
+                )
+                .await
+            });
+            tokio::time::timeout(Duration::from_secs(1), observed)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                !task.is_finished(),
+                "desktop capability must arrive while tools are pending"
+            );
+            ready.send(()).unwrap();
+            assert_eq!(task.await.unwrap().unwrap(), 42);
+        }
+
+        #[tokio::test]
+        async fn failed_desktop_refresh_never_connects_tools() {
+            let connected = AtomicBool::new(false);
+            let result = refresh_desktop_before_attachment(
+                ready(Err(VmHostError::Resource(
+                    "credential write failed".to_owned(),
+                ))),
+                async {
+                    connected.store(true, Ordering::SeqCst);
+                    Ok(())
+                },
+                &OperationCancellation::default(),
+            )
+            .await;
+            assert!(matches!(result, Err(VmHostError::Resource(_))));
+            assert!(!connected.load(Ordering::SeqCst));
+        }
+
+        #[tokio::test]
+        async fn cancelled_refresh_does_not_deliver_a_desktop_capability() {
+            let cancellation = OperationCancellation::default();
+            cancellation.cancel();
+            let delivered = AtomicBool::new(false);
+            let connected = AtomicBool::new(false);
+            let result = refresh_desktop_before_attachment(
+                async {
+                    delivered.store(true, Ordering::SeqCst);
+                    Ok(())
+                },
+                async {
+                    connected.store(true, Ordering::SeqCst);
+                    Ok(())
+                },
+                &cancellation,
+            )
+            .await;
+            assert!(matches!(result, Err(VmHostError::Cancelled)));
+            assert!(!delivered.load(Ordering::SeqCst));
+            assert!(!connected.load(Ordering::SeqCst));
+        }
+
+        #[tokio::test]
+        async fn cancellation_during_credential_delivery_prevents_tools_connection() {
+            let cancellation = OperationCancellation::default();
+            let connected = AtomicBool::new(false);
+            let result = refresh_desktop_before_attachment(
+                async {
+                    cancellation.cancel();
+                    Ok(())
+                },
+                async {
+                    connected.store(true, Ordering::SeqCst);
+                    Ok(())
+                },
+                &cancellation,
+            )
+            .await;
+            assert!(matches!(result, Err(VmHostError::Cancelled)));
+            assert!(!connected.load(Ordering::SeqCst));
+        }
+
+        #[tokio::test]
+        async fn tools_failure_is_reported_after_desktop_capability_delivery() {
+            let delivered = AtomicBool::new(false);
+            let result = refresh_desktop_before_attachment(
+                async {
+                    delivered.store(true, Ordering::SeqCst);
+                    Ok(())
+                },
+                async {
+                    assert!(delivered.load(Ordering::SeqCst));
+                    Err::<(), _>(VmHostError::Resource("tools handshake failed".to_owned()))
+                },
+                &OperationCancellation::default(),
+            )
+            .await;
+            assert!(matches!(result, Err(VmHostError::Resource(_))));
         }
 
         #[tokio::test]
