@@ -167,7 +167,7 @@
     "AGENT_IDLE_TIMEOUT_MS": "30000",
     "MANAGED_AGENT_DIRECT_CREDENTIALS": "true",
     "NANOCODEX_SANDBOX_DESKTOPS": "true",
-    "NANOCODEX_HAND_IMAGE": "ghcr.io/gakonst/nanocodex-hand@sha256:e68bfb9f6c704c9934b0cbae98231eee06d6a6b26de72a3bc0e7d86260b919d2",
+    "NANOCODEX_HAND_IMAGE": "ghcr.io/gakonst/nanocodex-hand@sha256:0cdd809e526c7e88827b9f46be5a665d9e3ca94a78a66d42f2a6a7110400e3c3",
     "MANAGED_BROWSER_PROVIDER": "cloudflare"
   },
   "env": {

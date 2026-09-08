@@ -334,6 +334,13 @@ returns a conflict instead of silently rotating it. Then ask the managed agent
 to connect that SSH identity as a Hand. Current broker networking requires a
 publicly reachable target; private/VPN-only SSH destinations are not supported.
 
+The broker supports RSA/ECDSA host keys and prefers RSA when the server offers
+both. Use the server's trusted RSA fingerprint in that case (for example, read
+`ssh-keygen -lf /etc/ssh/ssh_host_rsa_key.pub` through an already trusted session).
+Entering an ECDSA or Ed25519 fingerprint does not change the negotiated algorithm.
+An ECDSA-only host works; an Ed25519-only host is currently unsupported. This
+restriction does not apply to native Hands connecting outbound without SSH.
+
 The operator must publish `hands/remote/image/Dockerfile` for the server's
 architecture and configure `NANOCODEX_HAND_IMAGE` with its immutable
 `registry/path@sha256:...` reference. No image is pulled from an agent-supplied
@@ -633,3 +640,78 @@ References: [Cloudflare Realtime](https://developers.cloudflare.com/realtime/),
 Device inventory remains available at `GET /v1/account/hands`. Screen viewers
 use `GET /v1/account/hands/screens`; the separate responses preserve the native
 Hands inventory while screens are published, disconnected, or replaced.
+
+## 2026-09-09 verification pass
+
+Source fix `a510836f` repairs the public account proxy's server enrollment and
+scoped publisher routes. Without those routes, the real installer returned 404
+before a server could join. Replaced native and Linux publishers now release
+capture/input and retire instead of evicting their replacement repeatedly.
+Viewers still reconnect to the replacement; ordinary transport failures retry.
+Linux daemons remain idle after replacement so a container restart policy cannot
+immediately reclaim the screen. Explicitly restarting sharing enables it again.
+
+The web viewer now requests initial ICE credentials alongside signaling and
+reuses them for the first offer. Later offers refresh credentials. This removes
+one ICE request per attempt; the small live samples do not establish an overall
+speedup or eliminate the observed baseline long-tail delay.
+
+| Runtime | Evidence from this pass | Qualification |
+| --- | --- | --- |
+| macOS host | Signed Release app installed; cloud-agent command and file round trip through the native Hand | Mac locked before the final visible screen-input check; no reboot performed |
+| Native macOS viewer to Mac-hosted Linux VM | Decoded video, pending-control cancellation, release/reacquire, real input with 86/61 ms visible transitions | VM and workspace retained; this is a Linux guest, not a macOS guest |
+| iPhone viewer to that VM | One decoded 1600×900 frame in 744 ms; current signed app installed; no new app crash report | Two XCTest runners were killed before input; full physical input/recovery remains incomplete |
+| iOS shared runtime | Real WebRTC and UIKit teardown tests passed | Simulator app journey stopped at SMS sign-in |
+| Web viewer | Real Chrome VM video; browser fixture with encoded video/input, pause/resume, 12-second outage and new-generation recovery | Real VM first-frame samples 2404/1757/3129 ms; these are not a general latency bound |
+| Linux native Hand | Managed commands and file read/write before/after restart, same machine/workspace; catalog recovery 887 ms | Fresh isolated Linux container on the local VM; existing external SSH servers were unreachable |
+| Linux desktop | Locally built image: real compositor/capture/input at UID 12345, credential rotation, reconnect, revocation and publisher replacement cleanup | JPEG 142–149 ms, input-to-file 25–26 ms, signaling recovery about 1 second; initial CI-built ARM64 image failed portability testing below |
+| Cloudflare Sandbox | Fresh production desktop automatically published; native decoded frames, actual input/file readback, suspend/resume and agent observation passed | Owned agent deleted (204), exact lookup 404, screen removed |
+| SSH-installed Linux desktop | Exact managed installer through real pinned OpenSSH: publication in 4.157 s; browser decoded video in 1.335 s and real input; same identity/workspace after reconnect | Loopback-only SSH fixture with production enrollment/signaling; actual publisher outage 30.538 s and Watching observed 2.593 s after republication |
+
+Native VM first-frame samples were 1284/699/1828 ms. The first-frame diagnostic
+probe is opt-in and reports once per track, without per-frame UI publication.
+Focused checks passed: 28 shared native tests, 39 web/proxy tests, account
+TypeScript, the Go race suite and repeated replacement tests, and signed app
+builds. Both native image architectures passed JPEG and H.264 capture/decoding
+smokes before publication; anonymous pulls and exact source revision labels
+were then verified.
+
+The first SSH image candidate, `sha256:f2f5175d52134f08344c457c01dd5bb3ecfe07bc6be7f38fa8894120638a1ee5`,
+passed native CI smoke but was rejected before the production pin changed:
+its ARM64 Waymote binary exited 132 (illegal instruction) on Apple Silicon
+Linux. The server image needs a baseline CPU target, matching the Cloudflare
+image, and an actual released-image check on another ARM64 CPU. Source fix `e3a99c1e`
+adds that baseline target and a bounded pre-publication QEMU startup check; the
+rejected binary fails the same check that the local portable candidate passes.
+The candidate also passes real local JPEG/H.264 smoke. One initial cold
+agent-input marker was missed; 43 subsequent startup/input/reconnect/revocation
+runs passed. That first failure had no retained frame and remains unclassified;
+no input fix or arbitrary startup delay is claimed.
+
+The verified portable release is
+`ghcr.io/gakonst/nanocodex-hand@sha256:0cdd809e526c7e88827b9f46be5a665d9e3ca94a78a66d42f2a6a7110400e3c3`.
+Both native architecture codec smokes and baseline CPU guards passed. Its exact
+published ARM64 image also passed startup and non-root JPEG/H.264 capture on
+this Mac's Linux VM before the installer test. The browser test used the actual
+RemoteScreens component with a loopback authentication proxy restricted to the
+owned server, rather than a logged-in deployed-page session. Both input markers
+were independently verified byte-for-byte through the pinned SSH broker. Final
+disconnect revoked enrollment and stopped the desktop; separate account reads
+confirmed enrollment and screen absence. All fixture containers, state, workspace
+markers and generated private keys were removed.
+
+Existing SSH containers require explicit reconnection to use a new image. The
+retained VM's running publisher was not replaced: its current lifecycle also
+owns the compositor, so restarting it would disrupt desktop applications.
+
+No Windows or macOS guest was available for this pass. Windows native hosting
+remains planned; no Windows media was installed. External-server and encrypted
+vault-to-public-server installation remain unverified until a reachable owned
+SSH target is provided. A local SSH fixture does not establish those results.
+
+Private evidence is under `/tmp/nanocodex-remote-pass-20260909`,
+`/tmp/nanocodex-native-vm-pass-20260909`, `/tmp/nanocodex-phone-pass-20260909`,
+`/tmp/nanocodex-web-latency-20260909`, `/tmp/nanocodex-linux-ssh-20260909`,
+`/tmp/nanocodex-cloudflare-pass-20260909`, `/tmp/nanocodex-web-ssh-20260909`,
+`/tmp/nanocodex-hand-release-34287642764` (rejected image), and
+`/tmp/nanocodex-hand-release-34289137727` (portable release).
