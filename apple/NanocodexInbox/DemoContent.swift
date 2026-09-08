@@ -46,9 +46,12 @@ enum DemoContent {
     #endif
 
     static func cards() -> [AgentCard] {
+        #if DEBUG
+        if ProcessInfo.processInfo.environment["NANOCODEX_DEMO_EMPTY_AGENTS"] == "1" { return [] }
+        #endif
         let values: [(String, String, String, String)] = [
             ("durability", "Make long sessions bulletproof", "Ready", "The reconnect fix is ready. Two turns survive a disconnect, and steering stays attached to the right run. Ready for your review."),
-            ("inbox", "Build the agent inbox", "Running", "Wiring the card stack to live sessions. Drafts stay with their agent while you move through the deck."),
+            ("inbox", "Build the agent inbox", "Running", "Connecting agent tabs to live sessions. Drafts stay with their agent while you switch tabs."),
             ("data", "Tighten the fuel forecast", "Running", "Comparing the latest price observations against the holdout window. Checking where the forecast drifts."),
             ("hands", "Reconnect the browser Hand", "Failed", "The browser Hand disconnected before the page loaded. Reconnect the Hand, then send a follow-up to continue.")
         ]

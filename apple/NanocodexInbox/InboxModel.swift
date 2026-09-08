@@ -23,12 +23,28 @@ final class InboxModel: ObservableObject {
     enum Filter: String, CaseIterable { case inbox = "Inbox", running = "Running", all = "All" }
     @Published var cards: [AgentCard] = []
     @Published var deck = InboxDeck()
-    @Published var filter: Filter = .inbox { didSet { reconcile() } }
+    @Published var filter: Filter = .all { didSet { reconcile() } }
     @Published var drafts: [String: String] = [:]
     @Published var rows: [TranscriptRow] = []
     @Published var threadLoading = false
     @Published var threadError: String?
     private var observedAgentID: String?
+    private var tabOrder: [String] = []
+    private struct TabHistory {
+        var events: [AgentEvent]
+        var cursor: Cursor
+        var hasOlder: Bool
+    }
+    private var tabHistories: [String: TabHistory] = [:]
+    private var recentTabs: [String] = []
+    @Published private var overviewTranscripts: [String: [TranscriptRow]] = [:]
+    private var overviewVisible = Set<String>()
+    private var overviewTasks: [String: Task<Void, Never>] = [:]
+    private var overviewTokens: [String: UUID] = [:]
+    private var overviewEvents: [String: [AgentEvent]] = [:]
+    private var overviewBytes: [String: [Int]] = [:]
+    private var overviewByteCounts: [String: Int] = [:]
+    private var overviewProjections: [String: Task<Void, Never>] = [:]
     @Published var busy = Set<String>()
     @Published var connection = "Disconnected"
     @Published var error: String?
@@ -131,6 +147,10 @@ final class InboxModel: ObservableObject {
     var focused: AgentCard? { cards.first { $0.id == deck.focusedID } }
     var focusedConversationIdentity: String? {
         focused.map { card in createdAgentIDs.first(where: { $0.value == card.id })?.key ?? card.id }
+    }
+    var tabCards: [AgentCard] {
+        let byID = Dictionary(uniqueKeysWithValues: cards.map { ($0.id, $0) })
+        return tabOrder.compactMap { byID[$0] }
     }
     var creationError: String? { focused.flatMap { creationErrors[$0.id] } }
     private func resolvedAgentID(_ id: String) -> String { createdAgentIDs[id] ?? id }
@@ -487,6 +507,8 @@ final class InboxModel: ObservableObject {
         reset()
     }
     private func reset() {
+        stopOverview()
+        overviewTranscripts = [:]; tabHistories = [:]; recentTabs = []; tabOrder = []
         handTasks.cancelAll(stopTurns: false)
         schedulesTask?.cancel(); schedulesTask = nil; schedulesFailures = [:]
         scheduledJobs = []; scheduledJobAgents = [:]; schedulesLoading = false; schedulesLoaded = false; schedulesError = nil
@@ -533,8 +555,8 @@ final class InboxModel: ObservableObject {
             Task { await restoreSavedAccount() }
         }
         if active { refreshContext() }
-        if active { if isDemo { connection = "Demo" } else { resume() } }
-        else { scheduleHandRefresh(); polling?.cancel(); streaming?.cancel(); streaming = nil; observation = UUID(); connection = "Paused" }
+        if active { if isDemo { connection = "Demo" } else { resume() }; resumeOverview() }
+        else { suspendOverview(); scheduleHandRefresh(); polling?.cancel(); streaming?.cancel(); streaming = nil; observation = UUID(); connection = "Paused" }
     }
     private func resume(initialListing: [AgentCard]? = nil) {
         guard connected, !isDemo, isActive else { return }
@@ -746,10 +768,17 @@ final class InboxModel: ObservableObject {
         historyCursors.removeValue(forKey: id)
         if voice.conversationID == id { voice.stop() }
         cards.removeAll { $0.id == id }
+        setOverviewVisible(id, visible: false)
+        overviewTranscripts[id] = nil; tabHistories[id] = nil; recentTabs.removeAll { $0 == id }
         if pinnedThreadID == id { pinnedThreadID = nil }
         reconcile()
     }
     private func reconcile() {
+        let available = Set(cards.map(\.id))
+        var unique = Set<String>()
+        tabOrder.removeAll { !available.contains($0) || !unique.insert($0).inserted }
+        let known = Set(tabOrder)
+        tabOrder.append(contentsOf: cards.map(\.id).filter { !known.contains($0) })
         let previous = deck.focusedID
         let eligible = cards.filter { card in
             if card.id == pinnedThreadID { return true }
@@ -895,17 +924,29 @@ final class InboxModel: ObservableObject {
         select(id)
     }
 
-    func select(_ id: String) { filter = .all; deck.focus(id); observeFocused() }
+    func select(_ id: String) {
+        guard cards.contains(where: { $0.id == id }) else { return }
+        pinnedThreadID = id
+        filter = .all; deck.focus(id); observeFocused()
+    }
     private func observeFocused(restart: Bool = false) {
         let changed = observedAgentID != deck.focusedID
         guard changed || restart else { return }
+        if changed, let previous = observedAgentID, !isDemo, !events.isEmpty {
+            // Preserve loaded history along with each tab's draft.
+            tabHistories[previous] = TabHistory(events: events, cursor: cursor, hasOlder: hasOlder)
+            recentTabs.removeAll { $0 == previous }; recentTabs.append(previous)
+            while recentTabs.count > 8 { tabHistories[recentTabs.removeFirst()] = nil }
+        }
         observedAgentID = deck.focusedID
+        if let id = observedAgentID { cancelOverview(id) }
         streaming?.cancel(); streaming = nil; projection?.cancel(); projection = nil; observation = UUID(); loadingOlder = false
         threadError = nil
         if changed {
             rows = []; events = []; eventBytes = []; retainedBytes = 0; cursor = .zero
             olderBefore = nil; hasOlder = false; selectedTurn = ""
         }
+        resumeOverview()
         guard let id = deck.focusedID else {
             threadLoading = false
             if connected && isActive { connection = isDemo ? "Demo" : "Connected" }
@@ -913,6 +954,10 @@ final class InboxModel: ObservableObject {
         }
         if pendingCreations.contains(id) { threadLoading = false; return }
         if isDemo { rows = demoRows[id] ?? DemoContent.rows(id); connection = "Demo"; threadLoading = false; return }
+        if changed, let cached = tabHistories[id] {
+            events = cached.events; cursor = cached.cursor; hasOlder = cached.hasOlder
+            measureEvents(); olderBefore = events.first?.cursor; rows = transcript(events)
+        }
         threadLoading = rows.isEmpty
         guard let client, isActive else { return }
         let epoch = generation, token = observation
@@ -967,6 +1012,103 @@ final class InboxModel: ObservableObject {
                 do { try await Task.sleep(for: .seconds(delay)) } catch { return }
                 delay = min(delay * 2, 15)
             }
+        }
+    }
+    func overviewRows(for id: String) -> [TranscriptRow] {
+        if focused?.id == id, !rows.isEmpty { return rows }
+        if isDemo { return demoRows[id] ?? DemoContent.rows(id) }
+        return overviewTranscripts[id] ?? cards.first(where: { $0.id == id })?.previewRows ?? []
+    }
+    func setOverviewVisible(_ id: String, visible: Bool) {
+        if visible { overviewVisible.insert(id); startOverview(id) }
+        else { overviewVisible.remove(id); cancelOverview(id); overviewTranscripts[id] = nil }
+    }
+    func stopOverview() {
+        overviewVisible.removeAll(); suspendOverview(); overviewTranscripts = [:]
+    }
+    private func suspendOverview() {
+        for id in Array(overviewTasks.keys) { cancelOverview(id) }
+    }
+    private func cancelOverview(_ id: String) {
+        overviewTasks.removeValue(forKey: id)?.cancel(); overviewTokens[id] = nil
+        overviewProjections.removeValue(forKey: id)?.cancel()
+        overviewEvents[id] = nil; overviewBytes[id] = nil; overviewByteCounts[id] = nil
+    }
+    private func resumeOverview() {
+        for id in overviewVisible { startOverview(id) }
+    }
+    private func startOverview(_ id: String) {
+        guard !isDemo, connected, isActive, id != observedAgentID,
+              !pendingCreations.contains(id), overviewTasks[id] == nil,
+              cards.contains(where: { $0.id == id }), let client else { return }
+        let epoch = generation, token = UUID()
+        overviewTokens[id] = token
+        overviewTasks[id] = Task { [weak self] in
+            guard let self else { return }
+            var delay = 1, loaded = false
+            var position = Cursor.zero
+            while !Task.isCancelled, self.generation == epoch, self.overviewTokens[id] == token {
+                let started = Date()
+                do {
+                    if !loaded {
+                        async let history = client.history(id)
+                        async let state = client.state(id)
+                        let (page, current) = try await (history, state)
+                        guard self.generation == epoch, self.overviewTokens[id] == token, !Task.isCancelled else { return }
+                        self.overviewEvents[id] = page.events
+                        self.overviewBytes[id] = page.events.map { (try? JSONEncoder().encode($0.data).count) ?? 0 }
+                        self.overviewByteCounts[id] = self.overviewBytes[id]?.reduce(0, +) ?? 0
+                        self.trimOverview(id)
+                        if let index = self.cards.firstIndex(where: { $0.id == id }) { try self.cards[index].apply(state: current) }
+                        self.projectOverview(id); position = page.latest; loaded = true
+                    }
+                    try await client.stream(id, after: position) { [weak self] frame in
+                        await self?.receiveOverview(frame, id: id, epoch: epoch, token: token)
+                    }
+                } catch {
+                    guard self.generation == epoch, self.overviewTokens[id] == token, !Task.isCancelled else { return }
+                    if let apiError = error as? APIError, apiError == .agentDeleting || apiError == .http(404) {
+                        self.forgetUnavailableAgent(id); return
+                    }
+                    if let index = self.cards.firstIndex(where: { $0.id == id }) { self.cards[index].error = error.localizedDescription }
+                    if let apiError = error as? APIError, apiError == .http(401) || apiError == .http(403) { return }
+                }
+                position = max(position, self.overviewEvents[id]?.last?.cursor ?? .zero)
+                if Date().timeIntervalSince(started) >= 30 { delay = 1 }
+                do { try await Task.sleep(for: .seconds(delay)) } catch { return }
+                delay = min(delay * 2, 15)
+            }
+        }
+    }
+    private func receiveOverview(_ frame: SSEFrame, id: String, epoch: UUID, token: UUID) {
+        guard generation == epoch, overviewTokens[id] == token,
+              let event = frame.event, event.cursor > (overviewEvents[id]?.last?.cursor ?? .zero) else { return }
+        overviewEvents[id, default: []].append(event)
+        overviewBytes[id, default: []].append(frame.payloadBytes)
+        overviewByteCounts[id, default: 0] += frame.payloadBytes
+        trimOverview(id)
+        if overviewProjections[id] == nil {
+            overviewProjections[id] = Task { [weak self] in
+                do { try await Task.sleep(for: .milliseconds(100)) } catch { return }
+                guard let self, self.generation == epoch, self.overviewTokens[id] == token else { return }
+                self.projectOverview(id); self.overviewProjections[id] = nil
+            }
+        }
+    }
+    private func trimOverview(_ id: String) {
+        while (overviewEvents[id]?.count ?? 0) > 1,
+              (overviewEvents[id]?.count ?? 0) > 512 || (overviewByteCounts[id] ?? 0) > 8 * 1024 * 1024 {
+            overviewEvents[id]?.removeFirst()
+            overviewByteCounts[id, default: 0] -= overviewBytes[id]?.removeFirst() ?? 0
+        }
+    }
+    private func projectOverview(_ id: String) {
+        let history = overviewEvents[id] ?? [], projected = transcript(overviewEvents[id] ?? [])
+        if overviewTranscripts[id] != projected { overviewTranscripts[id] = projected }
+        if let index = cards.firstIndex(where: { $0.id == id }) {
+            var card = cards[index]
+            card.apply(events: history, transcriptRows: projected); card.error = nil
+            if cards[index] != card { cards[index] = card }
         }
     }
     private func receive(_ frame: SSEFrame, id: String, epoch: UUID, token: UUID) {
@@ -1559,6 +1701,11 @@ final class InboxModel: ObservableObject {
     private func bindCreatedAgent(_ localID: String, to id: String) {
         let wasFocused = deck.focusedID == localID
         createdAgentIDs[localID] = id
+        // A concurrent roster can list the real agent before create returns.
+        // Keep the placeholder's position and avoid duplicate SwiftUI identities.
+        tabOrder = tabOrder.filter { $0 != id }.map { $0 == localID ? id : $0 }
+        if overviewVisible.remove(localID) != nil { overviewVisible.insert(id) }
+        cancelOverview(localID)
         if let value = drafts.removeValue(forKey: localID) { drafts[id] = value }
         if let value = attachmentDrafts.removeValue(forKey: localID) { attachmentDrafts[id] = value }
         if let value = attachmentErrors.removeValue(forKey: localID) { attachmentErrors[id] = value }

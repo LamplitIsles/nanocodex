@@ -24,26 +24,12 @@ private enum Ink {
 
 struct InboxView: View {
     @ObservedObject var model: InboxModel
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var drag: CGFloat = 0
-    @State private var upwardDrag: CGFloat = 0
-    @State private var cardDrag: CardDrag?
-    @State private var previewGeometry = CardPreviewGeometry()
-    @State private var showThread = false
-    @State private var showAgents = false
-    @GestureState(resetTransaction: Transaction(animation: .snappy(duration: 0.28))) private var sidebarDrag: CGFloat = 0
+    @State private var showOverview = false
+    @State private var readingPositions = ConversationReadingPositions()
     @State private var showScheduledJobs = false
     @State private var showSettings = false
     @State private var showScreens = false
     @FocusState private var composerFocused: Bool
-
-    private let newThreadPullThreshold: CGFloat = 160
-    private var newThreadPullProgress: CGFloat { min(1, max(0, -upwardDrag / newThreadPullThreshold)) }
-    private var newThreadPullReady: Bool { -upwardDrag >= newThreadPullThreshold }
-    private var newThreadPullOffset: CGFloat {
-        let distance = max(0, -upwardDrag)
-        return -(min(distance, newThreadPullThreshold) * 0.6 + max(0, distance - newThreadPullThreshold) * 0.15)
-    }
 
     var body: some View {
         NavigationStack {
@@ -56,7 +42,7 @@ struct InboxView: View {
                 .navigationDestination(isPresented: $showScheduledJobs) {
                     ScheduledJobsView(model: model) {
                         showScheduledJobs = false
-                        model.openThread(); showThread = true
+                        composerFocused = false
                     }
                     #if os(iOS)
                     .toolbar(.visible, for: .navigationBar)
@@ -81,14 +67,23 @@ struct InboxView: View {
                 }
             }
         }
-        .sheet(isPresented: $showThread, onDismiss: { model.closeThread() }) { ConversationView(model: model).tint(Ink.accent) }
-        .sheet(isPresented: Binding(get: { model.showContext && !showThread }, set: { model.showContext = $0 })) { ContextInboxView(model: model).tint(Ink.accent) }
+        .sheet(isPresented: $showOverview) {
+            ConversationOverview(model: model) { id in
+                selectConversation(id)
+                showOverview = false
+            }
+            .tint(Ink.accent)
+        }
+        .sheet(isPresented: $model.showContext) { ContextInboxView(model: model).tint(Ink.accent) }
         .onChange(of: model.focused?.activeTurns ?? []) { _, turns in
             if !turns.contains(model.selectedTurn) { model.selectedTurn = turns.first ?? "" }
         }
-        .onChange(of: model.focusedConversationIdentity) { _, _ in drag = 0; upwardDrag = 0; cardDrag = nil; composerFocused = false }
+        .onChange(of: model.focusedConversationIdentity, initial: true) { _, _ in
+            composerFocused = false
+            if model.focused != nil { model.openThread() }
+        }
         .onChange(of: model.connected) { _, connected in
-            if !connected { showScreens = false; showScheduledJobs = false; showSettings = false; showAgents = false; showThread = false }
+            if !connected { showScreens = false; showScheduledJobs = false; showSettings = false; showOverview = false; readingPositions.values.removeAll() }
         }
     }
 
@@ -98,123 +93,97 @@ struct InboxView: View {
             if model.restoringAccount {
                 accountRestoration
             } else if model.connected {
-                sidebarLayout
+                inboxContent
             } else { ConnectView(model: model) }
         }
     }
-    private var sidebarLayout: some View {
-        GeometryReader { geometry in
-            let width = max(1, min(360, geometry.size.width * 0.78))
-            let offset = min(width, max(0, (showAgents ? width : 0) + sidebarDrag))
-            let progress = offset / width
-            ZStack(alignment: .topLeading) {
-                if showAgents || sidebarDrag > 0 {
-                    agentList
-                        .frame(width: width, height: geometry.size.height)
-                        .background(Ink.background.ignoresSafeArea())
-                        .offset(x: reduceMotion ? 0 : -24 * (1 - progress))
-                        .contentShape(Rectangle())
-                        .simultaneousGesture(sidebarGesture(width: width, closing: true))
-                        .accessibilityHidden(!showAgents)
-                        .allowsHitTesting(showAgents)
-                        .transition(.opacity)
-                }
-                inboxContent
-                    .frame(width: geometry.size.width, height: geometry.size.height)
-                    .accessibilityElement(children: .contain)
-                    .accessibilityIdentifier("inbox-panel")
-                    .accessibilityHidden(showThread || showAgents)
-                    .padding(.top, geometry.safeAreaInsets.top)
-                    .padding(.bottom, geometry.safeAreaInsets.bottom)
-                    .background(Ink.background)
-                    .clipShape(RoundedRectangle(cornerRadius: 38 * progress, style: .continuous))
-                    .shadow(color: .black.opacity(0.16 * progress), radius: 24, x: -8)
-                    .overlay {
-                        Color.clear.contentShape(Rectangle())
-                            .onTapGesture { setSidebar(false) }
-                            .gesture(sidebarGesture(width: width, closing: true))
-                            .allowsHitTesting(showAgents)
-                            .accessibilityHidden(true)
-                    }
-                    .offset(x: offset, y: -geometry.safeAreaInsets.top)
-            }
-            .frame(width: geometry.size.width, height: geometry.size.height, alignment: .topLeading)
-            .overlay(alignment: .leading) {
-                Color.clear.frame(width: 16).contentShape(Rectangle())
-                    .gesture(sidebarGesture(width: width, closing: false))
-                    .allowsHitTesting(!showAgents)
-                    .accessibilityHidden(true)
-            }
-            .coordinateSpace(name: "inbox-sidebar-space")
-            .transaction { if reduceMotion { $0.animation = nil } }
-        }
-    }
     private var inboxContent: some View {
-        VStack(spacing: 10) {
-            Group {
-                if let card = model.focused { deck(card) }
-                else { emptyState.frame(maxHeight: .infinity) }
-            }
-            .overlay(alignment: .bottomLeading) {
-                if model.canGoBack {
-                    Button(action: undoSwipe) {
-                        Image(systemName: "arrow.uturn.backward")
-                            .font(.system(size: 17, weight: .medium))
-                            .frame(width: 44, height: 44)
-                            .background(.regularMaterial, in: Circle())
-                            .shadow(color: .black.opacity(0.09), radius: 12, y: 4)
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Undo swipe")
-                    .accessibilityHint("Restore the previous agent and its review state.")
-                    .accessibilityIdentifier("undo-swipe")
-                    .padding(.leading, 18)
-                    .padding(.bottom, model.focused == nil ? 10 : composerFocused ? 22 : 34)
-                    .transition(.opacity)
-                }
+        VStack(spacing: 0) {
+            header.padding(.horizontal, 16).padding(.vertical, 4)
+            if let identity = model.focusedConversationIdentity {
+                ConversationView(model: model, composerFocused: $composerFocused,
+                                 identity: identity, readingPositions: readingPositions)
+                    .id(identity)
+            } else {
+                emptyState.frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             if let error = model.error {
                 HStack(alignment: .top) {
                     Text(error).font(.caption).foregroundStyle(Ink.amber)
-                    Button { model.error = nil } label: { Image(systemName: "xmark") }.accessibilityLabel("Dismiss error")
+                    Spacer(minLength: 4)
+                    Button { model.error = nil } label: { Image(systemName: "xmark") }
+                        .accessibilityLabel("Dismiss error")
                 }
-                .padding(12).background(Ink.card, in: RoundedRectangle(cornerRadius: 12))
+                .padding(12).background(Ink.card, in: RoundedRectangle(cornerRadius: 12)).padding(.horizontal, 12)
             } else if let notice = model.notice, !composerFocused {
                 Text(notice).font(.caption).foregroundStyle(Ink.muted).accessibilityIdentifier("notice")
             }
         }
-        .padding(.horizontal, 8).padding(.top, 4).padding(.bottom, 4)
-        .frame(maxWidth: 620)
-        .overlay(alignment: .top) {
-            if !composerFocused {
-                // Refresh hidden navigation accessibility nodes without resetting the deck or composer.
-                header.id(showAgents).padding(.horizontal, 16).padding(.top, 8)
-            }
-        }
         .safeAreaInset(edge: .bottom, spacing: 0) {
-            if model.focused != nil, !showThread {
-                AgentComposerView(model: model, focused: $composerFocused, onVoiceChat: {
-                    composerFocused = false; model.openThread(); showThread = true
-                }).frame(maxWidth: 620)
-            }
+            VStack(spacing: 0) {
+                if model.focused != nil {
+                    AgentComposerView(model: model, focused: $composerFocused, onVoiceChat: {
+                        composerFocused = false
+                    }).frame(maxWidth: 620)
+                }
+                browserTabs
+            }.background(Ink.background)
         }
     }
-    private func sidebarGesture(width: CGFloat, closing: Bool) -> some Gesture {
-        DragGesture(minimumDistance: 12, coordinateSpace: .named("inbox-sidebar-space"))
-            .updating($sidebarDrag) { value, drag, _ in
-                guard abs(value.translation.width) > abs(value.translation.height) * 1.3 else { return }
-                drag = closing ? min(0, value.translation.width) : max(0, value.translation.width)
+
+    private var browserTabs: some View {
+        HStack(spacing: 4) {
+            Button(action: createAgent) {
+                Image(systemName: "plus").font(.system(size: 20, weight: .medium))
+                    .frame(width: 44, height: 44)
             }
-            .onEnded { value in
-                guard abs(value.translation.width) > abs(value.translation.height) * 1.3 else { return }
-                let projected = value.predictedEndTranslation.width
-                let travel = value.translation.width
-                if closing {
-                    setSidebar(!(travel < -width * 0.3 || projected < -width * 0.3))
-                } else {
-                    setSidebar(travel > width * 0.3 || projected > width * 0.3)
+            .accessibilityLabel("New conversation").accessibilityIdentifier("new-conversation")
+            .keyboardShortcut("n", modifiers: .command)
+            ScrollViewReader { scroll in
+                ScrollView(.horizontal) {
+                    HStack(spacing: 6) {
+                        ForEach(model.tabCards) { card in
+                            Button { selectConversation(card.id) } label: {
+                                HStack(spacing: 6) {
+                                    Circle().fill(card.isRunning ? Color.green : Ink.muted.opacity(0.5))
+                                        .frame(width: 6, height: 6)
+                                    Text(card.title).font(.system(size: 13, weight: model.focused?.id == card.id ? .semibold : .regular))
+                                        .lineLimit(1).frame(maxWidth: 130)
+                                }
+                                .padding(.horizontal, 12).frame(height: 36)
+                                .background(model.focused?.id == card.id ? Ink.surface : Color.clear, in: RoundedRectangle(cornerRadius: 12))
+                                .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(model.focused?.id == card.id ? Ink.border : Color.clear))
+                            }
+                            .frame(minHeight: 44).id(card.id)
+                            .accessibilityLabel(card.title)
+                            .accessibilityValue(card.status)
+                            .accessibilityAddTraits(model.focused?.id == card.id ? [.isSelected] : [])
+                            .accessibilityIdentifier("browser-tab:" + card.id)
+                        }
+                    }
                 }
+                .scrollIndicators(.hidden)
+                .onChange(of: model.focused?.id, initial: true) { _, id in
+                    if let id { scroll.scrollTo(id, anchor: .center) }
+                }
+            }.accessibilityIdentifier("browser-tabs")
+            Button { composerFocused = false; showOverview = true } label: {
+                Text(String(model.cards.count)).font(.system(size: 13, weight: .semibold)).monospacedDigit()
+                    .frame(minWidth: 23, minHeight: 25)
+                    .overlay(RoundedRectangle(cornerRadius: 5).strokeBorder(Ink.text, lineWidth: 1.5))
+                    .frame(width: 44, height: 44)
             }
+            .accessibilityLabel("Conversation overview").accessibilityValue("\(model.cards.count) conversations")
+            .accessibilityIdentifier("tab-overview")
+        }
+        .buttonStyle(.plain).padding(.horizontal, 8).padding(.bottom, 2)
+        .background(Ink.background)
+        .overlay(alignment: .top) { Rectangle().fill(Ink.border.opacity(0.35)).frame(height: 0.5) }
+    }
+
+    private func selectConversation(_ id: String) {
+        composerFocused = false
+        model.select(id)
     }
     private var accountRestoration: some View {
         VStack(spacing: 20) {
@@ -239,292 +208,51 @@ struct InboxView: View {
     }
     private var header: some View {
         HStack(spacing: 8) {
-            Button { setSidebar(true) } label: {
-                Image(systemName: "sidebar.left").font(.system(size: 20)).frame(width: 44, height: 44)
+            Menu {
+                Button { composerFocused = false; showScheduledJobs = true } label: {
+                    Label("Scheduled jobs", systemImage: "clock")
+                }.accessibilityIdentifier("inbox-scheduled-jobs")
+                Button { composerFocused = false; showSettings = true } label: {
+                    Label("Account settings", systemImage: "gearshape")
+                }
+            } label: {
+                Image(systemName: "ellipsis").font(.system(size: 20)).frame(width: 44, height: 44)
                     .background(.regularMaterial, in: Circle())
-            }.accessibilityLabel("Browse agents").accessibilityIdentifier("inbox-sidebar-toggle")
-            ScrollView(.horizontal) { filters }
-                .scrollIndicators(.hidden)
-                .clipShape(Capsule())
+            }.accessibilityLabel("App menu").accessibilityIdentifier("app-menu")
+            VStack(alignment: .leading, spacing: 2) {
+                Text(model.focused?.title ?? "Nanocodex").font(.system(size: 17, weight: .semibold))
+                    .lineLimit(1).accessibilityIdentifier("agent-title")
+                if let card = model.focused {
+                    HStack(spacing: 5) {
+                        Circle().fill(card.isRunning ? Color.green : Ink.muted).frame(width: 5, height: 5)
+                        Text(card.status).font(.caption).foregroundStyle(Ink.muted).lineLimit(1)
+                    }.accessibilityElement(children: .combine)
+                }
+            }.frame(maxWidth: .infinity, alignment: .leading)
             Button { showScreens = true } label: {
                 Image(systemName: "display").frame(width: 44, height: 44)
                     .background(.regularMaterial, in: Circle())
             }.accessibilityLabel("Remote screens").disabled(model.remoteService == nil)
+                .accessibilityIdentifier("conversation-remote-screens")
             ConnectionStatusView(status: model.connection, retry: { model.retryConnection() }, signIn: { showSettings = true })
         }.foregroundStyle(Ink.text).buttonStyle(.plain).frame(height: 44)
             .shadow(color: .black.opacity(0.09), radius: 12, y: 4)
     }
 
-    private var filters: some View {
-        HStack(spacing: 6) {
-            ForEach(InboxModel.Filter.allCases, id: \.self) { filter in
-                Button { model.filter = filter } label: {
-                    HStack(spacing: 5) {
-                        Text(filter.rawValue)
-                        if filter != .all {
-                            Text(String(filter == .inbox ? model.attentionCount : model.runningCount))
-                                .monospacedDigit().opacity(0.7)
-                        }
-                    }.font(.system(size: 14, weight: .medium))
-                        .padding(.horizontal, 11).padding(.vertical, 8)
-                        .frame(minHeight: 44)
-                        .foregroundStyle(model.filter == filter ? Ink.background : Ink.muted)
-                        .background {
-                            if model.filter == filter { Capsule().fill(Ink.accent) }
-                            else { Capsule().fill(.regularMaterial) }
-                        }
-                }.buttonStyle(.plain).accessibilityIdentifier("filter-" + filter.rawValue)
-            }
-        }
-    }
-    private func deck(_ card: AgentCard) -> some View {
-        GeometryReader { _ in
-            ZStack {
-                RoundedRectangle(cornerRadius: 28).fill(Ink.surface.opacity(0.6)).padding(.horizontal, 18).offset(y: 16)
-                RoundedRectangle(cornerRadius: 28).fill(Ink.surface).padding(.horizontal, 9).offset(y: 8)
-                cardFace(card).id(card.id).transition(.identity)
-                    .overlay(alignment: drag > 0 ? .topLeading : .topTrailing) {
-                        if abs(drag) > 24 {
-                            Text(drag > 0 ? "SEEN" : "LATER")
-                                .font(.system(.title2).weight(.semibold))
-                                .padding(12).background(Ink.background, in: RoundedRectangle(cornerRadius: 10))
-                                .foregroundStyle(drag > 0 ? Ink.accent : Ink.amber)
-                                .overlay(RoundedRectangle(cornerRadius: 10).stroke(drag > 0 ? Ink.accent : Ink.amber, lineWidth: 2))
-                                .rotationEffect(.degrees(drag > 0 ? -9 : 9)).padding(24)
-                        }
-                    }
-                    .rotationEffect(.degrees(reduceMotion ? 0 : Double(drag / 28)))
-                    .offset(x: drag)
-                    .simultaneousGesture(DragGesture(minimumDistance: 18, coordinateSpace: .named("agent-card-deck"))
-                        .onChanged { value in
-                            if cardDrag == nil {
-                                if abs(value.translation.width) > abs(value.translation.height) * 1.3 {
-                                    cardDrag = .horizontal
-                                } else if !composerFocused, value.translation.height < 0,
-                                          abs(value.translation.height) > abs(value.translation.width) * 1.3,
-                                          !previewGeometry.isScrollable || !previewGeometry.viewport.contains(value.startLocation)
-                                            || previewGeometry.gestureRegion.contains(value.startLocation) {
-                                    cardDrag = .newAgent
-                                } else {
-                                    cardDrag = .scroll
-                                }
-                            }
-                            if cardDrag == .horizontal { drag = value.translation.width }
-                            if cardDrag == .newAgent { upwardDrag = min(0, value.translation.height) }
-                        }
-                        .onEnded { value in
-                            if cardDrag == .horizontal && (abs(drag) > 65 || (abs(drag) > 24 && abs(value.predictedEndTranslation.width) > 130)) { advance(reviewed: drag > 0) }
-                            // Only the distance at release commits; a quick flick or pulling back cancels.
-                            if cardDrag == .newAgent && -value.translation.height >= newThreadPullThreshold { createAgent() }
-                            cardDrag = nil
-                            withAnimation(reduceMotion ? nil : .snappy(duration: 0.16)) { drag = 0 }
-                            withAnimation(reduceMotion ? nil : .spring(response: 0.35, dampingFraction: 0.75)) { upwardDrag = 0 }
-                        })
-            }
-            .offset(y: newThreadPullOffset)
-            .background(alignment: .bottom) {
-                if upwardDrag < -18 { newThreadPullIndicator.transition(.opacity) }
-            }
-            .coordinateSpace(name: "agent-card-deck")
-            .onPreferenceChange(CardPreviewGeometryKey.self) { previewGeometry = $0 }
-            .onChange(of: newThreadPullReady) { _, ready in
-                if ready { UIImpactFeedbackGenerator(style: .light).impactOccurred() }
-            }
-        }.frame(minHeight: composerFocused ? 0 : 220, maxHeight: .infinity).padding(.bottom, composerFocused ? 12 : 24)
-            .clipped()
-    }
-    private var newThreadPullIndicator: some View {
-        VStack(spacing: 6) {
-            ZStack {
-                Circle().stroke(Ink.accent.opacity(0.12), lineWidth: 2)
-                Circle().trim(from: 0, to: newThreadPullProgress)
-                    .stroke(Ink.accent, style: StrokeStyle(lineWidth: 2, lineCap: .round))
-                    .rotationEffect(.degrees(-90))
-                Image(systemName: "plus").font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(newThreadPullReady ? Ink.background : Ink.muted)
-                    .frame(width: 22, height: 22)
-                    .background(newThreadPullReady ? Ink.accent : Color.clear, in: Circle())
-            }.frame(width: 28, height: 28)
-            Text(newThreadPullReady ? "Release for new thread" : "Pull up for new thread")
-                .font(.caption).foregroundStyle(newThreadPullReady ? Ink.accent : Ink.muted)
-        }
-        .padding(.bottom, 2)
-        .opacity(min(1, max(0, (-upwardDrag - 18) / 40)))
-        .allowsHitTesting(false)
-        .accessibilityElement(children: .combine)
-        .accessibilityIdentifier("new-thread-pull-indicator")
-    }
-    private func cardFace(_ card: AgentCard) -> some View {
-        let rows = model.rows.isEmpty ? card.previewRows : model.rows
-        let latestUser = rows.lastIndex(where: { $0.role == "You" })
-        let pending = model.focusedPending.last
-        let input = pending?.input ?? latestUser.map { rows[$0].text }
-        let images: [AttachmentImageSource?] = pending != nil
-            ? (pending?.attachments ?? []).filter { !$0.isVideo }.map { model.attachmentURL($0).map(AttachmentImageSource.file) }
-            : (latestUser.map { rows[$0].images ?? [] } ?? []).filter { $0.hasPrefix("data:image/") }.map { .inline($0) }
-        let pendingVideos = (pending?.attachments ?? []).filter(\.isVideo)
-        let videos = pending == nil ? (latestUser.map { rows[$0].videos ?? [] } ?? []) : []
-        // Parse complete blocks: taking the tail can discard an opening fence,
-        // heading, or list marker and turn the rest of the reply into plain text.
-        let reply = rows.dropFirst(latestUser.map { $0 + 1 } ?? 0)
-            .last(where: { $0.role == "Agent" && $0.phase != "commentary" && $0.agentID == nil && !$0.text.isEmpty })?.text
-        let waiting = pending?.phase == .failed ? "Message not confirmed" : pending?.phase == .submitting ? "Sending…" : pending != nil ? "Queued" : card.isRunning ? "Working…" : ""
-        let preview = pending != nil ? waiting : reply ?? (input == nil ? card.preview : waiting)
-        return ScrollView {
-                VStack(alignment: .leading, spacing: 12) {
-                    Text(card.title)
-                        .font(.system(size: 17, weight: .semibold))
-                        .fixedSize(horizontal: false, vertical: true).accessibilityIdentifier("agent-title")
-                    if let input {
-                        HStack {
-                            Spacer(minLength: 44)
-                            VStack(alignment: .leading, spacing: 8) {
-                                if !input.isEmpty {
-                                    Text(ContextPrompt.separate(input)?.request ?? input).font(.system(size: 17)).fixedSize(horizontal: false, vertical: true)
-                                        .accessibilityIdentifier("card-user-message")
-                                }
-                                if let image = images.first {
-                                    HStack(spacing: 8) {
-                                        AttachmentImageView(source: image, contentMode: .fit).frame(width: 96, height: 72)
-                                            .accessibilityIdentifier("card-image")
-                                        if images.count > 1 { Text("\(images.count) images").font(.caption).foregroundStyle(Ink.muted) }
-                                    }
-                                }
-                                ForEach(pendingVideos) { attachment in
-                                    AttachmentMovieThumbnail(attachment: attachment, poster: model.attachmentURL(attachment), movie: model.attachmentMovieURL(attachment))
-                                        .frame(width: 200, height: 130)
-                                }
-                                ForEach(videos) { VideoAttachmentView(video: $0, model: model, agentID: card.id) }
-                            }.padding(14).background(Ink.surface, in: RoundedRectangle(cornerRadius: 20))
-                        }
-                    }
-                    Group {
-                        if !waiting.isEmpty, preview == waiting, pending?.phase != .failed {
-                            PulsingText(text: preview)
-                        } else {
-                            ChatMarkdown(text: preview)
-                        }
-                    }
-                    .font(.system(size: 17)).foregroundStyle(Ink.text)
-                    .lineSpacing(3).fixedSize(horizontal: false, vertical: true)
-                    .accessibilityIdentifier("agent-preview")
-                    if pending == nil {
-                        InboxGeneratedOutputView(rows: Array(rows.dropFirst(latestUser.map { $0 + 1 } ?? 0))).equatable()
-                    }
-                    if let error = card.error {
-                        HStack(alignment: .top, spacing: 8) {
-                            Text(error).font(.caption).foregroundStyle(Ink.muted)
-                            Spacer(minLength: 0)
-                            Button("Retry") { Task { await model.refresh() } }
-                                .font(.caption.weight(.medium)).disabled(model.refreshing)
-                                .accessibilityLabel("Retry agent update")
-                        }.accessibilityIdentifier("card-update-error")
-                    }
-                }.frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 18)
-                    .padding(.top, composerFocused ? 18 : 64)
-                    .padding(.bottom, 62)
-                    .background {
-                        GeometryReader { geometry in
-                            Color.clear.preference(key: CardPreviewGeometryKey.self, value: CardPreviewGeometry(contentHeight: geometry.size.height))
-                        }
-                    }
-            }
-            .modifier(CardScrollAnchors(isComposing: composerFocused))
-            .scrollDismissesKeyboard(.interactively)
-            .scrollBounceBehavior(.always, axes: .vertical)
-            .background {
-                GeometryReader { geometry in
-                    let frame = geometry.frame(in: .named("agent-card-deck"))
-                    Color.clear.preference(key: CardPreviewGeometryKey.self, value: CardPreviewGeometry(
-                        viewport: frame,
-                        gestureRegion: CGRect(x: frame.minX, y: frame.maxY - 54, width: frame.width, height: 54)
-                    ))
-                }
-            }
-            .scrollIndicators(.hidden).accessibilityIdentifier("card-content")
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .background(Ink.card, in: RoundedRectangle(cornerRadius: 28))
-        .clipShape(RoundedRectangle(cornerRadius: 28))
-        .overlay(RoundedRectangle(cornerRadius: 28).stroke(Ink.border, lineWidth: 0.75))
-        .accessibilityElement(children: .contain)
-        .onTapGesture { composerFocused = false; model.openThread(); showThread = true }
-        .accessibilityAction(named: "Open thread") { composerFocused = false; model.openThread(); showThread = true }
-        .accessibilityAction(named: "Previous agent") { model.back() }
-        .contextMenu { Button("Previous agent") { model.back() }.disabled(!model.canGoBack) }
-        .accessibilityAction(named: "Next agent, revisit later") { advance(reviewed: false) }
-        .accessibilityAction(named: "Mark update seen") { advance(reviewed: true) }
-        .accessibilityAction(named: "New agent") { createAgent() }
-        .accessibilityIdentifier("agent-card")
-    }
     private var emptyState: some View {
         VStack(spacing: 18) {
             Image(systemName: "tray").font(.system(size: 46, weight: .ultraLight)).foregroundStyle(Ink.accent)
             Text(model.filter == .running ? "Nothing running" : model.filter == .inbox ? "Nothing in your inbox" : "You're caught up").font(.title2.weight(.medium))
-            Text("Start something new, or check all your agents.").font(.subheadline).foregroundStyle(Ink.muted).multilineTextAlignment(.center)
+            Text("Start a conversation with +.").font(.subheadline).foregroundStyle(Ink.muted).multilineTextAlignment(.center)
             Button("New agent") { createAgent() }.buttonStyle(.borderedProminent).foregroundStyle(Ink.background)
-            Button("View all agents") { model.filter = .all }
             Button("Context from other apps") { model.showContext = true }
-        }
-    }
-    private var agentList: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Text("Nanocodex").font(.system(size: 23, weight: .semibold))
-                Spacer()
-            }.frame(height: 44).padding(.leading, 20).padding(.trailing, 8).padding(.top, 4)
-            VStack(spacing: 2) {
-                Button { setSidebar(false); showScheduledJobs = true } label: {
-                    Label("Scheduled jobs", systemImage: "clock")
-                        .frame(maxWidth: .infinity, alignment: .leading).frame(minHeight: 44)
-                }.accessibilityIdentifier("inbox-scheduled-jobs")
-            }.font(.system(size: 16, weight: .medium)).padding(.horizontal, 20).padding(.vertical, 8)
-            List {
-                Section("Agents") {
-                    ForEach(model.cards) { card in
-                        Button { model.select(card.id); setSidebar(false) } label: {
-                            VStack(alignment: .leading, spacing: 6) {
-                                Text(card.title).foregroundStyle(Ink.text)
-                                Text(card.status).font(.caption).foregroundStyle(card.isRunning ? Ink.amber : Ink.muted)
-                            }.frame(maxWidth: .infinity, alignment: .leading).padding(.vertical, 6)
-                        }.listRowBackground(model.focused?.id == card.id ? Ink.surface : Color.clear)
-                            .accessibilityIdentifier("agent-row:\(card.id)")
-                    }
-                }
-            }.listStyle(.plain).scrollContentBackground(.hidden)
-                .contentMargins(.bottom, 88, for: .scrollContent)
-                .accessibilityIdentifier("sidebar-agents")
-        }
-        .overlay(alignment: .bottom) { sidebarActions }
-        .buttonStyle(.plain)
-        .accessibilityElement(children: .contain)
-        .accessibilityIdentifier("inbox-sidebar")
-        .accessibilityAction(.escape) { setSidebar(false) }
-    }
-    private var sidebarActions: some View {
-        HStack(spacing: 12) {
-            Button { createAgent() } label: {
-                Label("New agent", systemImage: "square.and.pencil")
-                    .font(.system(size: 17, weight: .semibold))
-                    .padding(.horizontal, 20).frame(height: 52)
-                    .foregroundStyle(Ink.background)
-                    .background(Ink.accent, in: Capsule())
-            }.keyboardShortcut("n", modifiers: .command).accessibilityIdentifier("sidebar-new-agent")
-            Spacer(minLength: 0)
-            Button { setSidebar(false); showSettings = true } label: {
-                Image(systemName: "gearshape").font(.system(size: 22, weight: .medium))
-                    .frame(width: 52, height: 52)
-                    .background(.regularMaterial, in: Circle())
-            }.accessibilityLabel("Account settings").accessibilityIdentifier("sidebar-settings")
-        }
-        .padding(.horizontal, 20).padding(.bottom, 14)
-        .shadow(color: .black.opacity(0.14), radius: 20, y: 5)
+        }.padding(24).accessibilityElement(children: .contain).accessibilityIdentifier("inbox-empty")
     }
     private var settings: some View {
         Form {
             Section("Account") {
                 Text(model.isDemo ? "Demo · sample agents" : model.connection == "Sign in again" ? "Sign in again to reconnect your account." : "Nanocodex account connected")
-                Text("Agents keep running when you swipe away or close the app.").foregroundStyle(.secondary)
+                Text("Agents keep running when you switch conversations or close the app.").foregroundStyle(.secondary)
                 Button(model.isDemo ? "Connect account" : model.connection == "Sign in again" ? "Sign in again" : "Disconnect account") {
                     do { try model.disconnect(); showSettings = false } catch { model.error = error.localizedDescription }
                 }
@@ -541,54 +269,161 @@ struct InboxView: View {
                 }
             }
             Section("Controls") {
-                Text("Swipe left: revisit later\nSwipe right: mark this update seen\nSwipe up: create a new agent\nTap card: read the conversation\nSend: queue a message\nSteer now: stop the current turn so the queued message can start")
-                Text("Long previews scroll vertically. Pull up from the bottom edge of a card to start a new agent. Release when the indicator fills, or pull back to cancel.").font(.caption)
-                Text("Undo swipe brings the previous agent back and restores its review state. You can undo several swipes in order. ⌘Return sends your message.").font(.caption)
+                Text("Tap a tab below the composer to switch conversations. Use + to start a new conversation, or the count to see all conversations.")
+                Text("The overview shows the latest conversation history. A green border and status dot identify running agents. Drafts and reading positions stay with each conversation.").font(.caption)
+                Text("Scroll up to read earlier messages. Send queues a message; Steer now stops the current turn so the queued message can start. ⌘Return sends your message.").font(.caption)
             }
         }
         .formStyle(.grouped)
         .navigationTitle("Settings")
         .accessibilityIdentifier("inbox-settings")
     }
-    private func advance(reviewed: Bool) {
-        composerFocused = false
-        #if os(iOS)
-        UIImpactFeedbackGenerator(style: .soft).impactOccurred()
-        #endif
-        withAnimation(reduceMotion ? nil : .snappy(duration: 0.18)) { model.advance(reviewed: reviewed); drag = 0 }
-    }
-    private func undoSwipe() {
-        composerFocused = false
-        UIImpactFeedbackGenerator(style: .soft).impactOccurred()
-        withAnimation(reduceMotion ? nil : .snappy(duration: 0.18)) { model.back(); drag = 0 }
-    }
-    private func setSidebar(_ visible: Bool) {
-        composerFocused = false
-        withAnimation(reduceMotion ? nil : .snappy(duration: 0.28)) { showAgents = visible }
-    }
     private func createAgent() {
         composerFocused = false
         #if os(iOS)
         UIImpactFeedbackGenerator(style: .soft).impactOccurred()
         #endif
-        setSidebar(false)
+        showOverview = false
         model.newAgent()
     }
-    private enum CardDrag { case horizontal, newAgent, scroll }
-    private struct CardPreviewGeometry: Equatable {
-        var viewport: CGRect = .zero
-        var gestureRegion: CGRect = .zero
-        var contentHeight: CGFloat = 0
-        var isScrollable: Bool { contentHeight > viewport.height + 1 }
-    }
-    private struct CardPreviewGeometryKey: PreferenceKey {
-        static let defaultValue = CardPreviewGeometry()
-        static func reduce(value: inout CardPreviewGeometry, nextValue: () -> CardPreviewGeometry) {
-            let next = nextValue()
-            if !next.viewport.isEmpty { value.viewport = next.viewport }
-            if !next.gestureRegion.isEmpty { value.gestureRegion = next.gestureRegion }
-            value.contentHeight = max(value.contentHeight, next.contentHeight)
+
+}
+
+private struct ConversationOverview: View {
+    @ObservedObject var model: InboxModel
+    var select: (String) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @State private var query = ""
+    @State private var runningOnly = false
+    private var visibleCards: [AgentCard] {
+        let text = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        return model.tabCards.filter { card in
+            (!runningOnly || card.isRunning) && (text.isEmpty || card.title.localizedCaseInsensitiveContains(text)
+                || card.id.localizedCaseInsensitiveContains(text) || card.preview.localizedCaseInsensitiveContains(text))
         }
+    }
+
+    private func overviewDescription(_ card: AgentCard) -> String {
+        let latest = model.overviewRows(for: card.id).last {
+            ($0.role == "You" || ($0.role == "Agent" && $0.agentID == nil && $0.phase != "commentary")) && !$0.text.isEmpty
+        }
+        let text = latest.map { String((ContextPrompt.separate($0.text)?.request ?? $0.text).suffix(600)) } ?? ""
+        return card.status + (text.isEmpty ? "" : ". " + text)
+    }
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 0) {
+                Picker("Conversations", selection: $runningOnly) {
+                    Text("All").tag(false)
+                    Text("Running").tag(true)
+                }.pickerStyle(.segmented).padding(.horizontal, 16).padding(.top, 8)
+                    .accessibilityIdentifier("overview-filter")
+            ScrollView {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: dynamicTypeSize.isAccessibilitySize ? 280 : 155), spacing: 14)], spacing: 18) {
+                    ForEach(visibleCards) { card in
+                        Button { select(card.id) } label: {
+                            VStack(alignment: .leading, spacing: 9) {
+                                ConversationMiniature(model: model, card: card)
+                                    .frame(height: 230)
+                                    .background(Ink.background)
+                                    .clipShape(RoundedRectangle(cornerRadius: 16))
+                                    .overlay {
+                                        RoundedRectangle(cornerRadius: 16)
+                                            .strokeBorder(card.isRunning ? Color.green : model.focused?.id == card.id ? Ink.text : Ink.border,
+                                                          lineWidth: card.isRunning || model.focused?.id == card.id ? 2 : 0.75)
+                                    }
+                                    .accessibilityIdentifier("overview-preview:" + card.id)
+                                Text(card.title).font(.system(size: 15, weight: .semibold)).lineLimit(2)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                HStack(spacing: 6) {
+                                    Circle().fill(card.isRunning ? Color.green : Ink.muted).frame(width: 6, height: 6)
+                                    Text(card.status)
+                                        .font(.caption).foregroundStyle(Ink.muted).lineLimit(2)
+                                }.accessibilityIdentifier("overview-status:" + card.id)
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityRepresentation {
+                            Button(card.title) { select(card.id) }
+                                .accessibilityValue(overviewDescription(card))
+                                .accessibilityHint("Open conversation")
+                                .accessibilityAddTraits(model.focused?.id == card.id ? [.isSelected] : [])
+                                .accessibilityIdentifier("overview-card:" + card.id)
+                        }
+                        .onAppear { model.setOverviewVisible(card.id, visible: true) }
+                        .onDisappear { model.setOverviewVisible(card.id, visible: false) }
+                    }
+                }.padding(16)
+                if visibleCards.isEmpty {
+                    ContentUnavailableView(model.cards.isEmpty ? "No conversations" : "No matching conversations", systemImage: "bubble.left.and.bubble.right",
+                                           description: Text(model.cards.isEmpty ? "Use + to start a conversation." : "Try another search or show all conversations."))
+                }
+            }.scrollDismissesKeyboard(.interactively).accessibilityIdentifier("conversation-overview")
+            }
+            .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .always), prompt: "Search conversations")
+            .background(Ink.background)
+            .navigationTitle("Conversations (\(model.cards.count))")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button {
+                        model.newAgent()
+                        dismiss()
+                    } label: { Image(systemName: "plus") }
+                    .accessibilityLabel("New conversation").accessibilityIdentifier("new-conversation-overview")
+                }
+                ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } }
+            }
+        }
+        .presentationDetents([.large]).presentationDragIndicator(.visible)
+        .onDisappear { model.stopOverview() }
+    }
+}
+
+private struct ConversationMiniature: View {
+    @ObservedObject var model: InboxModel
+    let card: AgentCard
+    private let scale: CGFloat = 0.48
+
+    var body: some View {
+        GeometryReader { viewport in
+            let rows = model.overviewRows(for: card.id)
+            let items = Array(ConversationItem.group(rows, activeTurns: Set(card.activeTurns)).suffix(16))
+            VStack(alignment: .leading, spacing: 18) {
+                if items.isEmpty {
+                    Text(card.error ?? (card.previewRows.isEmpty ? "Send a message to begin." : "Loading conversation…"))
+                        .font(.system(size: 17)).foregroundStyle(Ink.muted)
+                }
+                ForEach(items) { item in
+                    if let row = item.message {
+                        ConversationMessageView(row: row, model: model, agentID: card.id)
+                    } else {
+                        VStack(alignment: .leading, spacing: 14) {
+                            HStack(spacing: 10) {
+                                Image(systemName: item.isRunning ? "circle.fill" : "checkmark")
+                                    .font(.system(size: 12)).foregroundStyle(item.isRunning ? Color.green : Ink.muted)
+                                Text(item.isRunning ? "Working" : "Activity").font(.system(size: 13, weight: .medium))
+                                Spacer(minLength: 4)
+                                Text("\(item.activity.count) steps").font(.caption)
+                            }.foregroundStyle(Ink.muted).padding(13)
+                                .background(Ink.surface, in: RoundedRectangle(cornerRadius: 14))
+                            InboxGeneratedOutputView(rows: item.activity).equatable()
+                        }
+                    }
+                }
+            }
+            .padding(20)
+            .frame(width: viewport.size.width / scale, alignment: .leading)
+            .fixedSize(horizontal: false, vertical: true)
+            .scaleEffect(scale, anchor: .bottomLeading)
+            .frame(width: viewport.size.width, height: viewport.size.height, alignment: .bottomLeading)
+        }
+        .clipped().allowsHitTesting(false).accessibilityHidden(true)
+        // Preview updates stay steady even while a running transcript grows.
+        .transaction { $0.animation = nil; $0.disablesAnimations = true }
     }
 }
 
@@ -1170,13 +1005,87 @@ private struct ConnectView: View {
     }
 }
 
+private struct ConversationMessageView: View {
+    let row: TranscriptRow
+    @ObservedObject var model: InboxModel
+    let agentID: String
+    var pending: PendingMessage? = nil
+    var body: some View {
+        HStack(alignment: .top, spacing: 0) {
+            if row.role == "You" { Spacer(minLength: 44) }
+            VStack(alignment: .leading, spacing: 10) {
+                if row.role == "Thinking" {
+                    DisclosureGroup {
+                        ChatMarkdown(text: row.text)
+                    } label: {
+                        if row.running { PulsingText(text: "Thinking…") }
+                        else { Text("Thought process") }
+                    }.font(.system(size: 13)).foregroundStyle(Ink.muted)
+                } else if row.role == "You", let content = ContextPrompt.separate(row.text) {
+                    Text(content.request).font(.system(size: 17)).lineSpacing(5).textSelection(.enabled)
+                    DisclosureGroup("Captured context (\(content.captures.count))") {
+                        ForEach(Array(content.captures.enumerated()), id: \.offset) { _, capture in
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(capture.source + (capture.sender.isEmpty ? "" : " · " + capture.sender)).font(.caption.weight(.semibold))
+                                Text(capture.text.isEmpty ? capture.url : capture.text).font(.subheadline).textSelection(.enabled)
+                            }.padding(.vertical, 4)
+                        }
+                    }.font(.caption).foregroundStyle(Ink.muted)
+                } else if row.role == "Agent", !row.text.isEmpty {
+                    ChatMarkdown(text: row.text)
+                    if !row.running { ChatCopyButton(text: row.text).padding(.leading, -8) }
+                } else if !row.text.isEmpty {
+                    Text(row.text).font(.system(size: row.role == "Status" ? 14 : 17))
+                        .lineSpacing(5).textSelection(.enabled)
+                        .foregroundStyle(row.role == "Status" ? Ink.muted : Ink.text)
+                }
+                if let images = row.images {
+                    ForEach(Array(images.filter { $0.hasPrefix("data:image/") }.enumerated()), id: \.offset) { _, image in
+                        AttachmentImageView(source: .inline(image), contentMode: .fit)
+                            .frame(maxWidth: 240).frame(height: 180)
+                            .accessibilityIdentifier("message-image")
+                    }
+                }
+                ForEach(row.videos ?? []) { VideoAttachmentView(video: $0, model: model, agentID: agentID) }
+                if let pending {
+                    ForEach(pending.attachments ?? []) { attachment in
+                        if attachment.isVideo {
+                            AttachmentMovieThumbnail(attachment: attachment, poster: model.attachmentURL(attachment), movie: model.attachmentMovieURL(attachment))
+                                .frame(width: 200, height: 130)
+                        } else if let url = model.attachmentURL(attachment) {
+                            AttachmentImageView(source: .file(url), contentMode: .fit)
+                                .frame(maxWidth: 240).frame(height: 180).accessibilityIdentifier("message-image")
+                        }
+                    }
+                    Text(pending.phase == .cancelling ? "Cancelling…" : "Sending…").font(.caption).foregroundStyle(Ink.muted)
+                }
+            }
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel(row.role == "You" ? "Your message" : row.role == "Agent" ? "Assistant message" : row.role)
+            .padding(row.role == "You" ? 16 : 0)
+            .background(row.role == "You" ? Ink.surface : Color.clear, in: RoundedRectangle(cornerRadius: 24))
+            if row.role != "You" { Spacer(minLength: 0) }
+        }.frame(maxWidth: .infinity, alignment: row.role == "You" ? .trailing : .leading)
+    }
+}
+
+private final class ConversationReadingPositions {
+    struct Position {
+        var atLatest: Bool
+        var rowID: String? = nil
+        var offsetY: CGFloat = 0
+    }
+    var values: [String: Position] = [:]
+}
+
 private struct ConversationView: View {
     private let verticalPadding: CGFloat = 24
     @ObservedObject var model: InboxModel
-    @Environment(\.dismiss) private var dismiss
-    @FocusState private var composerFocused: Bool
-    @State private var showScreens = false
+    @FocusState.Binding var composerFocused: Bool
+    let identity: String
+    let readingPositions: ConversationReadingPositions
     @State private var hasInitialPosition = false
+    @State private var pendingReadingRestore: ConversationReadingPositions.Position?
     @State private var rowFrames: [String: CGRect] = [:]
     @State private var historyRestore: (id: String, anchor: UnitPoint)?
     @State private var historyContent = ConversationContentPosition()
@@ -1185,6 +1094,12 @@ private struct ConversationView: View {
     @State private var historyRequestInFlight = false
     @State private var historyRequestFirstID: String?
     @State private var resizeRestore: [(id: String, y: CGFloat, height: CGFloat)]?
+    private var pendingSubmissions: [PendingMessage] {
+        model.focusedPending.filter { message in
+            message.predecessor.isEmpty && message.phase != .failed
+                && !model.rows.contains { $0.role == "You" && ($0.id == message.id || $0.turnID == message.id) }
+        }
+    }
     private func rememberHistoryPosition(in viewport: GeometryProxy) {
         guard let first = rowFrames.filter({ $0.value.maxY > 0 && $0.value.minY < viewport.size.height })
             .min(by: { $0.value.minY < $1.value.minY }) else { return }
@@ -1192,7 +1107,8 @@ private struct ConversationView: View {
         historyRestore = (first.key, UnitPoint(x: 0, y: abs(available) > 0.5 ? first.value.minY / available : 0))
     }
     private func loadEarlierIfNeeded(in viewport: GeometryProxy) {
-        guard historyReady, historyContent.nearTop, historyRequestAllowed, historyContent.firstID == model.rows.first?.id,
+        guard model.focusedConversationIdentity == identity, pendingReadingRestore == nil,
+              historyReady, historyContent.nearTop, historyRequestAllowed, historyContent.firstID == model.rows.first?.id,
               model.hasOlder, !model.threadLoading, !model.loadingOlder, !historyRequestInFlight else { return }
         historyRequestAllowed = false
         historyRequestInFlight = true
@@ -1200,6 +1116,7 @@ private struct ConversationView: View {
         rememberHistoryPosition(in: viewport)
         Task {
             await model.loadOlder()
+            guard model.focusedConversationIdentity == identity else { return }
             let inserted = model.rows.first?.id != historyRequestFirstID
             if !inserted { historyRestore = nil }
             historyRequestInFlight = false
@@ -1210,11 +1127,12 @@ private struct ConversationView: View {
         }
     }
     private func updateHistoryPosition(in viewport: GeometryProxy) {
-        guard hasInitialPosition, historyContent.isMeasured else { return }
+        guard model.focusedConversationIdentity == identity, hasInitialPosition,
+              pendingReadingRestore == nil, historyContent.isMeasured else { return }
         // Ignore the transient top layout before a newly opened conversation
         // reaches its initial position at the bottom.
         if !historyReady {
-            guard historyContent.atLatest else { return }
+            guard historyContent.atLatest || readingPositions.values[identity]?.atLatest == false else { return }
             historyReady = true
         }
         if !historyContent.nearTop { historyRequestAllowed = true }
@@ -1230,60 +1148,42 @@ private struct ConversationView: View {
             }
             .map { ($0.key, $0.value.minY + frame.minY, $0.value.height) }
     }
+    private func saveReadingPosition(in viewport: GeometryProxy) {
+        guard model.focusedConversationIdentity == identity, hasInitialPosition,
+              pendingReadingRestore == nil, historyReady, historyContent.isMeasured,
+              !historyRequestInFlight else { return }
+        if historyContent.atLatest {
+            readingPositions.values[identity] = .init(atLatest: true)
+        } else if let first = rowFrames.filter({ $0.value.maxY > 0 && $0.value.minY < viewport.size.height })
+            .sorted(by: {
+                let leftFull = $0.value.minY >= 0 && $0.value.maxY <= viewport.size.height
+                let rightFull = $1.value.minY >= 0 && $1.value.maxY <= viewport.size.height
+                return leftFull == rightFull ? $0.value.minY < $1.value.minY : leftFull
+            }).first {
+            // Store a point offset, not a fraction of the current viewport.
+            // The keyboard may still be changing its height when switching tabs.
+            readingPositions.values[identity] = .init(atLatest: false, rowID: first.key, offsetY: first.value.minY)
+        }
+    }
     var body: some View {
-        NavigationStack {
-            ScrollViewReader { scroll in
+        ScrollViewReader { scroll in
             GeometryReader { viewport in
             ZStack(alignment: .top) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
                 LazyVStack(alignment: .leading, spacing: 18) {
                     if model.threadLoading { ProgressView("Loading conversation…") }
+                    if model.rows.isEmpty, pendingSubmissions.isEmpty, !model.threadLoading, model.threadError == nil {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Start a conversation").font(.title2.weight(.medium))
+                            Text("Send a message to begin.").foregroundStyle(Ink.muted)
+                        }.padding(.top, 24).accessibilityElement(children: .contain).accessibilityIdentifier("conversation-empty")
+                    }
                     if let error = model.threadError { Text(error).font(.subheadline).foregroundStyle(Ink.muted) }
                     ForEach(ConversationItem.group(model.rows, activeTurns: Set(model.focused?.activeTurns ?? []))) { item in
                         Group {
                         if let row = item.message {
-                        HStack(alignment: .top, spacing: 0) {
-                            if row.role == "You" { Spacer(minLength: 44) }
-                            VStack(alignment: .leading, spacing: 10) {
-                                if row.role == "Thinking" {
-                                    DisclosureGroup {
-                                        ChatMarkdown(text: row.text)
-                                    } label: {
-                                        if row.running { PulsingText(text: "Thinking…") }
-                                        else { Text("Thought process") }
-                                    }.font(.system(size: 13)).foregroundStyle(Ink.muted)
-                                } else if row.role == "You", let content = ContextPrompt.separate(row.text) {
-                                    Text(content.request).font(.system(size: 17)).lineSpacing(5).textSelection(.enabled)
-                                    DisclosureGroup("Captured context (\(content.captures.count))") {
-                                        ForEach(Array(content.captures.enumerated()), id: \.offset) { _, capture in
-                                            VStack(alignment: .leading, spacing: 4) {
-                                                Text(capture.source + (capture.sender.isEmpty ? "" : " · " + capture.sender)).font(.caption.weight(.semibold))
-                                                Text(capture.text.isEmpty ? capture.url : capture.text).font(.subheadline).textSelection(.enabled)
-                                            }.padding(.vertical, 4)
-                                        }
-                                    }.font(.caption).foregroundStyle(Ink.muted)
-                                } else if row.role == "Agent", !row.text.isEmpty {
-                                    ChatMarkdown(text: row.text)
-                                    if !row.running { ChatCopyButton(text: row.text).padding(.leading, -8) }
-                                } else if !row.text.isEmpty {
-                                    Text(row.text).font(.system(size: row.role == "Status" ? 14 : 17))
-                                        .lineSpacing(5).textSelection(.enabled)
-                                        .foregroundStyle(row.role == "Status" ? Ink.muted : Ink.text)
-                                }
-                                if let images = row.images {
-                                    ForEach(Array(images.filter { $0.hasPrefix("data:image/") }.enumerated()), id: \.offset) { _, image in
-                                        AttachmentImageView(source: .inline(image), contentMode: .fit)
-                                            .frame(maxWidth: 240).frame(height: 180)
-                                            .accessibilityIdentifier("message-image")
-                                    }
-                                }
-                                ForEach(row.videos ?? []) { VideoAttachmentView(video: $0, model: model, agentID: model.focused?.id ?? "") }
-                            }
-                            .padding(row.role == "You" ? 16 : 0)
-                            .background(row.role == "You" ? Ink.surface : Color.clear, in: RoundedRectangle(cornerRadius: 24))
-                            if row.role != "You" { Spacer(minLength: 0) }
-                        }.frame(maxWidth: .infinity, alignment: row.role == "You" ? .trailing : .leading)
+                        ConversationMessageView(row: row, model: model, agentID: model.focused?.id ?? "")
                         } else {
                             VStack(alignment: .leading, spacing: 14) {
                                 ConversationActivityView(item: item)
@@ -1295,7 +1195,13 @@ private struct ConversationView: View {
                                 Color.clear.preference(key: ConversationRowFrames.self, value: [item.id: geometry.frame(in: .named("conversation-viewport"))])
                             })
                             .accessibilityElement(children: .contain)
-                            .accessibilityIdentifier("message-" + item.id)
+                            .accessibilityIdentifier((item.message?.role == "You" ? "message-user-" : item.message?.role == "Agent" ? "message-assistant-" : "message-") + item.id)
+                    }
+                    ForEach(pendingSubmissions) { message in
+                        ConversationMessageView(row: .init(id: message.id, role: "You", text: message.input),
+                                                model: model, agentID: message.agentID, pending: message)
+                            .accessibilityElement(children: .contain)
+                            .accessibilityIdentifier("message-user-pending-" + message.id)
                     }
                 }.scrollTargetLayout()
                     // Keep the bottom target outside the lazy rows so it has a
@@ -1318,12 +1224,25 @@ private struct ConversationView: View {
                             isMeasured: frame.height > 0))
                     })
             }
-            .modifier(ChatScrollAnchors())
+            .modifier(ChatScrollAnchors(initialAnchor: readingPositions.values[identity]?.atLatest == false ? .top : .bottom))
             .scrollDismissesKeyboard(.interactively)
             .scrollBounceBehavior(.always, axes: .vertical)
             .coordinateSpace(name: "conversation-viewport")
             .onPreferenceChange(ConversationRowFrames.self) {
                 rowFrames = $0
+                if let target = pendingReadingRestore, let id = target.rowID, let frame = $0[id] {
+                    if abs(frame.minY - target.offsetY) < 1 {
+                        pendingReadingRestore = nil
+                        historyReady = true
+                    } else {
+                        let available = viewport.size.height - frame.height
+                        if abs(available) > 0.5 {
+                            // Reapply after the lazy stack measures the target row.
+                            scroll.scrollTo(id, anchor: UnitPoint(x: 0, y: target.offsetY / available))
+                        }
+                    }
+                }
+                saveReadingPosition(in: viewport)
                 // Continue following the reader during a slow history request,
                 // until the insertion changes the coordinate space.
                 if historyRequestInFlight, model.rows.first?.id == historyRequestFirstID {
@@ -1333,6 +1252,7 @@ private struct ConversationView: View {
             .onPreferenceChange(ConversationContentFrame.self) { content in
                 historyContent = content
                 updateHistoryPosition(in: viewport)
+                saveReadingPosition(in: viewport)
             }
             .onChange(of: hasInitialPosition) { _, _ in updateHistoryPosition(in: viewport) }
             .onChange(of: model.hasOlder) { _, _ in updateHistoryPosition(in: viewport) }
@@ -1362,7 +1282,11 @@ private struct ConversationView: View {
                     break
                 }
             }
-            .simultaneousGesture(DragGesture(minimumDistance: 1).onChanged { _ in resizeRestore = nil })
+            .simultaneousGesture(DragGesture(minimumDistance: 1).onChanged { _ in
+                resizeRestore = nil
+                pendingReadingRestore = nil
+                if hasInitialPosition { historyReady = true }
+            })
             .background(Ink.background)
             .accessibilityIdentifier("conversation")
             if model.loadingOlder {
@@ -1379,7 +1303,14 @@ private struct ConversationView: View {
                 if !hasInitialPosition, !model.rows.isEmpty {
                     // Position a newly opened conversation once. Later viewport
                     // changes, including the keyboard, retain its top edge.
-                    scroll.scrollTo("latest", anchor: .bottom)
+                    if let saved = readingPositions.values[identity], !saved.atLatest,
+                       let id = saved.rowID,
+                       ConversationItem.group(model.rows).contains(where: { $0.id == id }) {
+                        pendingReadingRestore = saved
+                        scroll.scrollTo(id, anchor: .top)
+                    } else {
+                        scroll.scrollTo("latest", anchor: .bottom)
+                    }
                     hasInitialPosition = true
                     return
                 }
@@ -1392,36 +1323,7 @@ private struct ConversationView: View {
                 }
             }
             }
-            .safeAreaInset(edge: .bottom, spacing: 0) {
-                AgentComposerView(model: model, focused: $composerFocused).frame(maxWidth: 620)
-            }
-            .navigationTitle(model.focused?.title ?? "Conversation")
-            #if os(iOS)
-            .navigationBarTitleDisplayMode(.inline)
-            #endif
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button { composerFocused = false; showScreens = true } label: { Image(systemName: "display") }
-                        .accessibilityLabel("Remote screens").disabled(model.remoteService == nil)
-                        .accessibilityIdentifier("conversation-remote-screens")
-                }
-                ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } }
-            }
-
-        }.foregroundStyle(Ink.text).frame(minWidth: 340)
-            .presentationDetents([.large]).presentationDragIndicator(.visible)
-            // A downward drag while typing belongs to the keyboard, not the sheet.
-            .interactiveDismissDisabled(composerFocused)
-            .sheet(isPresented: $model.showContext) { ContextInboxView(model: model) }
-            .sheet(isPresented: $showScreens) {
-                NavigationStack {
-                    if let service = model.remoteService {
-                        RemoteDashboard(service: service).id(ObjectIdentifier(service))
-                            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { showScreens = false } } }
-                    }
-                }
-            }
-            .onChange(of: model.connected) { _, connected in if !connected { showScreens = false } }
+        .foregroundStyle(Ink.text)
     }
 }
 
@@ -1450,37 +1352,16 @@ private struct InboxGeneratedOutputView: View, Equatable {
     }
 }
 
-private struct CardScrollAnchors: ViewModifier {
-    let isComposing: Bool
-    @State private var hasInteracted = false
-
-    func body(content: Content) -> some View {
-        Group {
-            if #available(iOS 18.0, macOS 15.0, *) {
-                content.modifier(ChatScrollAnchors())
-                    .defaultScrollAnchor(hasInteracted ? .top : .bottom, for: .sizeChanges)
-            } else {
-                content.defaultScrollAnchor(hasInteracted ? .top : .bottom)
-            }
-        }
-        // Card content can arrive after the view first appears. Follow it
-        // until the reader scrolls or starts composing.
-        .simultaneousGesture(DragGesture(minimumDistance: 1).onChanged { _ in hasInteracted = true })
-        .onChange(of: isComposing, initial: true) { _, focused in
-            if focused { hasInteracted = true }
-        }
-    }
-}
-
 private struct ChatScrollAnchors: ViewModifier {
+    var initialAnchor: UnitPoint = .bottom
     func body(content: Content) -> some View {
         if #available(iOS 18.0, macOS 15.0, *) {
             // Lazy Markdown rows can acquire their height after ScrollViewReader's
             // first scrollTo. Let the scroll view place new chats itself,
             // while keyboard and history resizing continue to retain the top edge.
-            content.defaultScrollAnchor(.top).defaultScrollAnchor(.bottom, for: .initialOffset)
+            content.defaultScrollAnchor(.top).defaultScrollAnchor(initialAnchor, for: .initialOffset)
         } else {
-            content.defaultScrollAnchor(.bottom)
+            content.defaultScrollAnchor(initialAnchor)
         }
     }
 }

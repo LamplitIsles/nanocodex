@@ -10,6 +10,10 @@ final class ContextUITests: XCTestCase {
         XCTAssertTrue(app.buttons["add-attachments"].waitForExistence(timeout: 10))
         return app
     }
+    private func assistantText(_ app: XCUIApplication, matching predicate: NSPredicate) -> XCUIElement {
+        app.scrollViews["conversation"].otherElements.matching(NSPredicate(format: "identifier BEGINSWITH %@", "message-assistant-"))
+            .staticTexts.matching(predicate).firstMatch
+    }
     private func openContext(_ app: XCUIApplication) {
         app.buttons["add-attachments"].tap()
         XCTAssertTrue(app.buttons["Context from other apps"].waitForExistence(timeout: 5))
@@ -26,14 +30,13 @@ final class ContextUITests: XCTestCase {
             throw XCTSkip("Requires a signed-in phone and NANOCODEX_CONTEXT_LIVE=1.")
         }
         let app = XCUIApplication(); app.launch()
-        XCTAssertTrue(app.buttons["Browse agents"].waitForExistence(timeout: 30))
+        XCTAssertTrue(app.buttons["tab-overview"].waitForExistence(timeout: 30))
         openContext(app)
         if app.switches["context-enabled"].value as? String != "1" { toggleCapture(app) }
         let message = "museum" + String(UUID().uuidString.lowercased().filter { $0.isLetter }.prefix(10))
         try runCaptureShortcut(app, message: message)
         app.buttons["Done"].tap()
-        app.buttons["Browse agents"].tap()
-        app.buttons["New agent"].tap()
+        app.buttons["new-conversation"].tap()
         let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
             app.staticTexts["agent-title"].label == "New agent"
         }, object: app)
@@ -42,12 +45,12 @@ final class ContextUITests: XCTestCase {
         print("Live message Hand UI conversation title: " + title)
         let composer = app.textFields["composer"]
         composer.tap(); composer.typeText(title); app.buttons["send"].tap()
-        let seeded = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label == %@", "READY"), object: app.staticTexts["agent-preview"])
+        let seeded = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == true"), object: self.assistantText(app, matching: NSPredicate(format: "label == %@", "READY")))
         XCTAssertEqual(XCTWaiter.wait(for: [seeded], timeout: 60), .completed)
         composer.tap()
         composer.typeText("Use my connected iPhone Hand to find the most recently captured message from Shared containing museum. Read it and reply with its complete text only.")
         app.buttons["send"].tap()
-        let answer = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label ==[c] %@", message), object: app.staticTexts["agent-preview"])
+        let answer = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == true"), object: self.assistantText(app, matching: NSPredicate(format: "label ==[c] %@", message)))
         XCTAssertEqual(XCTWaiter.wait(for: [answer], timeout: 120), .completed)
         attach(app, name: "context-live-phone-hand-answer")
     }
@@ -133,7 +136,6 @@ final class ContextUITests: XCTestCase {
         app.buttons["retry-pending"].tap()
         // A restored demo intentionally fails once again, then succeeds.
         if app.buttons["retry-pending"].waitForExistence(timeout: 3) { app.buttons["retry-pending"].tap() }
-        app.staticTexts["agent-title"].tap()
         let conversation = app.scrollViews["conversation"]
         XCTAssertTrue(conversation.staticTexts["Help me plan Friday"].waitForExistence(timeout: 8))
         conversation.buttons["Captured context (1)"].tap()
@@ -226,9 +228,8 @@ final class ContextUITests: XCTestCase {
         }
         let app = XCUIApplication()
         app.launch()
-        XCTAssertTrue(app.buttons["Browse agents"].waitForExistence(timeout: 30))
-        app.buttons["Browse agents"].tap()
-        app.buttons["New agent"].tap()
+        XCTAssertTrue(app.buttons["tab-overview"].waitForExistence(timeout: 30))
+        app.buttons["new-conversation"].tap()
         let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
             app.staticTexts["agent-title"].label == "New agent" && app.textFields["composer"].isEnabled
         }, object: app)
@@ -237,8 +238,8 @@ final class ContextUITests: XCTestCase {
         print("Live context UI conversation title: " + title)
         let composer = app.textFields["composer"]
         composer.tap(); composer.typeText(title); app.buttons["send"].tap()
-        XCTAssertTrue(app.staticTexts["agent-preview"].waitForExistence(timeout: 10))
-        let completed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label == %@", "READY"), object: app.staticTexts["agent-preview"])
+        XCTAssertTrue(app.scrollViews["conversation"].waitForExistence(timeout: 10))
+        let completed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == true"), object: self.assistantText(app, matching: NSPredicate(format: "label == %@", "READY")))
         XCTAssertEqual(XCTWaiter.wait(for: [completed], timeout: 60), .completed)
         openContext(app)
         let toggle = app.switches["context-enabled"]
@@ -250,12 +251,11 @@ final class ContextUITests: XCTestCase {
         composer.typeText("From the captured page, what two criteria can a Message automation match? Reply with the two option names only. Do not use tools.")
         app.buttons["send"].tap()
         let answer = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
-            let text = app.staticTexts["agent-preview"].label.lowercased()
+            let text = app.scrollViews["conversation"].otherElements.matching(NSPredicate(format: "identifier BEGINSWITH %@", "message-assistant-")).staticTexts.allElementsBoundByIndex.map(\.label).joined(separator: "\n").lowercased()
             return text.contains("sender") && text.contains("message contains")
         }, object: app)
         XCTAssertEqual(XCTWaiter.wait(for: [answer], timeout: 90), .completed)
         attach(app, name: "context-live-page-answer")
-        app.staticTexts["agent-title"].tap()
         let disclosure = app.scrollViews["conversation"].buttons["Captured context (1)"]
         XCTAssertTrue(disclosure.waitForExistence(timeout: 10))
         disclosure.tap()

@@ -1,11 +1,11 @@
 # Nanocodex for iPhone and iPad
 
-A native SwiftUI app for iPhone and iPad. One managed agent per card:
-review the latest update, steer its current turn, then move to the next agent.
+A native SwiftUI app for iPhone and iPad. One managed agent per tab:
+review the latest update, steer its current turn, and switch between agents.
 The interface uses ChatGPT-style neutral surfaces, native typography, a rounded
 composer, and right-aligned user message bubbles, with Nanocodex naming and
-the agent card deck, review actions, and live steering controls.
-Appearance follows the system light/dark setting, including cards, the composer,
+agent tabs, a live overview, and steering controls.
+Appearance follows the system light/dark setting, including conversations, the composer,
 and voice controls.
 The native Mac app lives in [`macos/`](../macos/README.md). It owns the tiled
 workspace, agent activity menu bar, and automatic background Mac Hand. This
@@ -22,13 +22,13 @@ HighlightSwift in light and dark mode. Unsupported languages remain readable
 as plain code. Desktop pane
 arrangement, tiling, navigation shortcuts, and per-agent state remain owned by
 the existing workspace.
-Inbox cards use the same renderer as the conversation and preserve the full
-available reply so Markdown blocks are not cut in the middle.
+Each tab opens the full conversation directly. Overview cards render miniature
+transcripts with the same message components and latest available content.
 Unchanged Markdown stays behind an equality boundary, so typing, scrolling, and
 another row's streamed updates do not reparse completed messages. The
 `ChatMarkdownParse` Points of Interest signpost measures actual parsing work.
 
-Generated attachments appear directly in iOS cards and conversations, outside
+Generated attachments appear directly in conversations and their overview previews, outside
 collapsed Activity. Tool text, memory payloads, and command diagnostics stay
 inside Activity; only assistant replies supply conversation text. The shared
 `ChatGeneratedOutput` parser combines raw and structured tool results, including
@@ -106,25 +106,24 @@ Return/Tab/Esc controls below the video.
 
 | Action | Result |
 | --- | --- |
-| Swipe left | Revisit after a new update; keep the agent in All |
-| Swipe right | Mark this update seen and advance |
-| Undo swipe | Restore the previous card and its seen/later state; available even with an empty inbox |
-| Drag down while typing | Interactively dismiss the keyboard in cards and conversations, keeping the current agent and draft |
-| Pull up and release | Fill the new-thread indicator to start an agent; pull back to cancel. Use the bottom edge of the card when the preview is long enough to scroll |
-| Long-press card → Previous agent | Return to the previous agent |
-| Tap card | Read messages, reasoning, and expandable tool details; keep composing while reading history |
-| Plus → Camera / Photos & Videos / Files | Take a photo or attach up to four photos/videos; preview or remove attachments before sending |
+| Tap an agent tab | Switch agents while preserving each agent’s draft and queued messages |
+| Tab bar plus | Open a new agent immediately and start composing |
+| Tab overview | See agents’ latest content and running status; tap a preview to select it |
+| Drag down while typing | Interactively dismiss the keyboard while keeping the current conversation and draft |
+| Scroll a conversation | Read the full history, reasoning, and expandable tool details while keeping the composer available |
+| Attachment plus → Camera / Photos & Videos / Files | Take a photo or attach up to four photos/videos; preview or remove attachments before sending |
 | Send / ⌘Return | Submit one durable follow-up; queue behind current work and dismiss the iPhone/iPad keyboard |
 | Steer now on queued message | Cancel the unfinished turn ahead of it so the follow-up can start |
 | Voice | Start an interactive spoken conversation with this agent; minimize the panel to keep talking |
 | Stop turn | Immediately cancel the selected turn from the send button |
-| Sidebar button | Open the left sidebar to jump to an agent, create one, or open Settings |
-| Sidebar → Scheduled jobs | View active and paused jobs across the account, inspect their schedule, or open the source chat and latest run |
+| Header menu → Account settings | Manage the account and device Hand |
+| Header menu → Scheduled jobs | View active and paused jobs across the account, inspect their schedule, or open the source chat and latest run |
 
-The left sidebar sits behind the inbox, which slides aside as a rounded, raised
-panel. Scheduled jobs stays above agent history; New agent and Settings float
-over its bottom edge. Navigation and filters float over card content so previews
-can scroll through the full space. Scheduled jobs and Settings use full-page
+The bottom dock groups the agent tabs, new-agent plus, overview, and composer.
+The overview replaces the sidebar: search conversations, filter to running agents,
+or select a live preview. The header menu opens Scheduled jobs and Account settings.
+The full conversation scrolls independently; horizontal swipes and upward pulls do not switch
+agents or create conversations. Scheduled jobs and Settings use full-page
 navigation with a Back button. Agent updates refresh automatically without a
 refresh button.
 
@@ -147,19 +146,17 @@ When a schedule read returns 404, one fresh account roster confirms whether the
 agent was deleted during discovery. Only confirmed removals become empty results;
 advertised but unreadable agents and authorization failures retain their warning.
 
-The inbox prioritizes completed/failed updates that have not been seen. Swiped
-cards leave this pass through the inbox until a newer update arrives. Clearing
-the deck shows **Nothing in your inbox**, using the same empty-page layout as
-**Nothing running**. Agents appear after a real update is known; initial reads
-run in the background without loading-placeholder cards. All and Previous
-retain access to those agents.
-Live changes preserve the focused card;
+When no conversation is available, the empty page offers an action to start one.
+The tab overview shows each agent’s latest available content and status.
+Searching or filtering the overview keeps the current conversation selected.
+Live changes preserve the selected tab;
 new work does not steal focus while typing. Drafts belong to agent IDs. Multiple
 active turns get an explicit selector. Navigation never approves tools, stops an
 agent, or deletes history. No approval endpoints are invented by this client.
 
-Only the visible card streams. Other cards refresh with four concurrent reads
-on a 15-second refresh loop. The stream resumes from an exact decimal cursor with
+The selected agent and visible overview previews receive live updates.
+Other agents refresh in the background. Overview observation follows the visible
+previews and stops when the overview closes. The stream resumes from an exact decimal cursor with
 backoff after disconnect. Backgrounding detaches observation; agents continue
 on the service. Foregrounding reloads history and resumes. Active-turn state
 reads cannot overwrite newer streamed events. Changing accounts invalidates old
@@ -517,7 +514,7 @@ xcodebuild -project apple/NanocodexInbox.xcodeproj -scheme NanocodexInbox -desti
 
 The `Apple apps` workflow runs protocol/policy tests, builds the native Mac
 workspace from `macos/` with its background Hand checks, builds the iOS app,
-and drives native iPhone Debug demo journeys covering swipes, per-agent drafts, queue
+and drives native iPhone Debug demo journeys covering tabs, per-agent drafts, queue
 recovery, cancel failures, repeated taps, relaunch, thread continuity, and voice
 sheet dismissal/error handling. It attaches screenshots, simulator video, and the
 full Xcode result as `native-inbox-evidence`. Demo automation does not establish
@@ -536,8 +533,8 @@ sample agents, or mocked service responses.
 until the app responds and separately records saved-account restoration through
 the `RestoreAccount` signpost. OS and filesystem caches remain warm.
 `testPerformanceInboxInteractionJourney` records CPU, memory, and hitch metrics
-(where supported) while scrolling real history, editing local input, reopening
-the conversation, and selecting the agent from the list. Initial account and
+(where supported) while scrolling real history, editing local input, opening and dismissing
+the overview, and finding the agent in the searchable overview. Initial account and
 history loading happen before its measured interval. It restores the original
 draft afterward and never sends or queues the temporary input. XCTest automation
 wall time is not a UI-response latency measurement.
@@ -557,11 +554,13 @@ New conversations open synchronously as local drafts. Creation runs in the backg
 
 Verified on 2026-09-06: seven native UI checks passed, including creation delayed by 10–20 seconds, immediate send, cancellation before admission, draft and keyboard preservation, retry, navigation, and relaunch. The signed-in iPhone journey also passed against the real backend: opening, two turns, history after relaunch, and voice connect/mute/minimize/end.
 
-Conversation scroll targets retain the visible message across prepended history and new output, and new conversations open at the latest messages. Returning to the foreground resumes the existing cursor and transcript rather than clearing the screen. Card drags lock their direction so vertical reading does not become a horizontal swipe; card changes do not crossfade.
+Conversation scroll targets retain the visible message across prepended history and new output, and new conversations open at the latest messages. Returning to the foreground resumes the existing cursor and transcript rather than clearing the screen. Conversation scrolling preserves the selected agent; navigation uses the tab strip and overview.
 
-The conversation keeps the same agent composer fixed above the keyboard while you read older messages. Sending dismisses the iPhone/iPad keyboard; ordinary submissions do not briefly insert a queue panel. Queued follow-ups and delivery errors retain their controls. With an empty draft and a running turn, the send button becomes Stop; adding text or an image restores Send in the same position. Drafts, queued follow-ups, steering, and stop controls are shared with the inbox card, so opening or closing a conversation preserves your work.
+The conversation keeps the same agent composer fixed above the keyboard while you read older messages. Sending dismisses the iPhone/iPad keyboard; ordinary submissions do not briefly insert a queue panel. Their message bubble and local attachments appear immediately with a Sending status until admission replaces them with durable history. Queued follow-ups and delivery errors retain their controls. With an empty draft and a running turn, the send button becomes Stop; adding text or an image restores Send in the same position. Drafts, queued follow-ups, steering, and stop controls belong to the selected agent. Switching tabs or opening the overview preserves that work.
 
-The native Debug demo suite additionally exercises long-thread reading during new output and foregrounding, older-history pagination, vertical card scrolling, repeated fast swipes, new-agent creation and immediate stopping from the send button, the empty inbox, inferred phone country codes, a multi-message queue with the keyboard open, and voice sign-in/draft preservation. Demo agents and injected failures are fixtures; this does not validate an authenticated service or physical microphone.
+Verified on 2026-09-08: focused iPhone/iPad checks cover browser tabs, searchable live previews, the All/Running filter, header-menu navigation, independent drafts, keyboard placement, point-based reading restoration, slow creation, cancellation, and retry. The signed-in iPhone 17 Pro completed a real reply, relaunched, and retained both messages through three round trips to other tabs. InboxCore passed 67 tests with three skips. These tab checks do not establish voice latency or microphone performance.
+
+The native Debug demo suite additionally exercises long-thread reading during new output and foregrounding, older-history pagination, conversation scrolling without swipe navigation, tab switching and draft isolation, live overview updates, plus-button creation and immediate stopping from the send button, the empty inbox, inferred phone country codes, a multi-message queue with the keyboard open, and voice sign-in/draft preservation. Demo agents and injected failures are fixtures; this does not validate an authenticated service or physical microphone.
 
 `VoiceIntegrationTests.testNativeManagedVoiceConnectsAndStops` is an opt-in real
 service journey (`NANOCODEX_VOICE_LIVE=1` and an account `NC_API_KEY`). It creates
