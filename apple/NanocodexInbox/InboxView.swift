@@ -99,6 +99,7 @@ struct InboxView: View {
     }
     private var inboxContent: some View {
         VStack(spacing: 0) {
+            browserTabs
             header.padding(.horizontal, 16).padding(.vertical, 4)
             if let identity = model.focusedConversationIdentity {
                 ConversationView(model: model, composerFocused: $composerFocused,
@@ -126,47 +127,58 @@ struct InboxView: View {
                         composerFocused = false
                     }).frame(maxWidth: 620)
                 }
-                browserTabs
+                browserToolbar
             }.background(Ink.background)
         }
     }
 
     private var browserTabs: some View {
-        HStack(spacing: 4) {
+        ScrollViewReader { scroll in
+            ScrollView(.horizontal) {
+                HStack(spacing: 6) {
+                    ForEach(model.tabCards) { card in
+                        Button { selectConversation(card.id) } label: {
+                            HStack(spacing: 6) {
+                                Circle().fill(card.isRunning ? Color.green : Ink.muted.opacity(0.5))
+                                    .frame(width: 6, height: 6)
+                                Text(card.title).font(.system(size: 13, weight: model.focused?.id == card.id ? .semibold : .regular))
+                                    .lineLimit(1).frame(maxWidth: 130)
+                            }
+                            .padding(.horizontal, 12).frame(height: 36)
+                            .background(model.focused?.id == card.id ? Ink.surface : Color.clear, in: RoundedRectangle(cornerRadius: 12))
+                            .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(model.focused?.id == card.id ? Ink.border : Color.clear))
+                        }
+                        .frame(minHeight: 44).id(card.id)
+                        .accessibilityLabel(card.title)
+                        .accessibilityValue(card.status)
+                        .accessibilityAddTraits(model.focused?.id == card.id ? [.isSelected] : [])
+                        .accessibilityIdentifier("browser-tab:" + card.id)
+                    }
+                }
+            }
+            .scrollIndicators(.hidden)
+            .onChange(of: model.focused?.id, initial: true) { _, id in
+                if let id { scroll.scrollTo(id, anchor: .center) }
+            }
+        }.accessibilityIdentifier("browser-tabs")
+        .buttonStyle(.plain).padding(.horizontal, 8)
+        .background(Ink.background)
+    }
+
+    private var browserToolbar: some View {
+        HStack(spacing: 0) {
+            Button { composerFocused = false; model.back() } label: {
+                Image(systemName: "chevron.left").frame(width: 44, height: 44)
+            }
+            .accessibilityLabel("Back").accessibilityIdentifier("conversation-back")
+            .disabled(!model.canGoBack)
+            Spacer(minLength: 0)
             Button(action: createAgent) {
-                Image(systemName: "plus").font(.system(size: 20, weight: .medium))
-                    .frame(width: 44, height: 44)
+                Image(systemName: "plus").frame(width: 44, height: 44)
             }
             .accessibilityLabel("New conversation").accessibilityIdentifier("new-conversation")
             .keyboardShortcut("n", modifiers: .command)
-            ScrollViewReader { scroll in
-                ScrollView(.horizontal) {
-                    HStack(spacing: 6) {
-                        ForEach(model.tabCards) { card in
-                            Button { selectConversation(card.id) } label: {
-                                HStack(spacing: 6) {
-                                    Circle().fill(card.isRunning ? Color.green : Ink.muted.opacity(0.5))
-                                        .frame(width: 6, height: 6)
-                                    Text(card.title).font(.system(size: 13, weight: model.focused?.id == card.id ? .semibold : .regular))
-                                        .lineLimit(1).frame(maxWidth: 130)
-                                }
-                                .padding(.horizontal, 12).frame(height: 36)
-                                .background(model.focused?.id == card.id ? Ink.surface : Color.clear, in: RoundedRectangle(cornerRadius: 12))
-                                .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(model.focused?.id == card.id ? Ink.border : Color.clear))
-                            }
-                            .frame(minHeight: 44).id(card.id)
-                            .accessibilityLabel(card.title)
-                            .accessibilityValue(card.status)
-                            .accessibilityAddTraits(model.focused?.id == card.id ? [.isSelected] : [])
-                            .accessibilityIdentifier("browser-tab:" + card.id)
-                        }
-                    }
-                }
-                .scrollIndicators(.hidden)
-                .onChange(of: model.focused?.id, initial: true) { _, id in
-                    if let id { scroll.scrollTo(id, anchor: .center) }
-                }
-            }.accessibilityIdentifier("browser-tabs")
+            Spacer(minLength: 0)
             Button { composerFocused = false; showOverview = true } label: {
                 Text(String(model.cards.count)).font(.system(size: 13, weight: .semibold)).monospacedDigit()
                     .frame(minWidth: 23, minHeight: 25)
@@ -175,9 +187,27 @@ struct InboxView: View {
             }
             .accessibilityLabel("Conversation overview").accessibilityValue("\(model.cards.count) conversations")
             .accessibilityIdentifier("tab-overview")
+            Spacer(minLength: 0)
+            Button { composerFocused = false; showScreens = true } label: {
+                Image(systemName: "display").frame(width: 44, height: 44)
+            }
+            .accessibilityLabel("Remote screens").disabled(model.remoteService == nil)
+            .accessibilityIdentifier("conversation-remote-screens")
+            Spacer(minLength: 0)
+            Menu {
+                Button { composerFocused = false; showScheduledJobs = true } label: {
+                    Label("Scheduled jobs", systemImage: "clock")
+                }.accessibilityIdentifier("inbox-scheduled-jobs")
+                Button { composerFocused = false; showSettings = true } label: {
+                    Label("Account settings", systemImage: "gearshape")
+                }
+            } label: {
+                Image(systemName: "ellipsis").frame(width: 44, height: 44)
+            }.accessibilityLabel("App menu").accessibilityIdentifier("app-menu")
         }
-        .buttonStyle(.plain).padding(.horizontal, 8).padding(.bottom, 2)
-        .background(Ink.background)
+        .font(.system(size: 20, weight: .medium)).buttonStyle(.plain)
+        .padding(.horizontal, 16).padding(.bottom, 2).frame(maxWidth: 620)
+        .frame(maxWidth: .infinity).background(Ink.background)
         .overlay(alignment: .top) { Rectangle().fill(Ink.border.opacity(0.35)).frame(height: 0.5) }
     }
 
@@ -208,17 +238,6 @@ struct InboxView: View {
     }
     private var header: some View {
         HStack(spacing: 8) {
-            Menu {
-                Button { composerFocused = false; showScheduledJobs = true } label: {
-                    Label("Scheduled jobs", systemImage: "clock")
-                }.accessibilityIdentifier("inbox-scheduled-jobs")
-                Button { composerFocused = false; showSettings = true } label: {
-                    Label("Account settings", systemImage: "gearshape")
-                }
-            } label: {
-                Image(systemName: "ellipsis").font(.system(size: 20)).frame(width: 44, height: 44)
-                    .background(.regularMaterial, in: Circle())
-            }.accessibilityLabel("App menu").accessibilityIdentifier("app-menu")
             VStack(alignment: .leading, spacing: 2) {
                 Text(model.focused?.title ?? "Nanocodex").font(.system(size: 17, weight: .semibold))
                     .lineLimit(1).accessibilityIdentifier("agent-title")
@@ -229,11 +248,6 @@ struct InboxView: View {
                     }.accessibilityElement(children: .combine)
                 }
             }.frame(maxWidth: .infinity, alignment: .leading)
-            Button { showScreens = true } label: {
-                Image(systemName: "display").frame(width: 44, height: 44)
-                    .background(.regularMaterial, in: Circle())
-            }.accessibilityLabel("Remote screens").disabled(model.remoteService == nil)
-                .accessibilityIdentifier("conversation-remote-screens")
             ConnectionStatusView(status: model.connection, retry: { model.retryConnection() }, signIn: { showSettings = true })
         }.foregroundStyle(Ink.text).buttonStyle(.plain).frame(height: 44)
             .shadow(color: .black.opacity(0.09), radius: 12, y: 4)
@@ -269,7 +283,7 @@ struct InboxView: View {
                 }
             }
             Section("Controls") {
-                Text("Tap a tab below the composer to switch conversations. Use + to start a new conversation, or the count to see all conversations.")
+                Text("Tap a tab at the top to switch conversations. The bottom bar has Back, + for a new conversation, the conversation overview, Remote screens, and the app menu.")
                 Text("The overview shows the latest conversation history. A green border and status dot identify running agents. Drafts and reading positions stay with each conversation.").font(.caption)
                 Text("Scroll up to read earlier messages. Send queues a message; Steer now stops the current turn so the queued message can start. ⌘Return sends your message.").font(.caption)
             }
@@ -298,7 +312,7 @@ private struct ConversationOverview: View {
     @State private var runningOnly = false
     private var visibleCards: [AgentCard] {
         let text = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        return model.tabCards.filter { card in
+        return model.cards.sorted(by: AgentCard.mostRecentFirst).filter { card in
             (!runningOnly || card.isRunning) && (text.isEmpty || card.title.localizedCaseInsensitiveContains(text)
                 || card.id.localizedCaseInsensitiveContains(text) || card.preview.localizedCaseInsensitiveContains(text))
         }

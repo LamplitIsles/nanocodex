@@ -1105,7 +1105,14 @@ final class InboxUITests: XCTestCase {
         for direction in 0..<2 {
             for _ in 0..<5 {
                 if tab.isHittable { break }
-                if direction == 0 { strip.swipeLeft() } else { strip.swipeRight() }
+                // The top scroll view includes the status-bar safe area. Swipe
+                // through the visible tab row, not its covered geometric center.
+                let y = tab.frame.midY - strip.frame.minY
+                let start = strip.coordinate(withNormalizedOffset: CGVector(dx: direction == 0 ? 0.85 : 0.15, dy: 0))
+                    .withOffset(CGVector(dx: 0, dy: y))
+                let end = strip.coordinate(withNormalizedOffset: CGVector(dx: direction == 0 ? 0.15 : 0.85, dy: 0))
+                    .withOffset(CGVector(dx: 0, dy: y))
+                start.press(forDuration: 0.05, thenDragTo: end)
             }
             if tab.isHittable { break }
         }
@@ -1845,7 +1852,8 @@ final class InboxUITests: XCTestCase {
             XCTAssertTrue(other.waitForExistence(timeout: 5))
             other.tap()
             XCTAssertFalse(app.buttons["browser-tab:" + originalID].isSelected)
-            selectAgentFromOverview(app, title: original, id: originalID)
+            XCTAssertTrue(app.buttons["conversation-back"].isEnabled)
+            app.buttons["conversation-back"].tap()
             XCTAssertTrue(app.buttons["browser-tab:" + originalID].isSelected)
             XCTAssertEqual(latestUserText(app).label, originalInput)
             XCTAssertTrue(self.assistantText(app, matching: NSPredicate(format: "label CONTAINS %@", "TAB_CACHE_OK")).exists)
@@ -1888,6 +1896,39 @@ final class InboxUITests: XCTestCase {
         }
         XCTAssertTrue(app.buttons["new-conversation"].isHittable)
         capture(app, "upward-pulls-do-not-create-agents")
+    }
+
+    func testBrowserBackRestoresDraftAndOverviewUsesLatestActivity() {
+        let app = launch(["NANOCODEX_DEMO_PROFILE": UUID().uuidString])
+        selectTab(app, id: "durability", title: "Make long sessions bulletproof")
+        composer(app).tap(); composer(app).typeText("Retain my draft when going back")
+        selectTab(app, id: "hands", title: "Reconnect the browser Hand")
+        let back = app.buttons["conversation-back"]
+        XCTAssertTrue(back.isEnabled)
+        let controls = ["conversation-back", "new-conversation", "tab-overview", "conversation-remote-screens", "app-menu"].map { app.buttons[$0] }
+        for (left, right) in zip(controls, controls.dropFirst()) {
+            XCTAssertLessThan(left.frame.maxX, right.frame.minX)
+            XCTAssertEqual(left.frame.midY, right.frame.midY, accuracy: 1)
+        }
+        XCTAssertLessThan(app.scrollViews["browser-tabs"].frame.maxY, app.scrollViews["conversation"].frame.minY)
+        back.tap()
+        XCTAssertEqual(app.staticTexts["agent-title"].label, "Make long sessions bulletproof")
+        XCTAssertEqual(composer(app).value as? String, "Retain my draft when going back")
+        app.buttons["new-conversation"].tap()
+        XCTAssertEqual(app.staticTexts["agent-title"].label, "New agent")
+        back.tap()
+        XCTAssertEqual(app.staticTexts["agent-title"].label, "Make long sessions bulletproof")
+        XCTAssertEqual(composer(app).value as? String, "Retain my draft when going back")
+        selectTab(app, id: "hands", title: "Reconnect the browser Hand")
+        queue(app, "Make this older conversation recent")
+        XCTAssertTrue(app.buttons["Stop turn"].waitForExistence(timeout: 5))
+        app.buttons["tab-overview"].tap()
+        let cards = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@", "overview-card:"))
+        XCTAssertTrue(cards.firstMatch.waitForExistence(timeout: 5))
+        XCTAssertEqual(cards.element(boundBy: 0).identifier, "overview-card:hands")
+        capture(app, "overview-sorted-by-latest-activity")
+        app.buttons["Done"].tap()
+        capture(app, "top-tabs-bottom-browser-controls")
     }
 
     func testPlusCreatesAgentAndMenuKeepsNavigationAccessible() {

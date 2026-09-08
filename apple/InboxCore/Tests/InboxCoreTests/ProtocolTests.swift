@@ -67,6 +67,25 @@ final class ProtocolTests: XCTestCase {
         XCTAssertEqual(frames[0].event?.data["final_message"].string, "Έτοιμο 👋")
         XCTAssertEqual(frames[0].payloadBytes, #"{"type":"turn_completed","final_message":"Έτοιμο 👋"}"#.utf8.count)
     }
+    func testRecentConversationOrderUsesDurableActivityAndIgnoresStaleReplay() throws {
+        var old = AgentCard(id: "old", title: "Older conversation", updatedAt: 1000)
+        var recent = AgentCard(id: "recent", title: "Recent conversation", updatedAt: 2000)
+        recent.activeTurns = ["running"]
+        func order() -> [String] { [old, recent].sorted(by: AgentCard.mostRecentFirst).map(\.id) }
+        XCTAssertEqual(order(), ["recent", "old"])
+        old.apply(events: [try event("20", "turn_accepted", ["created_at": .number(3000), "input": .string("Use this again")])])
+        XCTAssertEqual(order(), ["old", "recent"])
+        recent.apply(events: [try event("9", "turn_completed", ["created_at": .number(4000), "final_message": .string("New reply")])])
+        XCTAssertEqual(order(), ["recent", "old"], "Activity timestamps, not per-agent cursors or running status, determine recency")
+        recent.apply(events: [try event("1", "turn_accepted", ["created_at": .number(500)])])
+        recent.apply(events: [try event("10", "turn_completed")])
+        recent.apply(events: [try event("11", "turn_completed", ["created_at": .number(-1)])])
+        XCTAssertEqual(recent.updatedAt, 4000)
+        XCTAssertEqual(order(), ["recent", "old"])
+        old.updatedAt = 4000
+        XCTAssertEqual(order(), ["old", "recent"], "Equal timestamps have a deterministic order")
+    }
+
     func testStaleHistoryCannotReplaceLatestPreview() throws {
         var card = AgentCard(id: "agent", title: "Test")
         card.apply(events: [try event("20", "turn_completed", ["final_message": .string("New")])])

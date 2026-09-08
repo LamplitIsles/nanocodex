@@ -116,12 +116,14 @@ Return/Tab/Esc controls below the video.
 | Steer now on queued message | Cancel the unfinished turn ahead of it so the follow-up can start |
 | Voice | Start an interactive spoken conversation with this agent; minimize the panel to keep talking |
 | Stop turn | Immediately cancel the selected turn from the send button |
-| Header menu → Account settings | Manage the account and device Hand |
-| Header menu → Scheduled jobs | View active and paused jobs across the account, inspect their schedule, or open the source chat and latest run |
+| Bottom menu → Account settings | Manage the account and device Hand |
+| Bottom menu → Scheduled jobs | View active and paused jobs across the account, inspect their schedule, or open the source chat and latest run |
 
-The bottom dock groups the agent tabs, new-agent plus, overview, and composer.
+Conversation tabs sit at the top. Below the composer, the bottom bar groups Back,
+new-agent plus, overview, Remote screens, and the rightmost app menu. Back returns
+to the previous conversation, retaining its draft and reading position.
 The overview replaces the sidebar: search conversations, filter to running agents,
-or select a live preview. The header menu opens Scheduled jobs and Account settings.
+or select a live preview. The app menu opens Scheduled jobs and Account settings.
 The full conversation scrolls independently; horizontal swipes and upward pulls do not switch
 agents or create conversations. Scheduled jobs and Settings use full-page
 navigation with a Back button. Agent updates refresh automatically without a
@@ -147,7 +149,10 @@ agent was deleted during discovery. Only confirmed removals become empty results
 advertised but unreadable agents and authorization failures retain their warning.
 
 When no conversation is available, the empty page offers an action to start one.
-The tab overview shows each agent’s latest available content and status.
+The tab overview shows each agent’s latest available content and status, sorted
+by most recent activity first. Live event timestamps advance that ordering;
+replayed history and stale account snapshots cannot move a conversation backward.
+The top tab strip retains its order while replies arrive.
 Searching or filtering the overview keeps the current conversation selected.
 Live changes preserve the selected tab;
 new work does not steal focus while typing. Drafts belong to agent IDs. Multiple
@@ -558,7 +563,7 @@ Conversation scroll targets retain the visible message across prepended history 
 
 The conversation keeps the same agent composer fixed above the keyboard while you read older messages. Sending dismisses the iPhone/iPad keyboard; ordinary submissions do not briefly insert a queue panel. Their message bubble and local attachments appear immediately with a Sending status until admission replaces them with durable history. Queued follow-ups and delivery errors retain their controls. With an empty draft and a running turn, the send button becomes Stop; adding text or an image restores Send in the same position. Drafts, queued follow-ups, steering, and stop controls belong to the selected agent. Switching tabs or opening the overview preserves that work.
 
-Verified on 2026-09-08: focused iPhone/iPad checks cover browser tabs, searchable live previews, the All/Running filter, header-menu navigation, independent drafts, keyboard placement, point-based reading restoration, slow creation, cancellation, and retry. The signed-in iPhone 17 Pro completed a real reply, relaunched, and retained both messages through three round trips to other tabs. InboxCore passed 67 tests with three skips. These tab checks do not establish voice latency or microphone performance.
+Verified on 2026-09-08: focused iPhone/iPad checks cover browser tabs, searchable live previews, the All/Running filter, app-menu navigation, independent drafts, keyboard placement, point-based reading restoration, slow creation, cancellation, and retry. The signed-in iPhone 17 Pro completed a real reply, relaunched, and retained both messages through three round trips to other tabs. InboxCore passed 68 tests with three skips. The top tab strip, bottom Back/+/overview/screens/menu bar, Back draft restoration, and activity-sorted overview were checked in iPhone and iPad simulators. These tab checks do not establish voice latency or microphone performance.
 
 The native Debug demo suite additionally exercises long-thread reading during new output and foregrounding, older-history pagination, conversation scrolling without swipe navigation, tab switching and draft isolation, live overview updates, plus-button creation and immediate stopping from the send button, the empty inbox, inferred phone country codes, a multi-message queue with the keyboard open, and voice sign-in/draft preservation. Demo agents and injected failures are fixtures; this does not validate an authenticated service or physical microphone.
 

@@ -203,7 +203,7 @@ final class InboxModel: ObservableObject {
         }
     }
     func closeThread() { pinnedThreadID = nil; reconcile() }
-    var canGoBack: Bool { navigation.contains { previous in cards.contains { $0.id == previous.id } } }
+    var canGoBack: Bool { navigation.contains { previous in previous.id != focused?.id && cards.contains { $0.id == previous.id } } }
     var canRetry: Bool { focused.flatMap { retries[$0.id] }?.kind == .followUp }
     var draft: String {
         get { focused.flatMap { drafts[$0.id] } ?? "" }
@@ -696,7 +696,7 @@ final class InboxModel: ObservableObject {
             let created = cards.filter { unlistedAgents.contains($0.id) || pendingCreations.contains($0.id) }
             let merged = listing.map { summary in
                 var card = retained[summary.id] ?? summary
-                card.title = summary.title; card.updatedAt = summary.updatedAt; card.turnCount = summary.turnCount
+                card.title = summary.title; card.updatedAt = max(card.updatedAt, summary.updatedAt); card.turnCount = summary.turnCount
                 card.mayHaveScheduledJobs = summary.mayHaveScheduledJobs
                 return card
             } + created
@@ -818,10 +818,11 @@ final class InboxModel: ObservableObject {
     }
     func back() {
         while let previous = navigation.popLast() {
-            guard cards.contains(where: { $0.id == previous.id }) else { continue }
+            guard previous.id != focused?.id, cards.contains(where: { $0.id == previous.id }) else { continue }
+            pinnedThreadID = previous.id
             seen[previous.id] = previous.seen; deferred[previous.id] = previous.deferred
             persist(); filter = previous.filter
-            // A running agent may have finished since the swipe. Still bring it back.
+            // A running agent may have finished since the last visit. Still bring it back.
             if !deck.order.contains(previous.id) { filter = .all }
             deck.focus(previous.id); observeFocused()
             return
@@ -926,6 +927,10 @@ final class InboxModel: ObservableObject {
 
     func select(_ id: String) {
         guard cards.contains(where: { $0.id == id }) else { return }
+        if let card = focused, card.id != id {
+            navigation.append((card.id, seen[card.id], deferred[card.id], filter))
+            if navigation.count > 50 { navigation.removeFirst() }
+        }
         pinnedThreadID = id
         filter = .all; deck.focus(id); observeFocused()
     }
@@ -1583,6 +1588,7 @@ final class InboxModel: ObservableObject {
         let waiting = !message.predecessor.isEmpty && cards[index].activeTurns.contains(message.predecessor)
         if !cards[index].activeTurns.contains(message.id) { cards[index].activeTurns.append(message.id) }
         cards[index].status = "Running"
+        cards[index].updatedAt = Date().timeIntervalSince1970 * 1000
         var history = demoRows[message.agentID] ?? DemoContent.rows(message.agentID)
         if !history.contains(where: { $0.id == message.id }) { history.append(.init(id: message.id, role: "You", text: message.input)) }
         demoRows[message.agentID] = history
@@ -1602,6 +1608,7 @@ final class InboxModel: ObservableObject {
     private func demoFinish(agentID: String, turnID: String) {
         guard let index = cards.firstIndex(where: { $0.id == agentID }) else { return }
         cards[index].activeTurns.removeAll { $0 == turnID }
+        cards[index].updatedAt = Date().timeIntervalSince1970 * 1000
         // Cancelling a queued item must not start its successor while an older
         // turn is still running. Rebase the successor onto that older turn.
         let wasQueued = pending.contains { $0.agentID == agentID && $0.id == turnID }

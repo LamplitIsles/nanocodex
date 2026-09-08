@@ -23,6 +23,10 @@ public struct AgentCard: Identifiable, Equatable, Sendable {
         self.id = id; self.title = title; self.updatedAt = updatedAt; self.turnCount = turnCount
         self.mayHaveScheduledJobs = mayHaveScheduledJobs
     }
+    /// Historical conversations follow server activity, with a stable tie break.
+    public static func mostRecentFirst(_ lhs: Self, _ rhs: Self) -> Bool {
+        lhs.updatedAt != rhs.updatedAt ? lhs.updatedAt > rhs.updatedAt : lhs.id < rhs.id
+    }
     public var isRunning: Bool { !activeTurns.isEmpty }
     public func needsAttention(seen: Cursor?) -> Bool {
         checked && !isRunning && latestCursor > (seen ?? .zero) && (status == "Ready" || status == "Failed")
@@ -46,6 +50,10 @@ public struct AgentCard: Identifiable, Equatable, Sendable {
     }
     public mutating func apply(events: [AgentEvent], transcriptRows: [TranscriptRow]? = nil) {
         for event in events {
+            // Replayed history must not become recent merely because it was read.
+            if case .number(let time) = event.data["created_at"], time.isFinite, time >= 0 {
+                updatedAt = max(updatedAt, time)
+            }
             latestCursor = max(latestCursor, event.cursor)
             // A state read may already include these events. It owns active-turn
             // membership until the replay catches up to that read's cursor.
