@@ -55,6 +55,24 @@ jobs:
         env:
           ARCH: ${{ matrix.arch }}
         run: bash hands/remote/image/smoke.sh "$IMAGE:$IMAGE_TAG-$ARCH" "$ARCH"
+      # A native smoke can hide a binary specialized for the build runner's CPU.
+      # User-mode QEMU masks extensions; no privileged binfmt registration needed.
+      - name: Verify capture startup on a baseline CPU
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-user-static
+          case "$ARCH" in
+            amd64) emulator=/usr/bin/qemu-x86_64-static; cpu=qemu64 ;;
+            arm64) emulator=/usr/bin/qemu-aarch64-static; cpu=cortex-a53 ;;
+          esac
+          container="nanocodex-hand-cpu-$ARCH"
+          trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
+          timeout 20s docker run --rm --name "$container" --network none --ulimit core=0:0 --env "QEMU_CPU=$cpu" \
+            --mount "type=bind,src=$emulator,dst=/usr/local/bin/qemu-baseline,readonly" \
+            --entrypoint /usr/local/bin/qemu-baseline "$IMAGE:$IMAGE_TAG-$ARCH" \
+            /usr/local/bin/waymote-streamd --help
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         if: inputs.publish
         with:

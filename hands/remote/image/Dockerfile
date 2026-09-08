@@ -13,7 +13,9 @@ WORKDIR /src/waymote
 RUN git init && git remote add origin https://github.com/rockorager/waymote.git \
     && git fetch --depth=1 origin 69f585e6a1dfb84a3ac8135f1a0536aa9d75f6c5 \
     && git checkout --detach FETCH_HEAD
-RUN /opt/zig/zig build -Doptimize=ReleaseFast
+# Distributable images must not inherit the CI runner's CPU extensions (for
+# example ARM LSE/SVE unavailable on some supported deployment machines).
+RUN /opt/zig/zig build -Dcpu=baseline -Doptimize=ReleaseFast
 
 FROM golang:1.26.5-trixie AS remote
 WORKDIR /src/remote

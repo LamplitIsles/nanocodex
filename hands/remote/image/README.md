@@ -6,6 +6,11 @@ the build does not depend on Rosetta or QEMU. Each image must start a non-root
 headless desktop, capture and decode a JPEG, and encode and decode H.264 before
 publication. The smoke container has no network and is removed on exit.
 
+Waymote is compiled for the baseline CPU of each architecture. Before registry
+login, a bounded user-mode QEMU check also starts it with `qemu64` or `cortex-a53`
+CPU features. Native encoder tests alone can pass on a CI runner while producing
+a binary that crashes with an illegal instruction on another deployment CPU.
+
 After the workflow is on master, validate both architectures without publishing:
 
 ```sh
@@ -51,6 +56,16 @@ classic image store cannot retain both architectures under one index digest.
 The explicit empty registry entry prevents credential-helper fallback during
 anonymous verification. Production still uses the combined manifest digest;
 Docker selects the server's architecture when it pulls that reference.
+
+On the ARM64 deployment host, also execute the pulled capture binary before
+changing the production pin; a successful image download does not prove that
+its executable is compatible with that host's CPU:
+
+```sh
+arm64_child=$(cat /tmp/nanocodex-hand-release/digests/digest-arm64.txt)
+docker run --rm --network none --ulimit core=0:0 --platform linux/arm64 \
+  --entrypoint /usr/local/bin/waymote-streamd "$arm64_child" --help
+```
 
 Set `NANOCODEX_HAND_IMAGE` in the production `vars` of
 `js/managed/wrangler.jsonc` to the exact `ghcr.io/gakonst/nanocodex-hand@sha256:...`
