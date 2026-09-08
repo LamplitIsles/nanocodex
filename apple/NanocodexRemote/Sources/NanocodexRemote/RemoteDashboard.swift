@@ -18,6 +18,7 @@ public struct RemoteDashboard: View {
     @StateObject private var viewer = RemoteViewer()
     @Environment(\.scenePhase) private var scenePhase
     @State private var hands: [RemoteHand] = []
+    @State private var discoveryLoaded = false
     @State private var error: String?
     @State private var discoveryError: String?
     @State private var text = ""
@@ -98,7 +99,10 @@ public struct RemoteDashboard: View {
                 }
             } else {
                 HStack { Text("Screens").font(.title2.bold()); Spacer(); Button("Refresh") { Task { await refresh() } } }
-                if hands.isEmpty {
+                if !discoveryLoaded {
+                    ProgressView("Loading remote screens…")
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if hands.isEmpty {
                     ContentUnavailableView("No screens available", systemImage: "display", description: Text("VM desktops appear here when ready. To view a Mac, start screen sharing on that Mac."))
                 } else {
                     List(hands, id: \.identity) { hand in
@@ -139,7 +143,7 @@ public struct RemoteDashboard: View {
                             }
                         }
                     }
-                    Button("Stop sharing") { Task { await host.stop(); await refresh() } }
+                    Button("Stop sharing") { Task { await host.stopSharing(); await refresh() } }
                 } else {
                     if displays.isEmpty {
                         Button("Choose a screen to share…") { Task { await chooseScreen() } }
@@ -212,8 +216,8 @@ public struct RemoteDashboard: View {
         }
     }
     private func refresh() async {
-        do { let values = try await service.list(); guard !Task.isCancelled else { return }; hands = values; discoveryError = nil }
-        catch { if !Task.isCancelled { discoveryError = error.localizedDescription } }
+        do { let values = try await service.list(); guard !Task.isCancelled else { return }; hands = values; discoveryError = nil; discoveryLoaded = true }
+        catch { if !Task.isCancelled { discoveryError = error.localizedDescription; discoveryLoaded = true } }
     }
     private func key(_ code: UInt16) { for down in [true, false] { viewer.input(kind: .key, down: down, key: code) } }
     private func sendText() { guard !text.isEmpty, text.utf8.count <= 4096 else { return }; viewer.input(kind: .text, text: text); text = "" }
@@ -252,7 +256,7 @@ public struct RemoteSharingIndicator: View {
         if host.sharing || host.reconnecting || phoneHost.sharing {
             HStack(spacing: 8) {
                 Label(host.reconnecting ? "Screen sharing reconnecting…" : "Screen sharing active", systemImage: "record.circle").foregroundStyle(.red)
-                Button("Stop sharing") { Task { await host.stop(); await phoneHost.stop() } }
+                Button("Stop sharing") { Task { await host.stopSharing(); await phoneHost.stop() } }
                     .accessibilityLabel("Stop sharing")
                     .accessibilityIdentifier("remote-stop-sharing")
                     .help("Stop sharing this Mac and any paired iPhone")

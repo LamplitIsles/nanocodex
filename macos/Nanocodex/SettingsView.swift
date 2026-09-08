@@ -1,4 +1,5 @@
 import SwiftUI
+import NanocodexRemote
 
 struct SettingsView: View {
     @EnvironmentObject private var model: AppModel
@@ -26,8 +27,11 @@ struct SettingsView: View {
                     }
                 }
                 Section("Background Hands") {
+                    LaunchAtLoginSettings(launch: model.launchAtLogin)
                     Toggle("Make this Mac available as a Hand", isOn: Binding(get: { model.state.defaultHandEnabled != false }, set: { enabled in Task { await model.setDeviceHandEnabled(enabled) } }))
                         .disabled(!model.state.connected).accessibilityIdentifier("device-hand-enabled")
+                    MacScreenSharingSettings(host: model.remoteMacHost)
+                        .disabled(!model.state.connected)
                     Toggle("Keep Mac awake while Hands are running", isOn: $model.keepMacAwake)
                         .accessibilityIdentifier("keep-mac-awake")
                     Text("Hands keep running when you close the window. Open Nanocodex or quit from the menu bar.")
@@ -62,6 +66,44 @@ struct SettingsView: View {
     }
     private func shortcut(_ title: String, keys: String) -> some View {
         LabeledContent(title) { Text(keys).font(.system(size: 11, weight: .medium, design: .monospaced)).foregroundStyle(.secondary).padding(.horizontal, 7).padding(.vertical, 4).background(Color.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 5)) }
+    }
+}
+
+private struct LaunchAtLoginSettings: View {
+    @ObservedObject var launch: LaunchAtLogin
+    var body: some View {
+        Toggle("Open Nanocodex at login", isOn: Binding(get: { launch.isEnabled }, set: { launch.setEnabled($0) }))
+            .disabled(!launch.isAvailable).accessibilityIdentifier("launch-at-login")
+            .onAppear { launch.refresh() }
+            .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in launch.refresh() }
+        Text(launch.statusDescription).font(.caption).foregroundStyle(.secondary)
+            .accessibilityIdentifier("launch-at-login-status")
+        if let error = launch.error {
+            Text(error).font(.caption).foregroundStyle(.red)
+        }
+        if launch.isAvailable {
+            Button(launch.requiresApproval ? "Approve in Login Items…" : "Open Login Items…") { launch.openLoginItems() }
+                .accessibilityIdentifier("open-login-items")
+        }
+    }
+}
+
+private struct MacScreenSharingSettings: View {
+    @ObservedObject var host: RemoteMacHost
+    var body: some View {
+        Toggle("Share this Mac’s screen automatically", isOn: Binding(
+            get: { host.automaticSharingEnabled },
+            set: { enabled in Task { await host.setAutomaticSharingEnabled(enabled) } }
+        )).accessibilityIdentifier("automatic-screen-sharing")
+        Text("Your selected display is shared when you sign in and stays available after closing the window.")
+            .font(.caption).foregroundStyle(.secondary)
+        if host.automaticSharingEnabled {
+            Text(host.status).font(.caption).foregroundStyle(.secondary)
+            Button("Screen and control permissions…") {
+                _ = MacScreen.requestScreenPermission()
+                _ = MacScreen.requestInputPermission()
+            }
+        }
     }
 }
 

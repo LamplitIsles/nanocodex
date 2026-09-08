@@ -19,6 +19,7 @@ final class AppModel: ObservableObject {
     }
     @Published private(set) var runtimeFailed = false
     let backgroundActivity = HandBackgroundActivity()
+    let launchAtLogin: LaunchAtLogin
     private let backgroundPreferences: UserDefaults?
     private var backgroundActivityStopped = false
     @Published var tabs: [WorkspaceTab] = [WorkspaceTab()]
@@ -80,6 +81,7 @@ final class AppModel: ObservableObject {
                 remoteService = try? RemoteService(origin: origin) { request in
                     request.setValue("Bearer " + credential.apiKey, forHTTPHeaderField: "Authorization")
                 }
+                configureAutomaticScreenSharing()
             }
         }
     }
@@ -280,6 +282,7 @@ final class AppModel: ObservableObject {
         runtime = RuntimeClient(dataDirectory: runtimeDirectory)
         isolatedSession = runtimeDirectory != nil || ProcessInfo.processInfo.environment["NANOCODEX_DESKTOP_DATA"] != nil || ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
         self.backgroundPreferences = backgroundPreferences ?? (isolatedSession ? nil : .standard)
+        launchAtLogin = LaunchAtLogin.installed(isolatedSession: isolatedSession, preferences: self.backgroundPreferences)
         keepMacAwake = self.backgroundPreferences?.object(forKey: "keepMacAwakeWhileHandsRunning") as? Bool ?? true
         activeTabID = tabs[0].id
         runtime.onEvent = { [weak self] event in self?.receive(event) }
@@ -302,6 +305,7 @@ final class AppModel: ObservableObject {
     }
     func start() async {
         guard !didStart else { return }; didStart = true
+        launchAtLogin.start()
         do {
             let imported = AccountKeychain.environmentCredential()
             let initial = imported ?? (isolatedSession ? nil : AccountKeychain.read())
@@ -339,6 +343,7 @@ final class AppModel: ObservableObject {
         }
         if (!wasConnected || accountChanged), next.connected {
             connectDefaultHand()
+            configureAutomaticScreenSharing()
             observeAccountHands()
             Task { await restoreObservers() }
         }
@@ -911,5 +916,11 @@ final class AppModel: ObservableObject {
         mac.revokeControl(); phone.revokeControl()
         remoteMacHost = RemoteMacHost(); remotePhoneHost = RemoteMacHost()
         Task { await mac.stop(); await phone.stop() }
+    }
+
+    private func configureAutomaticScreenSharing() {
+        guard !isolatedSession, state.connected, !backgroundActivityStopped,
+              let remoteService else { return }
+        remoteMacHost.configureAutomaticSharing(service: remoteService, defaults: backgroundPreferences ?? .standard)
     }
 }

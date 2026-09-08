@@ -89,7 +89,9 @@ public final class RemoteViewer: ObservableObject {
     private var lastFailure = ""
     private var retryTask: Task<Void, Never>?
     private var peer: RemotePeer?
-    private var signaling: RemoteSignaling?
+    private var signaling: (any RemoteSignalingTransport)?
+    var makeSignaling: (RemoteService) -> any RemoteSignalingTransport = { RemoteSignaling(service: $0) }
+    private var connectionSetup: Task<Void, Error>?
     private var control = RemoteViewerControl()
     private var generation: String? { control.generation }
     private var sequence: UInt64 = 0
@@ -107,7 +109,8 @@ public final class RemoteViewer: ObservableObject {
     init(recoveryWindow: Duration) { self.recoveryWindow = recoveryWindow }
     var diagnosticState: String { peer?.diagnosticState ?? "no peer" }
     var diagnosticRecovery: String { "\(diagnosticState) ready=\(transportReady)/\(channelsReady) retries=\(retries) last=\(lastFailure)" }
-    func diagnosticICE() async -> String { await peer?.diagnosticICE() ?? "no peer" }
+    var connectionEvent: (String) -> Void = { _ in }
+    func diagnosticICE(includeAddresses: Bool = true) async -> String { await peer?.diagnosticICE(includeAddresses: includeAddresses) ?? "no peer" }
 
     public func connect(service: RemoteService, hand: RemoteHand) async {
         close(); self.service = service; self.hand = hand
@@ -135,6 +138,7 @@ public final class RemoteViewer: ObservableObject {
     private func start(refresh: Bool) async {
         guard let service, let selected = hand, !suspended else { return }
         detach(); let attempt = epoch; connecting = true
+        connectionEvent(refresh ? "reconnect" : "connect")
         status = refresh ? "Reconnecting…" : "Connecting…"
         let clock = ContinuousClock()
         // Replace a stalled foreground reconnect sooner within the recovery
@@ -144,6 +148,7 @@ public final class RemoteViewer: ObservableObject {
         connectionDeadline = Task { [weak self] in
             do { try await clock.sleep(until: deadline) } catch { return }
             guard let self, self.epoch == attempt, !self.connected else { return }
+            self.connectionEvent("connection deadline")
             self.fail(RemoteError.unavailable)
         }
         do {
@@ -159,47 +164,85 @@ public final class RemoteViewer: ObservableObject {
                 try startFrames(service: service, attempt: attempt)
                 return
             }
-            let ice = try await service.ice()
             guard epoch == attempt, !Task.isCancelled, let hand else { return }
-            let peer = try RemotePeer(publishing: false, ice: ice)
-            let signaling = RemoteSignaling(service: service)
+            let peer = try RemotePeer(publishing: false, ice: [])
+            let signaling = makeSignaling(service)
             self.peer = peer; self.signaling = signaling
-            peer.onSignal = { [weak signaling] signal in signaling?.send(.init(type: "signal", signal: signal)) }
+            // The authenticated socket and TURN request are independent. Open
+            // both now, but do not process SDP until credentials are installed.
+            let setup = Task { [weak self, weak peer] in
+                let ice = try await service.ice()
+                try Task.checkCancellation()
+                guard let self, self.epoch == attempt, let peer else { throw CancellationError() }
+                try peer.updateICE(ice)
+                self.connectionEvent("initial ICE ready")
+            }
+            connectionSetup = setup
+            peer.onSignal = { [weak self, weak signaling] signal in
+                guard let self, epoch == attempt else { return }
+                if signal.type != .candidate { connectionEvent("send \(signal.type.rawValue)") }
+                signaling?.send(.init(type: "signal", signal: signal))
+            }
             peer.onVideoTrack = { [weak self] track in
                 guard let self, epoch == attempt else { return }; self.track = track
             }
             peer.onState = { [weak self] state in
                 guard let self, epoch == attempt else { return }
+                connectionEvent("peer state \(state.rawValue)")
                 if state == .connected { transportReady = true; updateReady() }
                 if [.failed, .closed, .disconnected].contains(state) { fail(RemoteError.unavailable) }
             }
             peer.onChannelsReady = { [weak self] in
-                guard let self, epoch == attempt else { return }; channelsReady = true; updateReady()
+                guard let self, epoch == attempt else { return }; connectionEvent("channels ready"); channelsReady = true; updateReady()
             }
             peer.onData = { [weak self] data, motion in
                 guard let self, epoch == attempt, !motion else { return }; receiveControl(data)
             }
+            var receivedOffer = false
+            var queuedSignals = 0
             signaling.onMessage = { [weak self, weak peer] message in
-                guard let self, epoch == attempt, let signal = message.signal, let peer else { return }
+                guard let self, epoch == attempt else { return }
+                if message.type == "ready" { connectionEvent("signaling ready") }
+                guard let signal = message.signal, let peer else { return }
+                if signal.type != .candidate { connectionEvent("receive \(signal.type.rawValue)") }
+                guard queuedSignals < 128 else { fail(RemoteError.invalidMessage); return }
+                queuedSignals += 1
                 let preceding = signalQueue
                 signalQueue = Task { [weak self] in
+                    defer { queuedSignals -= 1 }
                     await preceding?.value
                     guard let self, epoch == attempt, !Task.isCancelled else { return }
+                    // start() owns setup failures, including caller cancellation.
+                    guard case .success = await setup.result else { return }
+                    guard epoch == attempt, !Task.isCancelled else { return }
                     do {
                         if signal.type == .offer {
-                            let ice = try await service.ice()
-                            guard epoch == attempt else { return }
-                            try peer.updateICE(ice)
+                            // The initial offer uses the credentials fetched
+                            // above. Later offers still renew them for ICE restart.
+                            if receivedOffer {
+                                let ice = try await service.ice()
+                                guard epoch == attempt, !Task.isCancelled else { return }
+                                try peer.updateICE(ice)
+                            }
+                            receivedOffer = true
                         }
                         try await peer.receive(signal)
-                    } catch { if epoch == attempt { fail(error) } }
+                    } catch { if epoch == attempt { connectionEvent("signal failed"); fail(error) } }
                 }
             }
             signaling.onClose = { [weak self] error in
-                guard let self, epoch == attempt else { return }; fail(error ?? RemoteError.closed)
+                guard let self, epoch == attempt else { return }; connectionEvent("signaling closed"); fail(error ?? RemoteError.closed)
             }
             try signaling.connect(hand: hand)
-        } catch { if epoch == attempt { fail(error) } }
+            try await withTaskCancellationHandler {
+                try await setup.value
+                try Task.checkCancellation()
+            } onCancel: { setup.cancel() }
+        } catch {
+            guard epoch == attempt else { return }
+            if Task.isCancelled { detach(); status = "Disconnected" }
+            else { connectionEvent("setup failed"); fail(error) }
+        }
     }
 
     public func takeControl() {
@@ -247,6 +290,7 @@ public final class RemoteViewer: ObservableObject {
         }
         control = RemoteViewerControl(); controlling = false
         leaseRenewal?.cancel(); leaseRenewal = nil
+        connectionSetup?.cancel(); connectionSetup = nil
         signalQueue?.cancel(); signalQueue = nil
         connectionDeadline?.cancel(); connectionDeadline = nil
         frameTask?.cancel(); frameTask = nil; frameDeadline?.cancel(); frameDeadline = nil; framePending = false; frame = nil
@@ -254,10 +298,12 @@ public final class RemoteViewer: ObservableObject {
         self.peer = nil; self.signaling = nil; track = nil; connected = false; connecting = false
         transportReady = false; channelsReady = false
         peer?.onState = { _ in }; signaling?.onClose = { _ in }
-        peer?.close(); signaling?.close()
+        peer?.close(); signaling?.close(error: nil)
     }
 
     private func fail(_ error: Error) {
+        let failure = error as NSError
+        connectionEvent("failure \(failure.domain):\(failure.code); \(diagnosticState)")
         lastFailure = error.localizedDescription
         detach(); status = error.localizedDescription
         guard !suspended, hand != nil, service != nil,
@@ -296,7 +342,7 @@ public final class RemoteViewer: ObservableObject {
     }
 
     private func startFrames(service: RemoteService, attempt: UUID) throws {
-        let signaling = RemoteSignaling(service: service); self.signaling = signaling
+        let signaling = makeSignaling(service); self.signaling = signaling
         signaling.onMessage = { [weak self] message in
             guard let self, epoch == attempt else { return }
             do {
@@ -376,14 +422,7 @@ extension RemoteCapture { func snapshot() throws -> RemoteSnapshot { throw Remot
 extension MacScreen: RemoteCapture {}
 extension MacInput: RemoteInputInjector { var controlAllowed: Bool { CGPreflightPostEventAccess() } }
 
-@MainActor protocol RemoteHostSignaling: AnyObject {
-    var onMessage: (RemoteMessage) -> Void { get set }
-    var onClose: (Error?) -> Void { get set }
-    func connect(hand: RemoteHand?) throws
-    func send(_ message: RemoteMessage)
-    func close(error: Error?)
-}
-extension RemoteSignaling: RemoteHostSignaling {}
+typealias RemoteHostSignaling = RemoteSignalingTransport
 
 @MainActor
 public final class RemoteMacHost: ObservableObject {
@@ -392,7 +431,21 @@ public final class RemoteMacHost: ObservableObject {
     @Published public private(set) var sharing = false
     @Published public private(set) var reconnecting = false
     @Published public private(set) var viewerCount = 0
+    @Published public private(set) var automaticSharingEnabled = false
     @Published private(set) var surface: RemoteSurface?
+    private var automaticSharing: (service: RemoteService, defaults: UserDefaults)?
+    private var automaticSharingTask: Task<Void, Never>?
+    private var automaticSharingEpoch = UUID()
+    private var automaticSharingBlocked = false
+    private var starting = false
+    var automaticSharingInterval: Duration = .seconds(5)
+    var macSurfaces: () async throws -> [RemoteSurface] = { try await MacScreen.surfaces() }
+    var prepareMacCapture: (RTCVideoSource, String) async throws -> (any RemoteCapture, any RemoteInputInjector) = { source, surfaceID in
+        let screen = MacScreen(source: source)
+        let bounds = try await screen.start(surfaceID: surfaceID)
+        do { return (screen, try MacInput(bounds: bounds, displayID: UInt32(surfaceID.dropFirst("display-".count)))) }
+        catch { await screen.stop(); throw error }
+    }
     private struct Viewer { let peer: RemotePeer; var renewal: Task<Void, Never>? }
     private var viewers: [String: Viewer] = [:]
     private var preparations = Set<String>()
@@ -427,20 +480,74 @@ public final class RemoteMacHost: ObservableObject {
 
     public init() {}
 
+    /// The signed-in desktop app owns this supervisor, independently of its windows.
+    /// Permission checks never display a prompt; the dashboard provides OS setup.
+    public func configureAutomaticSharing(service: RemoteService, defaults: UserDefaults = .standard) {
+        automaticSharing = (service, defaults)
+        automaticSharingEnabled = defaults.object(forKey: "nanocodex.remote.automatic-sharing") as? Bool ?? true
+        automaticSharingBlocked = false
+        superviseAutomaticSharing()
+    }
+
+    public func setAutomaticSharingEnabled(_ enabled: Bool) async {
+        automaticSharingEnabled = enabled
+        automaticSharing?.defaults.set(enabled, forKey: "nanocodex.remote.automatic-sharing")
+        automaticSharingBlocked = false
+        if enabled { superviseAutomaticSharing() } else { await stop() }
+    }
+
+    /// User intent differs from app shutdown: an explicit stop survives relaunch.
+    public func stopSharing() async { await setAutomaticSharingEnabled(false) }
+
+    private func superviseAutomaticSharing() {
+        automaticSharingTask?.cancel(); automaticSharingEpoch = UUID()
+        guard automaticSharingEnabled, let configuration = automaticSharing else { return }
+        let attempt = automaticSharingEpoch
+        automaticSharingTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self, self.automaticSharingEpoch == attempt else { return }
+                if !self.automaticSharingBlocked && !self.starting {
+                    do {
+                        let displays = try await self.macSurfaces()
+                        guard !Task.isCancelled, self.automaticSharingEpoch == attempt else { return }
+                        let preferred = configuration.defaults.string(forKey: "nanocodex.remote.display-id")
+                        let selected = displays.first { $0.id == preferred }
+                            ?? displays.first { $0.id == "display-\(CGMainDisplayID())" } ?? displays.first
+                        guard let selected else { throw RemoteError.unavailable }
+                        if self.requestedPublication == nil || self.surface != selected {
+                            try await self.checkAuthorization(configuration.service)
+                            guard !Task.isCancelled, self.automaticSharingEpoch == attempt else { return }
+                            await self.start(service: configuration.service,
+                                machineID: RemoteHostIdentity.load(defaults: configuration.defaults),
+                                name: Host.current().localizedName ?? "Mac", surfaceID: selected.id)
+                        }
+                    } catch {
+                        guard !Task.isCancelled, self.automaticSharingEpoch == attempt else { return }
+                        self.status = error.localizedDescription
+                        if error as? RemoteError == .unauthorized || error as? RemoteError == .invalidMessage {
+                            self.automaticSharingBlocked = true
+                        }
+                    }
+                }
+                do { try await Task.sleep(for: self.automaticSharingInterval) } catch { return }
+            }
+        }
+    }
+
     public func start(service: RemoteService, machineID: String, name: String, surfaceID: String) async {
         let previous = detach(), attempt = epoch
+        starting = true
+        defer { if epoch == attempt { starting = false } }
         status = "Starting screen sharing…"
         for capture in previous { await capture.stop() }
         guard epoch == attempt else { return }
         do {
-            let surfaces = try await MacScreen.surfaces()
+            let surfaces = try await macSurfaces()
             guard epoch == attempt else { return }
             guard let surface = surfaces.first(where: { $0.id == surfaceID }) else { throw RemoteError.unavailable }
+            automaticSharing?.defaults.set(surfaceID, forKey: "nanocodex.remote.display-id")
             await publish(service: service, machineID: machineID, name: name, surface: surface, attempt: attempt) { source in
-                let screen = MacScreen(source: source)
-                let bounds = try await screen.start(surfaceID: surfaceID)
-                do { return (screen, try MacInput(bounds: bounds, displayID: UInt32(surfaceID.dropFirst("display-".count)))) }
-                catch { await screen.stop(); throw error }
+                try await self.prepareMacCapture(source, surfaceID)
             }
         } catch { if epoch == attempt { status = error.localizedDescription } }
     }
@@ -492,7 +599,7 @@ public final class RemoteMacHost: ObservableObject {
             let source = RemotePeer.screenSource()
             let (screen, injector) = try await prepare(source)
             guard epoch == attempt else { await screen.stop(); return }
-            capture = screen; captureSource = source; input = injector; self.surface = surface
+            capture = screen; captureSource = source; input = injector; self.surface = surface; starting = false
             let capturedEpoch = captureEpoch
             screen.onFailure = { [weak self] error in
                 Task { @MainActor in
@@ -608,6 +715,9 @@ public final class RemoteMacHost: ObservableObject {
     }
 
     private func stopAfterFailure(_ error: Error) {
+        if error as? RemoteError == .unauthorized || error as? RemoteError == .invalidMessage || error is DecodingError {
+            automaticSharingBlocked = true
+        }
         let previous = detach(), stopped = epoch
         status = error.localizedDescription
         Task {
@@ -771,6 +881,7 @@ public final class RemoteMacHost: ObservableObject {
     }
 
     public func stop() async {
+        automaticSharingTask?.cancel(); automaticSharingTask = nil; automaticSharingEpoch = UUID()
         for capture in detach() { await capture.stop() }
     }
 
@@ -789,7 +900,7 @@ public final class RemoteMacHost: ObservableObject {
         // Clear intent before awaiting capture cleanup, so Stop or an account
         // change cannot be undone by a late authorization or capture completion.
         recoveryTask?.cancel(); recoveryTask = nil; recoveryAttempts = 0
-        requestedPublication = nil; reconnecting = false; captureEpoch = UUID()
+        requestedPublication = nil; reconnecting = false; starting = false; captureEpoch = UUID()
         disconnectPublication()
         input = nil; captureSource = nil; surface = nil; sharing = false; status = "Not sharing"
         var captures: [any RemoteCapture] = []

@@ -127,8 +127,16 @@ public struct RemoteMessage: Codable, Sendable {
     }
 }
 
+@MainActor protocol RemoteSignalingTransport: AnyObject {
+    var onMessage: (RemoteMessage) -> Void { get set }
+    var onClose: (Error?) -> Void { get set }
+    func connect(hand: RemoteHand?) throws
+    func send(_ message: RemoteMessage)
+    func close(error: Error?)
+}
+
 @MainActor
-public final class RemoteSignaling {
+public final class RemoteSignaling: RemoteSignalingTransport {
     public var onMessage: (RemoteMessage) -> Void = { _ in }
     public var onClose: (Error?) -> Void = { _ in }
     private let service: RemoteService

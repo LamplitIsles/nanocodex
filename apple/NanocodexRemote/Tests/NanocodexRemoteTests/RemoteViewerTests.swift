@@ -17,6 +17,18 @@ private final class RemoteHTTPFixture: URLProtocol {
     }
 }
 
+@MainActor private final class ViewerSocket: RemoteSignalingTransport {
+    var onMessage: (RemoteMessage) -> Void = { _ in }
+    var onClose: (Error?) -> Void = { _ in }
+    var onConnect: () -> Void = {}
+    var onSend: (RemoteMessage) -> Void = { _ in }
+    var messages: [RemoteMessage] = []
+    var closed = false
+    func connect(hand: RemoteHand?) throws { onConnect() }
+    func send(_ message: RemoteMessage) { messages.append(message); onSend(message) }
+    func close(error: Error?) { closed = true; onClose(error) }
+}
+
 final class RemoteViewerTests: XCTestCase {
     @MainActor func testCanvasTeardownDoesNotPublishDuringSwiftUIInvalidation() {
         let viewer = RemoteViewer()
@@ -55,13 +67,143 @@ final class RemoteViewerTests: XCTestCase {
         }
     }
 
+    @MainActor private func viewer(recoveryWindow: Duration = .seconds(90)) -> RemoteViewer {
+        let viewer = RemoteViewer(recoveryWindow: recoveryWindow)
+        viewer.makeSignaling = { _ in ViewerSocket() }
+        return viewer
+    }
+
+    @MainActor func testInitialICEOverlapsSignalingAndIsReusedUntilRestart() async throws {
+        let initialICE = expectation(description: "Initial ICE request started")
+        let socketOpened = expectation(description: "Socket opened while ICE is outstanding")
+        let firstAnswer = expectation(description: "Initial offer answered")
+        let restartAnswer = expectation(description: "Restart answered with renewed ICE")
+        let prematureAnswer = expectation(description: "No answer before ICE authorization")
+        prematureAnswer.isInverted = true
+        let lock = NSLock()
+        var pending: RemoteHTTPFixture?, requests = 0
+        let service = try service { request in
+            let count = lock.withLock { requests += 1; return requests }
+            if count == 1 { lock.withLock { pending = request }; initialICE.fulfill() }
+            else { request.respond(200, ["iceServers": []]) }
+        }
+        let viewer = viewer(), socket = ViewerSocket(), publisher = try RemotePeer(publishing: true, ice: [])
+        var publisherQueue: Task<Void, Never>?, answers = 0, credentialsReturned = false
+        defer { viewer.close(); publisher.close(); publisherQueue?.cancel(); service.close() }
+        viewer.makeSignaling = { _ in socket }
+        socket.onConnect = { socketOpened.fulfill() }
+        publisher.onSignal = { socket.onMessage(.init(type: "signal", signal: $0)) }
+        socket.onSend = { message in
+            guard let signal = message.signal else { return }
+            if signal.type == .answer && !credentialsReturned { prematureAnswer.fulfill() }
+            let previous = publisherQueue
+            publisherQueue = Task {
+                await previous?.value
+                do {
+                    try await publisher.receive(signal)
+                    if signal.type == .answer {
+                        answers += 1
+                        if answers == 1 { firstAnswer.fulfill() }
+                        if answers == 2 { restartAnswer.fulfill() }
+                    }
+                } catch { XCTFail("Publisher signaling failed: \(error)") }
+            }
+        }
+        let selected = try hand("original")
+        let connection = Task { await viewer.connect(service: service, hand: selected) }
+        await fulfillment(of: [initialICE, socketOpened], timeout: 2)
+        try await publisher.offer()
+        await fulfillment(of: [prematureAnswer], timeout: 0.1)
+        XCTAssertNil(viewer.track)
+        XCTAssertFalse(viewer.connected)
+        credentialsReturned = true
+        lock.withLock { pending }?.respond(200, ["iceServers": []])
+        await connection.value
+        await fulfillment(of: [firstAnswer], timeout: 5)
+        XCTAssertEqual(lock.withLock { requests }, 1, "The first offer must reuse initial ICE credentials")
+        try await publisher.restartICE([])
+        await fulfillment(of: [restartAnswer], timeout: 5)
+        XCTAssertEqual(lock.withLock { requests }, 2, "A subsequent offer must fetch fresh ICE credentials")
+        XCTAssertFalse(viewer.controlling)
+        await publisherQueue?.value
+    }
+
+    @MainActor func testAuthorizationFailureDiscardsAnOfferReceivedDuringSetup() async throws {
+        let requested = expectation(description: "ICE request is pending")
+        let lock = NSLock()
+        var pending: RemoteHTTPFixture?
+        let service = try service { request in lock.withLock { pending = request }; requested.fulfill() }
+        let viewer = viewer(), socket = ViewerSocket(), publisher = try RemotePeer(publishing: true, ice: [])
+        defer { viewer.close(); publisher.close(); service.close() }
+        viewer.makeSignaling = { _ in socket }
+        publisher.onSignal = { socket.onMessage(.init(type: "signal", signal: $0)) }
+        let selected = try hand("original")
+        let connection = Task { await viewer.connect(service: service, hand: selected) }
+        await fulfillment(of: [requested], timeout: 2)
+        try await publisher.offer()
+        lock.withLock { pending }?.respond(403)
+        await connection.value
+        XCTAssertEqual(viewer.status, RemoteError.unauthorized.localizedDescription)
+        XCTAssertTrue(socket.closed)
+        XCTAssertFalse(viewer.connecting)
+        XCTAssertFalse(viewer.connected)
+        XCTAssertNil(viewer.track)
+        XCTAssertEqual(viewer.diagnosticState, "no peer")
+        XCTAssertTrue(socket.messages.isEmpty, "Rejected credentials must never produce an answer or input")
+    }
+
+    @MainActor func testPendingCredentialSignalingQueueIsBounded() async throws {
+        let requested = expectation(description: "ICE request is pending")
+        let service = try service { _ in requested.fulfill() }
+        let viewer = viewer(), socket = ViewerSocket()
+        defer { viewer.close(); service.close() }
+        viewer.makeSignaling = { _ in socket }
+        let selected = try hand("original")
+        let connection = Task { await viewer.connect(service: service, hand: selected) }
+        await fulfillment(of: [requested], timeout: 2)
+        for _ in 0...128 {
+            socket.onMessage(.init(type: "signal", signal: .init(type: .offer, sdp: "pending authorization")))
+        }
+        await connection.value
+        XCTAssertEqual(viewer.status, RemoteError.invalidMessage.localizedDescription)
+        XCTAssertTrue(socket.closed)
+        XCTAssertFalse(viewer.connecting)
+        XCTAssertTrue(socket.messages.isEmpty)
+    }
+
+    @MainActor func testCancellingCallerCancelsSetupWithoutRetryingQueuedOffers() async throws {
+        let requested = expectation(description: "ICE request is pending")
+        let unexpected = expectation(description: "Cancelled setup must not retry")
+        unexpected.isInverted = true
+        let service = try service { request in
+            if request.request.url?.path.hasSuffix("/screens") == true { unexpected.fulfill() }
+            else { requested.fulfill() }
+        }
+        let viewer = viewer(), socket = ViewerSocket()
+        defer { viewer.close(); service.close() }
+        viewer.makeSignaling = { _ in socket }
+        let selected = try hand("original")
+        let connection = Task { await viewer.connect(service: service, hand: selected) }
+        await fulfillment(of: [requested], timeout: 2)
+        socket.onMessage(.init(type: "signal", signal: .init(type: .offer, sdp: "pending authorization")))
+        connection.cancel()
+        await connection.value
+        await fulfillment(of: [unexpected], timeout: 1.1)
+        XCTAssertEqual(viewer.status, "Disconnected")
+        XCTAssertTrue(socket.closed)
+        XCTAssertFalse(viewer.connecting)
+        XCTAssertFalse(viewer.connected)
+        XCTAssertNil(viewer.track)
+        XCTAssertTrue(socket.messages.isEmpty)
+    }
+
     @MainActor func testBackgroundResumeKeepsSelectionAndRefreshesPublication() async throws {
         let catalog = surface("restarted")
         let service = try service { request in
             if request.request.url?.path.hasSuffix("/screens") == true { request.respond(200, ["surfaces": [catalog]]) }
             else { request.respond(401) }
         }
-        let viewer = RemoteViewer()
+        let viewer = viewer()
         defer { viewer.close(); service.close() }
         await viewer.connect(service: service, hand: try hand("original"))
         XCTAssertEqual(viewer.status, RemoteError.unauthorized.localizedDescription)
@@ -82,18 +224,20 @@ final class RemoteViewerTests: XCTestCase {
 
     @MainActor func testCloseFencesAnOutstandingConnection() async throws {
         let started = expectation(description: "ICE request started")
-        let lock = NSLock()
-        var pending: RemoteHTTPFixture?
-        let service = try service { request in lock.withLock { pending = request }; started.fulfill() }
-        let viewer = RemoteViewer()
+        let service = try service { _ in started.fulfill() }
+        let viewer = viewer(), socket = ViewerSocket()
+        viewer.makeSignaling = { _ in socket }
         defer { viewer.close(); service.close() }
         let hand = try hand("original")
         let connection = Task { await viewer.connect(service: service, hand: hand) }
         await fulfillment(of: [started], timeout: 2)
         XCTAssertTrue(viewer.connecting)
+        let staleMessage = socket.onMessage, staleClose = socket.onClose
         viewer.close()
-        lock.withLock { pending }?.respond(200, ["iceServers": []])
         await connection.value
+        staleMessage(.init(type: "signal", signal: .init(type: .offer, sdp: "stale")))
+        staleClose(RemoteError.unauthorized)
+        XCTAssertTrue(socket.closed)
         XCTAssertNil(viewer.hand)
         XCTAssertNil(viewer.track)
         XCTAssertFalse(viewer.connected)
@@ -117,7 +261,7 @@ final class RemoteViewerTests: XCTestCase {
                 if count == 2 { retried.fulfill() }
             }
         }
-        let viewer = RemoteViewer()
+        let viewer = viewer()
         defer { viewer.close(); service.close() }
         await viewer.connect(service: service, hand: try hand("original"))
         XCTAssertTrue(viewer.connecting)
@@ -135,7 +279,7 @@ final class RemoteViewerTests: XCTestCase {
             if request.request.url?.path.hasSuffix("/screens") == true { unexpected.fulfill() }
             request.respond(503)
         }
-        let viewer = RemoteViewer()
+        let viewer = viewer()
         defer { viewer.close(); service.close() }
         await viewer.connect(service: service, hand: try hand("original"))
         viewer.suspend()
@@ -161,7 +305,7 @@ final class RemoteViewerTests: XCTestCase {
                 if count == 2 { recovered.fulfill() }
             }
         }
-        let viewer = RemoteViewer()
+        let viewer = viewer()
         defer { viewer.close(); service.close() }
         await viewer.connect(service: service, hand: try hand("before-restart"))
         await fulfillment(of: [recovered], timeout: 20)
@@ -176,7 +320,7 @@ final class RemoteViewerTests: XCTestCase {
             if request.request.url?.path.hasSuffix("/screens") == true { unexpected.fulfill() }
             request.respond(503)
         }
-        let viewer = RemoteViewer(recoveryWindow: .milliseconds(100))
+        let viewer = viewer(recoveryWindow: .milliseconds(100))
         defer { viewer.close(); service.close() }
         await viewer.connect(service: service, hand: try hand("original"))
         await fulfillment(of: [unexpected], timeout: 0.3)

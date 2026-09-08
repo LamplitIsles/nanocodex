@@ -56,18 +56,30 @@ or sent to native Hand subprocesses.
 
 ## Background Hands
 
+The signed app installed in `/Applications` enables **Open Nanocodex at login**
+on its first normal launch. macOS starts it after you sign into the computer;
+the saved account, laptop Hand, and automatic screen sharing then reconnect.
+Settings shows the actual login-item status and links to macOS Login Items when
+approval is required. Explicit app or system opt-outs are preserved. Tests,
+isolated development sessions, and builds outside `/Applications` never register
+a login item.
+
 **Hands → Remote Screens** opens the shared native WebRTC viewer. Desktop-enabled
 factory VMs appear automatically once their publisher connects. The same screens
 are available from the iPhone/iPad inbox and conversations. Mac screen sharing
-is started explicitly from Remote Screens and remains owned by the app when the
-sheet closes. The Mac's screen identity is saved across reopening the picker and
-restarting the app. Shell-only VM images do not publish a desktop; Cloudflare
+starts automatically after sign-in when Screen Recording permission is available,
+and remains owned by the app when its windows close. It remembers the selected
+display and restores capture after system interruptions or display changes.
+The Mac's screen identity is saved across reopening the picker and restarting
+the app. Shell-only VM images do not publish a desktop; Cloudflare
 sandbox desktops require the managed desktop feature flag. A disconnected viewer retries with the current publication generation,
 retains the selected screen, and offers **Reconnect** after a 90-second recovery
 window. Control must be acquired again after reconnecting.
 Mac publishing also reconnects after temporary signaling outages while keeping
-the selected display. Stop sharing remains available during recovery; quitting
-the app ends sharing.
+the selected display. **Stop sharing** disables automatic screen sharing across
+relaunches. Re-enable **Share this Mac’s screen automatically** in Settings;
+screen and control permission setup is available there and in Remote Screens.
+Quitting ends sharing while preserving the preference for the next launch.
 
 The Hands page, chat picker, and menu bar include devices connected elsewhere on
 the same account. Previously observed devices remain listed as offline after

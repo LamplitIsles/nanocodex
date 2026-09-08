@@ -77,7 +77,7 @@ public final class RemotePeer: NSObject {
             }
         }
     }
-    func diagnosticICE() async -> String {
+    func diagnosticICE(includeAddresses: Bool = true) async -> String {
         await withCheckedContinuation { continuation in
             connection.statistics { report in
                 let pairs = report.statistics.values.filter { $0.type == "candidate-pair" }
@@ -88,7 +88,8 @@ public final class RemotePeer: NSObject {
                     }
                     for side in ["local", "remote"] {
                         if let id = pair.values[side + "CandidateId"] as? String, let candidate = report.statistics[id] {
-                            for key in ["candidateType", "protocol", "address", "port"] { result[side + "." + key] = candidate.values[key]?.description }
+                            let keys = includeAddresses ? ["candidateType", "protocol", "address", "port"] : ["candidateType", "protocol"]
+                            for key in keys { result[side + "." + key] = candidate.values[key]?.description }
                         }
                     }
                     return result

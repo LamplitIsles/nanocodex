@@ -190,6 +190,202 @@ final class RemoteHostRecoveryTests: XCTestCase {
         await host.stop()
     }
 
+    @MainActor func testAutomaticSharingStartsAndRecoversCaptureWithRetainedDisplayAndIdentity() async throws {
+        let service = try service(), host = RemoteMacHost(), defaults = try automaticDefaults()
+        defer { service.close() }
+        addTeardownBlock { await host.stop() }
+        defaults.set("existing-installation", forKey: "nanocodex.remote.machine-id")
+        defaults.set("display-42", forKey: "nanocodex.remote.display-id")
+        let selected = automaticSurface(), input = RecoveryInput()
+        var captures: [RecoveryCapture] = [], sockets: [RecoverySocket] = [], authorized = 0
+        host.automaticSharingInterval = .milliseconds(10)
+        host.macSurfaces = { [self.automaticSurface("display-99"), selected] }
+        host.checkAuthorization = { current in XCTAssertTrue(current === service); authorized += 1 }
+        host.prepareMacCapture = { _, surfaceID in
+            XCTAssertEqual(surfaceID, selected.id)
+            let capture = RecoveryCapture(); captures.append(capture); return (capture, input)
+        }
+        host.makeSignaling = { _ in let socket = RecoverySocket(); sockets.append(socket); return socket }
+        host.configureAutomaticSharing(service: service, defaults: defaults)
+        XCTAssertTrue(host.automaticSharingEnabled)
+        try await eventually { host.sharing && captures.count == 1 }
+        let first = captures[0], staleFailure = first.onFailure
+        first.onFailure(RemoteError.geometryChanged)
+        try await eventually { host.sharing && captures.count == 2 }
+        XCTAssertEqual(first.stops, 1); XCTAssertEqual(captures[1].stops, 0)
+        XCTAssertEqual(authorized, 2); XCTAssertEqual(sockets.count, 2)
+        for socket in sockets {
+            let catalog = try XCTUnwrap(socket.messages.first { $0.type == "catalog" })
+            XCTAssertEqual(catalog.machineID, "existing-installation")
+            XCTAssertEqual(catalog.surfaces?.first?.id, selected.id)
+        }
+        staleFailure(RemoteError.screenPermission)
+        try await Task.sleep(for: .milliseconds(35))
+        XCTAssertTrue(host.sharing); XCTAssertEqual(captures.count, 2)
+        XCTAssertEqual(defaults.string(forKey: "nanocodex.remote.display-id"), selected.id)
+        await host.stop()
+    }
+
+    @MainActor func testExplicitStopPersistsAutomaticSharingOptOutUntilEnabledAgain() async throws {
+        let service = try service(), host = RemoteMacHost(), defaults = try automaticDefaults()
+        defer { service.close() }
+        addTeardownBlock { await host.stop() }
+        let surface = automaticSurface(), capture = RecoveryCapture()
+        host.automaticSharingInterval = .milliseconds(5)
+        host.macSurfaces = { [surface] }
+        host.checkAuthorization = { _ in }
+        host.prepareMacCapture = { _, _ in (capture, RecoveryInput()) }
+        host.makeSignaling = { _ in RecoverySocket() }
+        host.configureAutomaticSharing(service: service, defaults: defaults)
+        try await eventually { host.sharing }
+        await host.stopSharing()
+        XCTAssertFalse(host.automaticSharingEnabled); XCTAssertFalse(host.sharing)
+        XCTAssertEqual(capture.stops, 1)
+        XCTAssertEqual(defaults.object(forKey: "nanocodex.remote.automatic-sharing") as? Bool, false)
+
+        let relaunched = RemoteMacHost()
+        addTeardownBlock { await relaunched.stop() }
+        var enumerations = 0
+        relaunched.automaticSharingInterval = .milliseconds(5)
+        relaunched.macSurfaces = { enumerations += 1; return [surface] }
+        relaunched.checkAuthorization = { _ in }
+        relaunched.prepareMacCapture = { _, _ in (RecoveryCapture(), RecoveryInput()) }
+        relaunched.makeSignaling = { _ in RecoverySocket() }
+        relaunched.configureAutomaticSharing(service: service, defaults: defaults)
+        try await Task.sleep(for: .milliseconds(35))
+        XCTAssertFalse(relaunched.automaticSharingEnabled); XCTAssertFalse(relaunched.sharing)
+        XCTAssertEqual(enumerations, 0)
+        await relaunched.setAutomaticSharingEnabled(true)
+        try await eventually { relaunched.sharing }
+        XCTAssertTrue(defaults.bool(forKey: "nanocodex.remote.automatic-sharing"))
+        await relaunched.stop()
+    }
+
+    @MainActor func testAppShutdownStopsSupervisorWithoutDisablingFutureAutomaticSharing() async throws {
+        let service = try service(), host = RemoteMacHost(), defaults = try automaticDefaults()
+        defer { service.close() }
+        addTeardownBlock { await host.stop() }
+        let surface = automaticSurface()
+        var captures: [RecoveryCapture] = []
+        host.automaticSharingInterval = .milliseconds(5)
+        host.macSurfaces = { [surface] }
+        host.checkAuthorization = { _ in }
+        host.prepareMacCapture = { _, _ in
+            let capture = RecoveryCapture(); captures.append(capture); return (capture, RecoveryInput())
+        }
+        host.makeSignaling = { _ in RecoverySocket() }
+        host.configureAutomaticSharing(service: service, defaults: defaults)
+        try await eventually { host.sharing }
+        await host.setAutomaticSharingEnabled(true)
+        await host.stop()
+        try await Task.sleep(for: .milliseconds(35))
+        XCTAssertFalse(host.sharing); XCTAssertEqual(captures.count, 1); XCTAssertEqual(captures[0].stops, 1)
+        XCTAssertTrue(host.automaticSharingEnabled)
+        XCTAssertTrue(defaults.bool(forKey: "nanocodex.remote.automatic-sharing"))
+        host.configureAutomaticSharing(service: service, defaults: defaults)
+        try await eventually { host.sharing && captures.count == 2 }
+        await host.stop()
+    }
+
+    @MainActor func testAutomaticSharingStopFencesPendingAuthorization() async throws {
+        let service = try service()
+        defer { service.close() }
+        for optOut in [false, true] {
+            let host = RemoteMacHost(), defaults = try automaticDefaults(), surface = automaticSurface()
+            addTeardownBlock { await host.stop() }
+            var pending: CheckedContinuation<Void, Never>?, returned = false, preparations = 0, sockets = 0
+            host.automaticSharingInterval = .milliseconds(5)
+            host.macSurfaces = { [surface] }
+            host.checkAuthorization = { _ in
+                await withCheckedContinuation { pending = $0 }
+                returned = true
+            }
+            host.prepareMacCapture = { _, _ in
+                preparations += 1; return (RecoveryCapture(), RecoveryInput())
+            }
+            host.makeSignaling = { _ in sockets += 1; return RecoverySocket() }
+            host.configureAutomaticSharing(service: service, defaults: defaults)
+            try await eventually { pending != nil }
+            if optOut { await host.stopSharing() } else { await host.stop() }
+            pending?.resume(); pending = nil
+            try await eventually { returned }
+            try await Task.sleep(for: .milliseconds(25))
+            XCTAssertEqual(preparations, 0); XCTAssertEqual(sockets, 0); XCTAssertFalse(host.sharing)
+            XCTAssertEqual(host.automaticSharingEnabled, !optOut)
+        }
+    }
+
+    @MainActor func testAutomaticSharingPermissionDenialDefersCaptureAndRetriesAfterGrant() async throws {
+        let service = try service(), host = RemoteMacHost(), defaults = try automaticDefaults()
+        defer { service.close() }
+        addTeardownBlock { await host.stop() }
+        let surface = automaticSurface()
+        var permissionGranted = false, enumerations = 0, authorizations = 0, preparations = 0
+        host.automaticSharingInterval = .milliseconds(5)
+        // The injected equivalent of MacScreen.surfaces only checks permission;
+        // neither the test nor the supervisor asks macOS to display a prompt.
+        host.macSurfaces = {
+            enumerations += 1
+            guard permissionGranted else { throw RemoteError.screenPermission }
+            return [surface]
+        }
+        host.checkAuthorization = { _ in authorizations += 1 }
+        host.prepareMacCapture = { _, _ in
+            preparations += 1; return (RecoveryCapture(), RecoveryInput())
+        }
+        host.makeSignaling = { _ in RecoverySocket() }
+        host.configureAutomaticSharing(service: service, defaults: defaults)
+        try await eventually { enumerations >= 2 }
+        XCTAssertTrue(host.automaticSharingEnabled); XCTAssertFalse(host.sharing)
+        XCTAssertEqual(host.status, RemoteError.screenPermission.localizedDescription)
+        XCTAssertEqual(authorizations, 0); XCTAssertEqual(preparations, 0)
+        permissionGranted = true
+        try await eventually { host.sharing }
+        XCTAssertEqual(authorizations, 1); XCTAssertEqual(preparations, 1)
+        await host.stop()
+    }
+
+    @MainActor func testAutomaticSharingDoesNotRestartUnauthorizedOrInvalidPublications() async throws {
+        let service = try service()
+        defer { service.close() }
+        let failures: [Error] = [RemoteError.unauthorized, RemoteError.invalidMessage,
+            DecodingError.dataCorrupted(.init(codingPath: [], debugDescription: "Invalid fixture message"))]
+        for failure in failures {
+            let host = RemoteMacHost(), defaults = try automaticDefaults(), capture = RecoveryCapture()
+            addTeardownBlock { await host.stop() }
+            let surface = automaticSurface()
+            var authorizations = 0, preparations = 0, sockets: [RecoverySocket] = []
+            host.automaticSharingInterval = .milliseconds(5)
+            host.macSurfaces = { [surface] }
+            host.checkAuthorization = { _ in authorizations += 1 }
+            host.prepareMacCapture = { _, _ in
+                preparations += 1; return (capture, RecoveryInput())
+            }
+            host.makeSignaling = { _ in let socket = RecoverySocket(); sockets.append(socket); return socket }
+            host.configureAutomaticSharing(service: service, defaults: defaults)
+            try await eventually { host.sharing }
+            sockets[0].onClose(failure)
+            try await eventually { capture.stops == 1 }
+            try await Task.sleep(for: .milliseconds(35))
+            XCTAssertTrue(host.automaticSharingEnabled)
+            XCTAssertFalse(host.sharing); XCTAssertFalse(host.reconnecting)
+            XCTAssertEqual(host.status, failure.localizedDescription)
+            XCTAssertEqual(authorizations, 1); XCTAssertEqual(preparations, 1); XCTAssertEqual(sockets.count, 1)
+            await host.stop()
+        }
+    }
+
+    @MainActor private func automaticDefaults() throws -> UserDefaults {
+        let suite = "nanocodex.remote.automatic-test.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+        return defaults
+    }
+
+    @MainActor private func automaticSurface(_ id: String = "display-42") -> RemoteSurface {
+        RemoteSurface(id: id, name: "Selected display", kind: .desktop, width: 1600, height: 900, controllable: true)
+    }
+
     @MainActor private func eventually(_ predicate: () -> Bool) async throws {
         let deadline = ContinuousClock.now + .seconds(2)
         while ContinuousClock.now < deadline {
