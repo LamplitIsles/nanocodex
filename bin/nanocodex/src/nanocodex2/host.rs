@@ -10,7 +10,8 @@ use std::{
 use nanocodex_tools::attachment::{AttachmentMachine, AttachmentMetadata};
 use serde::Deserialize;
 
-pub(crate) const MACHINE_CAPABILITIES: [&str; 5] = ["native", "filesystem", "process", "package", "server"];
+pub(crate) const MACHINE_CAPABILITIES: [&str; 5] =
+    ["native", "filesystem", "process", "package", "server"];
 static MACHINE_ID: OnceLock<String> = OnceLock::new();
 
 #[derive(Debug)]

@@ -10,9 +10,9 @@
 mod config;
 mod hand_observability;
 mod host;
-mod native_hand;
 #[allow(dead_code)]
 mod installation;
+mod native_hand;
 #[allow(dead_code)]
 mod skill;
 #[allow(dead_code, unused_imports)]
