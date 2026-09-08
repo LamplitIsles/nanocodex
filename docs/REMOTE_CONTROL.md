@@ -1,10 +1,46 @@
 # Interactive Hands
 
-Work in progress on `feat/apple-remote-control`. The scope is interactive macOS,
-paired iPhone, factory-spawned Nanocodex VM Hands, Cloudflare sandbox desktops,
-and existing Linux servers reached over SSH. Viewers are the native Apple
-clients and the account browser. Completion requires runtime evidence for each
-host type; the implementation and evidence below distinguish what works today.
+Interactive Hands connect macOS, paired iPhone, factory-spawned Linux VMs,
+Cloudflare sandbox desktops, and existing Linux servers to the managed account.
+Viewers are the native Apple clients and the account browser. A connected shell
+Hand and a published screen are separate capabilities; verify both before
+claiming that a machine supports files, processes, and desktop control.
+
+## Architecture checklist
+
+The product diagram uses illustrative mount names. `accountInfo` returns the
+actual mounts available to the current agent; `workdir` selects the execution
+Hand. Code Mode runs in the managed service, while native commands run on the
+selected Hand. Screen tools select their exact machine and publication instead
+of inferring a target from `workdir`.
+
+Desktop, mobile, and browser clients read the same account-owned durable agents
+and resume their event streams. Signing in selects the account; a connected
+device publishes its available capabilities through an outbound authenticated
+connection. Normal Hand operation requires no inbound listener, port forwarding,
+or VPN. A device may share its host workspace, offer an isolated VM factory, or
+provide both. VM allocations keep their own workspaces and identities.
+
+| Connection | Current implementation | Required live check |
+| --- | --- | --- |
+| Mac host | Automatic account-wide shell Hand and screen sharing while Nanocodex runs | File/process roundtrip, video/input, relaunch, window close |
+| Mac-hosted VM | Factory-managed Linux VM with its own workspace and desktop | Retained files, video/input, generation change and viewer recovery after restart |
+| Cloudflare Hand | Retained sandbox workspace and `frames-v1` desktop | Workspace roundtrip, rendered frames/input, sleep/resume |
+| Native Linux Hand | `native-hand` publishes an explicit workspace and native tools over an outbound account connection | File/process roundtrip, socket reconnect, process restart with retained identity |
+| SSH Linux server | Vault-bound SSH for native commands; `server_hand` installs a dedicated desktop container | Reachable SSH target, Docker access, enrollment, video/input, reconnect |
+| Browser viewer | Screens in Connect and agent terminals | Discovery, video/input, tab background/resume, host restart |
+| iPhone viewer/host | Shared native viewer; hosting uses a paired Mac bridge | Physical-device journey; currently paused |
+| Windows host | Planned | No native Windows host is claimed |
+| Service connections | Account credential broker with per-agent and per-connection grants | Connected inventory and a read-only request to each granted service |
+
+Mac-hosted factory VMs in this implementation are Linux guests. Linux server
+desktops use a dedicated retained workspace; they do not expose every server
+project automatically. SSH filesystem mounts and desktop workspaces are distinct.
+SSH is an optional installation path for a machine that is not running a Hand.
+That bootstrap requires the matching vault identity, pinned server fingerprint,
+reachable SSH host/port, and Docker access for managed desktop setup. The current
+cloud SSH broker needs a public SSH target; that limitation does not apply to a
+Hand started directly on the device, whose normal connection is outbound.
 
 ## Transport and ownership
 
@@ -75,18 +111,24 @@ Xcode and the existing managed runtime/Node build prerequisites. Both clients
 expose Screens; the account browser exposes Screens from Connect and the agent
 terminal.
 
-For Mac hosting, choose a display and explicitly start sharing. macOS Screen
-Recording permission is required for capture, and Accessibility/input permission
+For Mac hosting, screen sharing starts automatically after sign-in once macOS
+Screen Recording permission is available. Accessibility/input permission is
 for control. Allow Local Network access when connecting to a Hand on the same
 network. Sharing remains visible in the main Mac toolbar after the picker
 closes. Stop sharing and account changes revoke viewers and release input.
-The Mac machine identity is persisted when first created, so reopening Screens
-and relaunching the app keep the same discovery identity. Quitting the app stops
-sharing; start sharing again after relaunching.
+The selected display and Mac machine identity persist across relaunches. Closing
+the window keeps the shell Hand and screen available. Quitting stops sharing;
+reopening restores it. **Stop sharing** persists an opt-out; re-enable **Share
+this Mac's screen automatically** in Settings. The automatic supervisor also
+restores capture after system interruptions and display changes.
+The signed app installed in `/Applications` defaults to opening at login through
+macOS Login Items. Settings shows the actual OS registration state and preserves
+later opt-outs. Development, isolated test, and ad-hoc builds do not register.
 While sharing is requested, a temporary signaling outage retains the display
 capture and retries with capped backoff. Recovery drops old viewers and releases
 input; viewers must acquire control again. Stop sharing, account changes, and
-permission or display failures cancel recovery.
+permission or display failures end that publication. Automatic sharing waits for
+permission and an available display before starting a fresh publication.
 
 For iPhone hosting:
 
@@ -133,10 +175,9 @@ The existing video tracks and control channels survive renewal. Hosts send new
 ICE candidates after their corresponding offers, and unanswered host offers
 expire after twenty-five seconds.
 
-Cloudflare Realtime was activated with explicit approval. The user supplied
-`TURN_TOKEN_ID` and `TURN_SERVER_API_KEY` in the main checkout's private `.env`;
-only those values were mapped to the isolated managed Worker's `.dev.vars`
-bindings above. No production deployment has been performed.
+Cloudflare Realtime was activated with explicit approval. The initial relay
+evidence below used an isolated managed Worker. It does not establish a
+production-duration relay soak or connectivity from a second physical network.
 
 The real authenticated development Worker now issues Cloudflare credentials.
 Live testing caught a Workers compatibility issue: its fetch implementation
@@ -206,9 +247,65 @@ the old viewer; restarting retained the private root and its files. Network
 publication retries independently of compositor readiness, so a signaling outage
 does not block the shell attachment.
 
-## Evidence and outstanding work (2026-09-07)
+## Evidence and outstanding work (2026-09-08)
+
+Fresh wrap-up evidence is retained in `/tmp/nanocodex-remote-wrapup-20260908/`.
+The cloud agent executed on the actual Mac Hand, verified Darwin and its native
+workspace, and wrote/read/removed an isolated marker. The native app's real
+Hand journey passed across runtime restart, including a completed turn while
+its window was closed. The native VM viewer decoded video, exercised input and
+control reacquisition, and recovered after a 12-second factory outage with the
+same machine identity and new publication generation. The desktop runtime's 33
+tests also passed.
+
+The updated identity-signed `/Applications/Nanocodex.app` registered successfully
+with macOS Login Items. Its login, laptop Hand, automatic screen-sharing, and
+keep-awake settings are enabled. Closing the window left both the native Hand
+and controllable screen published; the browser decoded the live Mac afterward.
+This verifies registration and background availability, not a computer reboot.
+
+The deployed browser discovered Mac, VM, and Cloudflare screens. It rendered a
+fresh Cloudflare desktop, created a marker through text/key input, recovered its
+selected viewer after publisher restart, and created a second marker. Both
+markers were independently read back; the disposable cloud agent and screen
+were removed. `/tmp/nanocodex-web-wrapup-20260908.json` records the checks and
+automation limits.
+
+Read-only broker requests returned HTTP 200 for GitHub, Gmail, Drive, and X.
+Calendar, Tasks, Contacts, Docs, Sheets, and Slides have retained connections but
+their Google APIs returned `SERVICE_DISABLED`; the Google Cloud project needs
+those APIs enabled. Slack is not connected. Provider inventory alone is not
+proof that every provider API is usable. Sanitized receipts are under
+`/tmp/nanocodex-live-connectors-20260908/`.
 
 ### Linux servers and vault SSH setup
+
+For native access without inbound SSH or a VM, configure the CLI with the same
+account credential, then run on the machine itself:
+
+```sh
+nanocodex2 native-hand --workspace /path/to/workspace
+```
+
+`native-hand` uses the CLI's account authentication and publishes the selected
+workspace and its native execution tools over the
+account's outbound connection. It persists the machine identity, reconnects
+after socket loss, and handles Ctrl-C/SIGTERM. A single-instance state lock
+prevents two processes from publishing the same identity. A different workspace
+requires its own `--state-dir`. Credentials are excluded from native command
+environments. This command provides native files/processes; desktop capture and
+VM factories remain separate capabilities.
+
+Real CLI checks passed on macOS and Linux with an isolated local account
+service: file/process requests, forced socket reconnect, process restart with
+the same catalog/UUID, credential filtering, and graceful shutdown. A separate
+disposable Linux container also joined the production account: a real cloud
+agent executed in its explicit native workdir, verified Linux, and wrote/read
+a marker. Restarting the process retained its identity and workspace; a fresh
+turn read the same marker. The agent, containers, volume, and publication were
+removed afterward. The receipt is under
+`/tmp/nanocodex-production-native-hand/f585d4b5-bff7-4210-8c00-dbf45fef1ff6/`.
+This does not establish connectivity to an external SSH server.
 
 `nanocodex-remote server-host` starts a headless labwc desktop directly on Linux,
 without a nested VM. It accepts `--url`, `--credential-file`, `--machine-id`,
@@ -253,8 +350,9 @@ Linux desktop lifecycle runs, including decoded JPEGs, terminal file creation,
 credential rotation, signaling reconnect with the same compositor, subsequent
 input, and revocation cleanup. Vault key generation/encrypted storage, actual SSH
 stdin transport, setup failure cleanup, and account browser onboarding also pass
-their focused tests. Publishing the release image, configuring the managed
-operator setting, and checking an external SSH server remain rollout work.
+their focused tests. The release image is now published for Linux arm64 and
+amd64, and production reports installation available. The vault currently has
+no SSH targets, so external server installation remains unverified.
 
 Both local desktop images were rebuilt with the updated Go daemon:
 `nanocodex-server-hand:evidence` for Linux arm64 and
@@ -273,6 +371,19 @@ a missing VM publication no longer exhausts all retries in seven seconds.
 Stalled reconnect attempts time out after ten seconds within that window.
 Disconnected canvases hide the old decoded frame. Remote Screens is also
 available inside iPhone conversations.
+
+Native viewer startup opens authenticated signaling and fetches ICE credentials
+concurrently. The initial offer reuses that credential request; later offers
+still refresh credentials. Cancellation and publication generation checks fence
+queued signals. Native and browser discovery show a loading state while the
+initial catalog request is pending. Actual decoded-frame benchmarks retain phase
+timestamps separately from app build and unit-test timing.
+
+When a factory's cloud connection is replaced, it delivers the new scoped
+desktop credential before waiting for the tools socket to reconnect. This lets
+the retained desktop republish during that independent handshake. Cancellation,
+allocation identity, and server-side lease checks remain in force. Transport
+diagnostics report reset categories without peer text or credentials.
 
 ### Cloudflare sandbox desktops
 
@@ -302,9 +413,12 @@ exclusive host lease, generation and sequence checks as WebRTC. These are paced
 screen updates, not the VM's 60 fps video transport.
 
 The real local Worker tests cover sandbox enrollment, intercepted publication,
-transport isolation, bounded frames/input, and revocation. The SDK container
-image and end-to-end Cloudflare runtime check are still being verified; no
-Cloudflare deployment has been made.
+transport isolation, bounded frames/input, and revocation. The production
+Cloudflare journey passed on September 7: a fresh sandbox mounted its workspace,
+rendered native frames, accepted input that created a file, resumed after viewer
+suspension with control released, and returned an agent screenshot. Deleting the
+test agent removed its screen. The receipt is retained under
+`/tmp/nanocodex-production-cloudflare-evidence/c32e6837-542d-4a2a-8301-0313f422e455/`.
 
 ### Additional viewer evidence
 

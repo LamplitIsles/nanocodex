@@ -239,19 +239,19 @@ struct RemoteSetupView: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.dismiss) private var dismiss
     @State private var advanced = false
-    var command: String { "nanocodex2 hand \\\n  --vm /path/to/linux.ext4 \\\n  --vm-guest-runtime /path/to/nanocodex-vm-guest \\\n  --vm-workspace /workspace \\\n  --machine-id remote-computer \\\n  --machine-name 'Remote computer'" }
+    var command: String { "nanocodex2 native-hand --workspace /path/to/workspace" }
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             Text("Connect another computer").font(.system(size: 23, weight: .semibold))
             VStack(alignment: .leading, spacing: 14) {
                 Label("Open Nanocodex on the other Mac.", systemImage: "1.circle")
-                Label("Connect the same Nanocodex account.", systemImage: "2.circle")
+                Label("Sign in with the same phone number.", systemImage: "2.circle")
                 Label("Its Hand connects automatically.", systemImage: "3.circle")
             }.font(.system(size: 14)).padding(.vertical, 6)
             Text("Its compute becomes available to your agents here. Keep Nanocodex running on that computer while you use it.").font(.system(size: 13)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-            DisclosureGroup("Server or VM with nanocodex2", isExpanded: $advanced) {
+            DisclosureGroup("Linux server with nanocodex2", isExpanded: $advanced) {
                 VStack(alignment: .leading, spacing: 12) {
-                    Text("With a prepared Linux image and guest runtime, set NANOCODEX_API_KEY in the server’s environment and run:").font(.system(size: 12)).foregroundStyle(.secondary)
+                    Text("Use the same Nanocodex account with nanocodex2 on the server, then choose a workspace. Its Hand connects outbound and gives the agent access to that workspace and the server’s installed tools.").font(.system(size: 12)).foregroundStyle(.secondary)
                     Text(command).font(.system(size: 11, design: .monospaced)).textSelection(.enabled).padding(14).frame(maxWidth: .infinity, alignment: .leading).background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 9))
                     Button("Copy Command") { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(command, forType: .string) }
                 }.padding(.top, 12)
