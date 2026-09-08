@@ -10,6 +10,7 @@
 mod config;
 mod hand_observability;
 mod host;
+mod native_hand;
 #[allow(dead_code)]
 mod installation;
 #[allow(dead_code)]
@@ -76,6 +77,8 @@ enum Command {
     Attach(Attach),
     /// Register one retained libkrun VM as a compute hand for the account.
     Hand(Hand),
+    /// Connect this machine's native workspace to the account over outbound HTTPS.
+    NativeHand(native_hand::NativeHand),
     /// Serve a bounded pool of on-demand libkrun VM hands.
     Host(Host),
     /// Create a managed agent and print its receipt as JSON.
@@ -379,6 +382,7 @@ async fn run(cli: Cli) -> Result<(), ManagedError> {
                 .map_err(|error| ManagedError::Configuration(error.to_string()))?;
             serve_vm_hand(&client, command).await
         }
+        Some(Command::NativeHand(command)) => native_hand::serve(&client, command).await,
         Some(Command::Host(_)) => unreachable!("handled before managed client setup"),
         Some(Command::New) => write_json(&client.create().await?),
         Some(Command::List) => write_json(&client.list().await?),
