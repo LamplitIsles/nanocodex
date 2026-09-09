@@ -57,6 +57,9 @@ pub struct ModelConfig {
     pub system_prompt: Option<Arc<str>>,
     /// Host instructions appended to the selected or overridden system prompt.
     pub additional_instructions: Option<Arc<str>>,
+    /// Optional consumer-owned instruction used to summarize context before
+    /// installing a replacement history.
+    pub companion_compaction_instruction: Option<Arc<str>>,
 }
 
 impl ModelConfig {
@@ -116,6 +119,7 @@ impl Default for ModelConfig {
             host_transport: None,
             system_prompt: None,
             additional_instructions: None,
+            companion_compaction_instruction: None,
         }
     }
 }

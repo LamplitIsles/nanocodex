@@ -807,6 +807,8 @@ struct WasmConfig {
     #[serde(default)]
     additional_instructions: Option<String>,
     #[serde(default)]
+    companion_compaction_instruction: Option<String>,
+    #[serde(default)]
     session_id: Option<String>,
     #[serde(default)]
     workspace: Option<String>,
@@ -815,6 +817,8 @@ struct WasmConfig {
     #[serde(default)]
     resume: Option<SessionSnapshot>,
     #[serde(default)]
+    history_seed: Option<WasmHistorySeed>,
+    #[serde(default)]
     durability_id: Option<String>,
     #[serde(default)]
     durability_host_id: Option<String>,
@@ -822,6 +826,14 @@ struct WasmConfig {
     terminal_receipt_retention: Option<usize>,
     #[serde(default)]
     subagents: Option<WasmSubagentsConfig>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WasmHistorySeed {
+    history: Vec<ResponseItem>,
+    #[serde(default)]
+    continuity_summary: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1286,9 +1298,13 @@ impl WasmNanocodex {
         if let Some(instructions) = config.additional_instructions {
             builder = builder.additional_instructions(instructions);
         }
+        if let Some(instruction) = config.companion_compaction_instruction {
+            builder = builder.companion_compaction_instruction(instruction);
+        }
         if let Some(session_id) = config.session_id {
             builder = builder.session_id(session_id.parse::<SessionId>().map_err(js_error)?);
         }
+        let history_workspace = config.workspace.clone().unwrap_or_else(|| ".".to_owned());
         if let Some(workspace) = config.workspace {
             builder = builder.workspace(workspace);
         }
@@ -1302,6 +1318,15 @@ impl WasmNanocodex {
         }
         if let Some(resume) = config.resume {
             builder = builder.resume(resume);
+        } else if let Some(seed) = config.history_seed {
+            let snapshot = SessionSnapshot::from_history(
+                model,
+                history_workspace,
+                seed.history,
+                seed.continuity_summary,
+            )
+            .map_err(js_error)?;
+            builder = builder.resume(snapshot);
         }
         if let (Some(route_id), Some(state_id)) = (config.durability_host_id, config.durability_id)
         {
@@ -1554,6 +1579,7 @@ impl WasmNanocodex {
         instruction: &str,
         operation_id: Option<String>,
         cancel_on_admission: Option<bool>,
+        supplementary_context: Option<String>,
     ) -> Result<WasmTurn, JsValue> {
         validate_operation_id(operation_id.as_deref())?;
         if instruction.trim().is_empty() {
@@ -1564,6 +1590,7 @@ impl WasmNanocodex {
             Prompt::new(instruction),
             operation_id,
             cancel_on_admission.unwrap_or(false),
+            supplementary_context,
         ))
     }
 
@@ -1578,6 +1605,7 @@ impl WasmNanocodex {
         content_json: &str,
         operation_id: Option<String>,
         cancel_on_admission: Option<bool>,
+        supplementary_context: Option<String>,
     ) -> Result<WasmTurn, JsValue> {
         validate_operation_id(operation_id.as_deref())?;
         Ok(WasmTurn::accept(
@@ -1585,6 +1613,7 @@ impl WasmNanocodex {
             parse_browser_prompt(content_json)?,
             operation_id,
             cancel_on_admission.unwrap_or(false),
+            supplementary_context,
         ))
     }
 
@@ -2821,6 +2850,7 @@ impl WasmTurn {
         prompt: Prompt,
         operation_id: Option<String>,
         cancel_on_admission: bool,
+        supplementary_context: Option<String>,
     ) -> Self {
         let state = Rc::new(RefCell::new(TurnState {
             accepted: None,
@@ -2836,6 +2866,9 @@ impl WasmTurn {
             }
             if cancel_on_admission {
                 request = request.cancel_on_admission();
+            }
+            if let Some(context) = supplementary_context {
+                request = request.supplementary_context(context);
             }
             let accepted = agent.prompt(request).await;
             match accepted {
@@ -3299,6 +3332,11 @@ fn validate(config: &WasmConfig) -> Result<(), JsValue> {
     if config.durability_id.is_some() != config.durability_host_id.is_some() {
         return Err(js_error(
             "durability_id and durability_host_id must be supplied together",
+        ));
+    }
+    if config.resume.is_some() && config.history_seed.is_some() {
+        return Err(js_error(
+            "resume and history_seed cannot be supplied together",
         ));
     }
     if config

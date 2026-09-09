@@ -275,6 +275,15 @@ pub(super) fn validate(config: &ModelConfig, prompt_cache_key: Option<&str>) -> 
             "prompt_cache_key must not be empty".to_owned(),
         ));
     }
+    if config
+        .companion_compaction_instruction
+        .as_deref()
+        .is_some_and(|instruction| instruction.trim().is_empty())
+    {
+        return Err(NanocodexError::InvalidRequest(
+            "companion compaction instruction must not be empty".to_owned(),
+        ));
+    }
     Ok(())
 }
 

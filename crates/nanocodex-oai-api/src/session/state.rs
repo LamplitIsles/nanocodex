@@ -337,6 +337,26 @@ impl ManagedSessionState {
         self.history_revision = self.history_revision.saturating_add(1);
     }
 
+    /// Installs a consumer-owned summary and the newest complete conversation
+    /// tail, then forces the next request to replay the replacement history.
+    #[doc(hidden)]
+    pub fn install_companion_compaction(
+        &mut self,
+        summary: ResponseItem,
+        initial_context: impl IntoIterator<Item = ResponseItem>,
+        request_prefix: &[ResponseItem],
+    ) {
+        let initial_context = initial_context.into_iter().collect::<Vec<_>>();
+        let history = compaction::install_companion_history(
+            &self.context.flattened_items(),
+            &initial_context,
+            summary,
+        );
+        self.context.replace_and_recompute(history, request_prefix);
+        self.reset_for_full_request();
+        self.history_revision = self.history_revision.saturating_add(1);
+    }
+
     /// Returns the monotonic number of installed history replacements.
     #[must_use]
     pub const fn history_revision(&self) -> u64 {

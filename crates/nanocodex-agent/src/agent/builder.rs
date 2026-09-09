@@ -82,6 +82,18 @@ impl<F> NanocodexBuilder<F> {
         self
     }
 
+    /// Uses a consumer-owned instruction for context compaction.
+    ///
+    /// When configured, explicit, automatic, and provider-overflow recovery
+    /// compaction requests a normal generation with this instruction and
+    /// installs its validated text as a client-owned checkpoint. Unconfigured
+    /// agents retain the provider compaction behavior.
+    #[must_use]
+    pub fn companion_compaction_instruction(mut self, instruction: impl Into<Arc<str>>) -> Self {
+        self.config.companion_compaction_instruction = Some(instruction.into());
+        self
+    }
+
     /// Overrides the `OpenAi` recipe's model thinking level for this agent.
     ///
     /// Without this call the agent inherits the client default. A later

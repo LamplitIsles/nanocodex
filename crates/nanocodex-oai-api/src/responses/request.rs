@@ -93,6 +93,27 @@ impl RequestProfile {
         Arc::clone(&self.prefix)
     }
 
+    /// Returns this profile with model-visible tool declarations removed.
+    ///
+    /// Consumer-owned summaries are ordinary generations, but they must not
+    /// be allowed to execute application tools. The profile metadata and
+    /// cache identity remain stable while the tool-specific mappings are
+    /// cleared.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn without_tools(mut self) -> Self {
+        self.prefix = Arc::from(
+            self.prefix
+                .iter()
+                .filter(|item| !matches!(item, ResponseItem::AdditionalTools { .. }))
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+        self.code_mode_tool_names = Arc::default();
+        self.tool_namespaces_info = Arc::new(tool_namespaces_info(&self));
+        self
+    }
+
     pub(crate) fn with_request_content(
         mut self,
         prompt_cache_key: String,

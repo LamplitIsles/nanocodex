@@ -2,7 +2,7 @@ use std::fmt;
 #[cfg(feature = "openai")]
 use std::sync::Arc;
 
-use nanocodex_oai_api::responses::ResponseItem;
+use nanocodex_oai_api::responses::{ContentItem, ResponseItem};
 #[cfg(feature = "openai")]
 use nanocodex_oai_api::{Model, responses::MessageRole};
 
@@ -148,6 +148,67 @@ impl fmt::Debug for SessionSnapshot {
 }
 
 impl SessionSnapshot {
+    /// Builds an engine-owned resume boundary from already selected history.
+    ///
+    /// The caller supplies only supported Responses items and an optional
+    /// continuity summary. Nanocodex creates the session lineage and cache
+    /// identity; callers do not need to fabricate serialized snapshot fields
+    /// or provider continuation IDs. Structural history validation runs when
+    /// the boundary is prepared for the agent driver.
+    #[cfg(feature = "openai")]
+    pub fn from_history(
+        model: Model,
+        workspace: impl Into<String>,
+        mut history: Vec<ResponseItem>,
+        continuity_summary: Option<String>,
+    ) -> Result<Self> {
+        let workspace = workspace.into();
+        if workspace.trim().is_empty() {
+            return Err(NanocodexError::InvalidSessionSnapshot(
+                "workspace must not be empty".to_owned(),
+            ));
+        }
+        let canonical_index = history
+            .iter()
+            .position(ResponseItem::is_user_message)
+            .ok_or_else(|| {
+                NanocodexError::InvalidSessionSnapshot(
+                    "history seed must contain a user message".to_owned(),
+                )
+            })?;
+        if let Some(summary) = continuity_summary {
+            if summary.trim().is_empty() {
+                return Err(NanocodexError::InvalidSessionSnapshot(
+                    "continuity summary must not be empty".to_owned(),
+                ));
+            }
+            history.insert(
+                canonical_index + 1,
+                ResponseItem::message(
+                    MessageRole::Developer,
+                    [ContentItem::input_text(format!(
+                        "<compacted-summary>\n{}\n</compacted-summary>",
+                        summary.trim()
+                    ))],
+                ),
+            );
+        }
+        let canonical_context = history[canonical_index].clone();
+        let lineage_id = SessionId::new().to_string();
+        Ok(Self {
+            version: SESSION_SNAPSHOT_VERSION,
+            model: model.as_str().to_owned(),
+            lineage_id: lineage_id.clone(),
+            prompt_cache_key: lineage_id,
+            workspace,
+            base_instructions: None,
+            request_prefix: None,
+            canonical_context,
+            history,
+            context_snapshot: None,
+        })
+    }
+
     #[cfg(all(feature = "openai", not(target_family = "wasm")))]
     pub(crate) fn from_rollout(
         model: Model,

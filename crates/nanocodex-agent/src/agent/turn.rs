@@ -262,6 +262,7 @@ pub struct PromptRequest {
     pub(super) prompt: Prompt,
     pub(super) request_id: Option<String>,
     pub(super) cancel_on_admission: bool,
+    pub(super) supplementary_context: Option<Arc<str>>,
 }
 
 impl PromptRequest {
@@ -275,6 +276,7 @@ impl PromptRequest {
             prompt: prompt.into(),
             request_id: None,
             cancel_on_admission: false,
+            supplementary_context: None,
         }
     }
 
@@ -296,6 +298,17 @@ impl PromptRequest {
     #[must_use]
     pub const fn cancel_on_admission(mut self) -> Self {
         self.cancel_on_admission = true;
+        self
+    }
+
+    /// Associates host-owned descriptive context with this real user input.
+    ///
+    /// The context is appended to the same model-visible user message after
+    /// admission. It does not create a separate user turn or wake an idle
+    /// agent by itself.
+    #[must_use]
+    pub fn supplementary_context(mut self, context: impl Into<Arc<str>>) -> Self {
+        self.supplementary_context = Some(context.into());
         self
     }
 }
@@ -371,6 +384,7 @@ pub(super) enum Command {
     Prompt {
         key: TurnKey,
         prompt: Prompt,
+        supplementary_context: Option<Arc<str>>,
         execution_operation: Option<ExecutionOperation>,
         accepted: Option<oneshot::Sender<Result<String>>>,
         cancel_on_admission: bool,
@@ -388,6 +402,7 @@ pub(super) enum Command {
     RoutePrompt {
         key: TurnKey,
         prompt: Prompt,
+        supplementary_context: Option<Arc<str>>,
         parent: Option<tracing::Span>,
         events: EventSink,
         turn_result: oneshot::Sender<Result<TurnResult>>,
@@ -467,6 +482,7 @@ pub(super) enum QueuedTurn {
     Pending {
         key: TurnKey,
         prompt: Prompt,
+        supplementary_context: Option<Arc<str>>,
         execution_operation: Option<String>,
         thinking: Thinking,
         fast_mode: bool,

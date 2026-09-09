@@ -1,6 +1,7 @@
 use super::*;
 
 mod compaction;
+mod companion;
 mod durable_provider;
 mod failures;
 mod normalization;

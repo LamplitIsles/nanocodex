@@ -101,6 +101,7 @@ where
                         QueuedTurn::Pending {
                             key,
                             prompt,
+                            supplementary_context,
                             execution_operation,
                             thinking,
                             fast_mode,
@@ -111,6 +112,7 @@ where
                             break Command::Prompt {
                                 key,
                                 prompt,
+                                supplementary_context,
                                 execution_operation: execution_operation
                                     .map(ExecutionOperation::Admitted),
                                 accepted: None,
@@ -304,6 +306,7 @@ where
             let Command::Prompt {
                 key,
                 prompt,
+                supplementary_context,
                 execution_operation,
                 accepted: _,
                 cancel_on_admission,
@@ -566,6 +569,7 @@ where
                                     Some(Command::Prompt {
                                         key,
                                         prompt,
+                                        supplementary_context,
                                         execution_operation,
                                         accepted: _,
                                         cancel_on_admission,
@@ -580,6 +584,7 @@ where
                                         queued_turns.push_back(queued_prompt(
                                             key,
                                             prompt,
+                                            supplementary_context,
                                             execution_operation,
                                             cancel_on_admission,
                                             default_thinking,
@@ -594,6 +599,7 @@ where
                                         let Some(Command::Prompt {
                                             key,
                                             prompt,
+                                            supplementary_context,
                                             execution_operation,
                                             accepted: _,
                                             cancel_on_admission,
@@ -630,6 +636,7 @@ where
                                         queued_turns.push_back(queued_prompt(
                                             key,
                                             prompt,
+                                            supplementary_context,
                                             execution_operation.map(ExecutionOperation::into_id),
                                             cancel_on_admission,
                                             default_thinking,
@@ -987,6 +994,7 @@ where
                 queued_turns.push_front(queued_prompt(
                     key,
                     prompt,
+                    supplementary_context,
                     execution_operation,
                     true,
                     thinking,
@@ -1092,6 +1100,7 @@ where
                 model
                     .execute(
                         prompt,
+                        supplementary_context,
                         self.workspace.clone(),
                         thinking,
                         fast_mode,
@@ -1158,6 +1167,7 @@ where
                             Some(Command::Prompt {
                                 key,
                                 prompt,
+                                supplementary_context,
                                 execution_operation,
                                 accepted: _,
                                 cancel_on_admission,
@@ -1172,6 +1182,7 @@ where
                                 queued_turns.push_back(queued_prompt(
                                     key,
                                     prompt,
+                                    supplementary_context,
                                     execution_operation,
                                     cancel_on_admission,
                                     default_thinking,
@@ -1782,6 +1793,7 @@ async fn accept_execution_command(
     let Command::Prompt {
         key,
         prompt,
+        supplementary_context,
         execution_operation: Some(operation),
         accepted: Some(accepted),
         cancel_on_admission,
@@ -1818,6 +1830,7 @@ async fn accept_execution_command(
             Some(Command::Prompt {
                 key,
                 prompt,
+                supplementary_context,
                 execution_operation: Some(ExecutionOperation::Admitted(operation_id)),
                 accepted: None,
                 cancel_on_admission,
@@ -1901,6 +1914,7 @@ async fn accept_idle_route(
     let Command::RoutePrompt {
         key,
         prompt,
+        supplementary_context,
         parent,
         events,
         turn_result,
@@ -1914,6 +1928,7 @@ async fn accept_idle_route(
         return Some(Command::Prompt {
             key,
             prompt,
+            supplementary_context,
             execution_operation: None,
             accepted: None,
             cancel_on_admission: false,
@@ -1942,6 +1957,7 @@ async fn accept_idle_route(
             Some(Command::Prompt {
                 key,
                 prompt,
+                supplementary_context,
                 execution_operation: Some(ExecutionOperation::Admitted(operation_id)),
                 accepted: None,
                 cancel_on_admission: false,

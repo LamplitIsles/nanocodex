@@ -9,6 +9,70 @@ export type PromptItem =
 
 export type PromptInput = string | readonly PromptItem[];
 
+/** Model-visible content accepted by an engine-owned history seed. */
+export type HistoryContentItem =
+  | { type: "input_text"; text: string }
+  | { type: "input_image"; image_url: string; detail?: "auto" | "low" | "high" | "original" | undefined }
+  | { type: "input_audio"; audio_url: string }
+  | { type: "output_text"; text: string };
+
+/** Function or custom-tool output accepted in a history seed. */
+export type HistoryToolOutput = string | readonly (
+  | { type: "input_text"; text: string }
+  | { type: "input_image"; image_url: string; detail?: "auto" | "low" | "high" | "original" | undefined }
+  | { type: "input_audio"; audio_url: string }
+  | { type: "encrypted_content"; encrypted_content: string }
+)[];
+
+/** Supported typed Responses items for engine-owned history hydration. */
+export type HistoryItem =
+  | Readonly<{
+    type: "message";
+    role: "developer" | "user" | "assistant";
+    content: readonly HistoryContentItem[];
+    id?: string | undefined;
+    status?: "in_progress" | "completed" | "incomplete" | "failed" | undefined;
+    phase?: "commentary" | "final_answer" | undefined;
+  }>
+  | Readonly<{
+    type: "function_call";
+    name: string;
+    arguments: string;
+    call_id: string;
+    id?: string | undefined;
+  }>
+  | Readonly<{
+    type: "function_call_output";
+    call_id: string;
+    output: HistoryToolOutput;
+    id?: string | undefined;
+  }>
+  | Readonly<{
+    type: "custom_tool_call";
+    call_id: string;
+    name: string;
+    input: string;
+    id?: string | undefined;
+  }>
+  | Readonly<{
+    type: "custom_tool_call_output";
+    call_id: string;
+    name?: string | undefined;
+    output: HistoryToolOutput;
+    id?: string | undefined;
+  }>
+  | Readonly<{
+    type: "compaction";
+    encrypted_content: string;
+    id?: string | undefined;
+  }>;
+
+/** Already selected conversation state that the engine will validate and own. */
+export type HistorySeed = Readonly<{
+  history: readonly HistoryItem[];
+  continuitySummary?: string | undefined;
+}>;
+
 export type AgentEvent = {
   protocol_version: number;
   request_id: string;
@@ -22,6 +86,10 @@ export type AgentOptions = {
   instructions?: string | undefined;
   /** Appends host instructions while retaining the selected model's prompt. */
   additionalInstructions?: string | undefined;
+  /** Generates client-owned context summaries instead of provider compaction. */
+  companionCompactionInstruction?: string | undefined;
+  /** Hydrates a validated active history; cannot be combined with resume. */
+  historySeed?: HistorySeed | undefined;
   model?: Model | undefined;
   reasoningMode?: ReasoningMode | undefined;
   fastMode?: boolean | undefined;
@@ -341,6 +409,8 @@ export type AgentActions = {
     prompt(options: {
       input: PromptInput;
       id?: string | undefined;
+      /** Host-resolved evidence attached to this same model input. */
+      supplementaryContext?: string | undefined;
     }): Turn;
   };
 };

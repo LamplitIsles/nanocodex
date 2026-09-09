@@ -23,15 +23,17 @@ pub(in crate::model) fn task_input(
     prompt: &Prompt,
     user_content: Vec<ContentItem>,
     context: &ContextSnapshot,
+    supplementary_context: Option<&str>,
 ) -> Vec<ResponseItem> {
     let mut input = vec![developer_context(), context.full_item()];
-    input.extend(prompt_messages(prompt, user_content));
+    input.extend(prompt_messages(prompt, user_content, supplementary_context));
     input
 }
 
 pub(in crate::model) fn prompt_messages(
     prompt: &Prompt,
     user_content: Vec<ContentItem>,
+    supplementary_context: Option<&str>,
 ) -> Vec<ResponseItem> {
     let mut input = Vec::with_capacity(prompt.transcript().len() + 1);
     input.extend(prompt.transcript().iter().map(|message| {
@@ -45,6 +47,10 @@ pub(in crate::model) fn prompt_messages(
         };
         ResponseItem::message(role, [content])
     }));
+    let mut user_content = user_content;
+    if let Some(supplementary_context) = supplementary_context {
+        user_content.push(ContentItem::input_text(supplementary_context));
+    }
     input.push(ResponseItem::message(MessageRole::User, user_content));
     input
 }
@@ -163,6 +169,7 @@ mod tests {
                 text: "fix the bug".into(),
             }],
             &context,
+            None,
         );
         assert_eq!(
             serde_json::to_value(input).unwrap(),
@@ -217,6 +224,7 @@ mod tests {
             &prompt,
             vec![ContentItem::input_text("return the second answer")],
             &context,
+            None,
         );
 
         let roles = input
@@ -244,7 +252,7 @@ mod tests {
             PromptMessage::assistant("answer"),
         ]);
 
-        let input = prompt_messages(&prompt, vec![ContentItem::input_text("continue")]);
+        let input = prompt_messages(&prompt, vec![ContentItem::input_text("continue")], None);
         let roles = input
             .iter()
             .map(|item| serde_json::to_value(item).unwrap()["role"].clone())
@@ -258,6 +266,24 @@ mod tests {
                 json!("assistant"),
                 json!("user")
             ]
+        );
+    }
+
+    #[test]
+    fn supplementary_context_is_attached_to_the_real_final_user_message() {
+        let prompt = Prompt::new("what should I remember?");
+        let input = prompt_messages(
+            &prompt,
+            vec![ContentItem::input_text("what should I remember?")],
+            Some("<hindsight_context>tea preference</hindsight_context>"),
+        );
+        assert_eq!(input.len(), 1);
+        let value = serde_json::to_value(&input[0]).unwrap();
+        assert_eq!(value["role"], "user");
+        assert_eq!(value["content"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            value["content"][1]["text"],
+            "<hindsight_context>tea preference</hindsight_context>"
         );
     }
 

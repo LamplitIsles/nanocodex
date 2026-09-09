@@ -63,7 +63,6 @@ where
             }
         };
         let Some(compacted) = compacted else {
-            session.conversation.reset_for_full_request();
             let checkpoint =
                 Self::checkpoint_from_session(&session, false, self.global_instructions.clone());
             self.session = Some(session);
@@ -72,7 +71,6 @@ where
         let (item, _usage, server_reasoning_included) = match compacted {
             Ok(compacted) => compacted,
             Err(error) => {
-                session.conversation.reset_for_full_request();
                 let checkpoint = Self::checkpoint_from_session(
                     &session,
                     false,
@@ -85,9 +83,11 @@ where
         session
             .conversation
             .observe_server_reasoning(server_reasoning_included);
-        session
-            .conversation
-            .install_pre_turn_compaction(item, session.factory.profile().prefix());
+        session.conversation.install_pre_turn_compaction(
+            item,
+            session.factory.profile().prefix(),
+            self.config.companion_compaction_instruction.is_some(),
+        );
         session.conversation.commit_tail();
         session.context.require_full_reinjection();
         session.preserve_inherited_delta = false;
@@ -181,6 +181,7 @@ where
     pub(crate) async fn execute(
         &mut self,
         task: Prompt,
+        supplementary_context: Option<Arc<str>>,
         workspace: Option<Arc<str>>,
         thinking: Thinking,
         fast_mode: bool,
@@ -217,6 +218,7 @@ where
         let outcome = self
             .execute_task(
                 task,
+                supplementary_context,
                 workspace,
                 logical_turn,
                 steering,
@@ -341,6 +343,7 @@ where
         &mut self,
         session: &mut ModelSessionState,
         task: &Prompt,
+        supplementary_context: Option<&str>,
         cancel: &mut tokio::sync::oneshot::Receiver<()>,
     ) -> Result<bool> {
         let compacted = {
@@ -364,7 +367,7 @@ where
             let user_content = prepare_user_input(&task.instruction).await;
             session
                 .conversation
-                .append(prompt_messages(task, user_content));
+                .append(prompt_messages(task, user_content, supplementary_context));
             return Ok(false);
         };
         if compacted || session.preserve_inherited_delta {
@@ -400,13 +403,14 @@ where
         let user_content = prepare_user_input(&task.instruction).await;
         session
             .conversation
-            .append(prompt_messages(task, user_content));
+            .append(prompt_messages(task, user_content, supplementary_context));
         Ok(true)
     }
 
     pub(super) async fn execute_task(
         &mut self,
         task: Prompt,
+        supplementary_context: Option<Arc<str>>,
         requested_workspace: Option<Arc<str>>,
         logical_turn: u64,
         steering: TurnSteering,
@@ -423,7 +427,12 @@ where
                 .conversation
                 .prepare_request_policy(self.continuation_policy());
             match self
-                .prepare_follow_on_turn(&mut session, &task, cancel)
+                .prepare_follow_on_turn(
+                    &mut session,
+                    &task,
+                    supplementary_context.as_deref(),
+                    cancel,
+                )
                 .await
             {
                 Ok(true) => {}
@@ -461,7 +470,12 @@ where
                 tools.default_shell_name(),
                 self.context_source.execution_environment(),
             );
-            let mut history = task_input(&task, user_content, &context_snapshot);
+            let mut history = task_input(
+                &task,
+                user_content,
+                &context_snapshot,
+                supplementary_context.as_deref(),
+            );
             if !self.pending_developer_messages.is_empty() {
                 history.splice(2..2, self.pending_developer_messages.drain(..));
             }
@@ -856,7 +870,7 @@ where
             }
             let instruction_bytes = steer.prompt.text_bytes();
             let user_content = prepare_user_input(&steer.prompt.instruction).await;
-            conversation.append(prompt_messages(&steer.prompt, user_content));
+            conversation.append(prompt_messages(&steer.prompt, user_content, None));
             self.stats.steers += 1;
             self.events.emit(
                 AgentEventKind::RunSteered,
