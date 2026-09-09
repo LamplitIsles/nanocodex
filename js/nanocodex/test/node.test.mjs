@@ -3,12 +3,17 @@ import { readFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { test } from "node:test";
 import { WebSocketServer } from "ws";
+import asyncVariant from "@jitl/quickjs-wasmfile-release-asyncify";
+import { newQuickJSAsyncWASMModuleFromVariant } from "quickjs-emscripten-core";
 
 import { Actions, Agent, Subagents, Transport } from "../node/index.mjs";
 import { createNodeHost } from "../node/host.mjs";
 import { createMemoryDurabilityStore } from "../runtime/durability-store.mjs";
+import { createQuickJsEvaluator } from "../runtime/quickjs-evaluator.mjs";
 import { createWorkspace } from "../runtime/workspace.mjs";
 import { createTools } from "../tools/Tools.mjs";
+
+const quickJs = await newQuickJSAsyncWASMModuleFromVariant(asyncVariant);
 
 const SESSION_IDS = Object.freeze({
   primary: "018f1f9a-7b3c-7a01-8000-000000000001",
@@ -21,6 +26,7 @@ const SESSION_IDS = Object.freeze({
   ambiguousSeed: "018f1f9a-7b3c-7a0a-8000-00000000000a",
   queuedSupplementary: "018f1f9a-7b3c-7a0b-8000-00000000000b",
   durableCompanion: "018f1f9a-7b3c-7a0c-8000-00000000000c",
+  cancelledCompanion: "018f1f9a-7b3c-7a0d-8000-00000000000d",
   left: "018f1f9a-7b3c-7a05-8000-000000000005",
   right: "018f1f9a-7b3c-7a06-8000-000000000006",
 });
@@ -261,6 +267,7 @@ test("Node-hosted WASM preserves follow-ons, cache identity, events, and custom 
     thinking: "none",
     reasoningMode: "pro",
     sessionId: SESSION_IDS.primary,
+    codeEvaluator: createQuickJsEvaluator(quickJs),
     tools: {
       multiply: {
         description: "Multiply two integers.",
@@ -1120,6 +1127,7 @@ test("Node WASM hydrates typed history and rejects ambiguous or unsupported seed
 
 test("Node WASM uses Companion compaction for success and preserves context on failure", async () => {
   const server = await startServer();
+  const events = [];
   const agent = await createWarmAgent({
     apiKey: "test-key",
     websocketUrl: server.url,
@@ -1127,6 +1135,8 @@ test("Node WASM uses Companion compaction for success and preserves context on f
     sessionId: SESSION_IDS.right,
     companionCompactionInstruction: "Keep durable facts and recent work.",
   });
+  const watch = agent.events.watch();
+  watch.onEvent((event) => events.push(event));
   const readerState = {};
   try {
     const scenario = (async () => {
@@ -1135,17 +1145,17 @@ test("Node WASM uses Companion compaction for success and preserves context on f
       await reader.next();
       sendWarmup(socket, "resp-companion-warmup");
       await reader.next();
-      sendFinal(socket, "resp-companion-first", "first answer");
+      sendStreamedFinal(socket, "resp-companion-first", "first answer");
       const compact = await reader.next();
       readerState.compact = compact;
       assert.equal(compact.previous_response_id, undefined);
       assert.doesNotMatch(JSON.stringify(compact.input), /additional_tools/);
       assert.match(JSON.stringify(compact.input), /Keep durable facts and recent work/);
-      sendFinal(socket, "resp-companion-summary", "durable facts");
+      sendStreamedFinal(socket, "resp-companion-summary", "PRIVATE_SUMMARY_MARKER");
       const followOn = await reader.next();
       readerState.followOn = followOn;
       assert.equal(followOn.previous_response_id, undefined);
-      assert.match(JSON.stringify(followOn.input), /durable facts/);
+      assert.match(JSON.stringify(followOn.input), /PRIVATE_SUMMARY_MARKER/);
       sendFinal(socket, "resp-companion-follow-on", "continued");
       const failed = await reader.next();
       readerState.failed = failed;
@@ -1171,11 +1181,104 @@ test("Node WASM uses Companion compaction for success and preserves context on f
       "recovered",
     );
     await scenario;
+    await new Promise((resolve) => setImmediate(resolve));
     assert.equal(readerState.compact.generate, undefined);
     assert.equal(readerState.failed.generate, undefined);
+    assert.ok(events.some((event) =>
+      event.type === "assistant.delta" && event.payload.text === "first answer"));
+    assert.ok(events.some((event) =>
+      event.type === "assistant.message" && event.payload.text === "first answer"));
+    assert.equal(events.filter((event) =>
+      (event.type === "assistant.delta" || event.type === "assistant.message")
+      && event.payload.text.includes("PRIVATE_SUMMARY_MARKER")).length, 0);
+    assert.ok(events.some((event) =>
+      event.type === "api.event" && JSON.stringify(event).includes("PRIVATE_SUMMARY_MARKER")));
+    assert.ok(events.some((event) => event.type === "model.compaction.completed"));
   } finally {
+    watch.off();
     agent.dispose();
     await server.close();
+  }
+});
+
+test("Node WASM cancels an in-flight Companion summary without publishing it", async () => {
+  const durabilityId = "node-cancelled-companion-summary";
+  const durability = createMemoryDurabilityStore(durabilityId);
+  const options = {
+    apiKey: "test-key",
+    thinking: "none",
+    sessionId: SESSION_IDS.cancelledCompanion,
+    durability,
+    durabilityId,
+    companionCompactionInstruction: "Keep the durable cancellation facts.",
+  };
+  const server = await startServer();
+  let resolveSummarySeen;
+  const summarySeen = new Promise((resolve) => { resolveSummarySeen = resolve; });
+  let agent;
+  let watch;
+  const events = [];
+  try {
+    agent = await createWarmAgent({ ...options, websocketUrl: server.url });
+    watch = agent.events.watch();
+    watch.onEvent((event) => events.push(event));
+    const scenario = (async () => {
+      const socket = await server.connection;
+      const reader = messageReader(socket);
+      await reader.next();
+      sendWarmup(socket, "resp-cancelled-companion-warmup");
+      const first = await reader.next();
+      assert.match(JSON.stringify(first.input), /before Companion cancellation/);
+      sendFinal(socket, "resp-cancelled-companion-first", "before cancellation");
+      const summary = await reader.next();
+      assert.equal(summary.previous_response_id, undefined);
+      assert.match(JSON.stringify(summary.input), /Keep the durable cancellation facts/);
+      resolveSummarySeen(summary);
+    })();
+    assert.equal(
+      (await agent.turn.prompt({ input: "before Companion cancellation" }).result()).finalMessage,
+      "before cancellation",
+    );
+    const compacting = agent.session.compact();
+    await bounded(summarySeen, "in-flight Companion summary");
+    await agent.session.shutdown();
+    await assert.rejects(compacting);
+    await bounded(scenario, "cancelled Companion summary request");
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(
+      events.filter((event) => event.type === "model.compaction.completed").length,
+      0,
+    );
+    agent = undefined;
+  } finally {
+    watch?.off();
+    if (agent) await agent.session.shutdown().catch(() => {});
+    await server.close();
+  }
+
+  const resumedServer = await startServer();
+  let resumed;
+  try {
+    resumed = await createWarmAgent({ ...options, websocketUrl: resumedServer.url });
+    const resumedScenario = (async () => {
+      const socket = await resumedServer.connection;
+      const request = await messageReader(socket).next();
+      assert.equal(request.previous_response_id, undefined);
+      const input = JSON.stringify(request.input);
+      assert.match(input, /before Companion cancellation/);
+      assert.match(input, /after cancelled Companion compaction/);
+      assert.doesNotMatch(input, /PRIVATE_CANCELLED_SUMMARY/);
+      sendFinal(socket, "resp-cancelled-companion-resumed", "recovered after cancellation");
+    })();
+    assert.equal(
+      (await resumed.turn.prompt({ input: "after cancelled Companion compaction" }).result())
+        .finalMessage,
+      "recovered after cancellation",
+    );
+    await bounded(resumedScenario, "fresh resume after cancelled Companion summary");
+  } finally {
+    if (resumed) await resumed.session.shutdown().catch(() => {});
+    await resumedServer.close();
   }
 });
 
@@ -1543,6 +1646,30 @@ function sendFinal(socket, responseId, text) {
     role: "assistant",
     content: [{ type: "output_text", text }],
   }]);
+}
+
+function sendStreamedFinal(socket, responseId, text) {
+  const itemId = `${responseId}-item`;
+  socket.send(JSON.stringify({
+    type: "response.output_item.added",
+    output_index: 0,
+    item: { id: itemId, type: "message", role: "assistant", content: [] },
+  }));
+  socket.send(JSON.stringify({
+    type: "response.output_text.delta",
+    output_index: 0,
+    delta: text,
+  }));
+  socket.send(JSON.stringify({
+    type: "response.output_item.done",
+    item: {
+      id: itemId,
+      type: "message",
+      role: "assistant",
+      content: [{ type: "output_text", text }],
+    },
+  }));
+  sendCompleted(socket, responseId, []);
 }
 
 function sendCompleted(socket, responseId, output) {

@@ -75,6 +75,7 @@ pub(crate) async fn run(
                 &request.observer,
                 required_call_index(request)?,
                 started_at,
+                request.display_events(),
             )
             .await?,
         ),

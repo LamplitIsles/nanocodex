@@ -413,6 +413,7 @@ impl ResponsesService {
                     &request.observer,
                     required_call_index(request)?,
                     started_at,
+                    request.display_events(),
                 )
                 .await
                 .map_err(|error| error.with_connection_generation(generation))?,

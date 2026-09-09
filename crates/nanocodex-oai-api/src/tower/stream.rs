@@ -242,6 +242,7 @@ pub(crate) async fn receive<S>(
     observer: &ResponsesObserver,
     call_index: u32,
     started_at: Instant,
+    display_events: bool,
 ) -> Result<GenerationOutput, ResponsesServiceError>
 where
     S: ResponseEventSource,
@@ -280,39 +281,45 @@ where
                 output_index,
                 delta,
             } => {
-                let item = output_index.and_then(|index| assistant_items.get(&index));
-                emit_display_delta(
-                    &observer.events,
-                    &mut timing,
-                    AgentEventKind::AssistantDelta,
-                    AssistantTextDelta {
-                        model_call_index: call_index,
-                        item_id: item.and_then(|item| item.item_id.as_deref()),
-                        phase: item.and_then(|item| item.phase),
-                        text: &delta,
-                    },
-                    received.received_ns,
-                    received.api_event_seq,
-                    delta.len(),
-                )?;
+                if display_events {
+                    let item = output_index.and_then(|index| assistant_items.get(&index));
+                    emit_display_delta(
+                        &observer.events,
+                        &mut timing,
+                        AgentEventKind::AssistantDelta,
+                        AssistantTextDelta {
+                            model_call_index: call_index,
+                            item_id: item.and_then(|item| item.item_id.as_deref()),
+                            phase: item.and_then(|item| item.phase),
+                            text: &delta,
+                        },
+                        received.received_ns,
+                        received.api_event_seq,
+                        delta.len(),
+                    )?;
+                }
             }
             ServerEvent::ReasoningSummaryTextDelta { delta, .. }
             | ServerEvent::ReasoningSummaryDelta { delta, .. } => {
-                emit_display_delta(
-                    &observer.events,
-                    &mut timing,
-                    AgentEventKind::ReasoningSummaryDelta,
-                    TextDelta {
-                        model_call_index: call_index,
-                        text: &delta,
-                    },
-                    received.received_ns,
-                    received.api_event_seq,
-                    delta.len(),
-                )?;
+                if display_events {
+                    emit_display_delta(
+                        &observer.events,
+                        &mut timing,
+                        AgentEventKind::ReasoningSummaryDelta,
+                        TextDelta {
+                            model_call_index: call_index,
+                            text: &delta,
+                        },
+                        received.received_ns,
+                        received.api_event_seq,
+                        delta.len(),
+                    )?;
+                }
             }
             ServerEvent::OutputItemDone { item } => {
-                emit_assistant_message(&observer.events, call_index, &item)?;
+                if display_events {
+                    emit_assistant_message(&observer.events, call_index, &item)?;
+                }
                 done_items.push(item);
             }
             ServerEvent::Completed { mut response } => {

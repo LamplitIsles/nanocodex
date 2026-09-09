@@ -617,16 +617,18 @@ where
             [ContentItem::input_text(instruction.as_ref())],
         ));
         let factory = factory.without_tools();
-        let request = factory.generation(
-            after_model_call_index,
-            history.clone(),
-            history,
-            0,
-            None,
-            model,
-            thinking,
-            fast_mode,
-        );
+        let request = factory
+            .generation(
+                after_model_call_index,
+                history.clone(),
+                history,
+                0,
+                None,
+                model,
+                thinking,
+                fast_mode,
+            )
+            .suppress_display_events();
         let (input_item_count, input_bytes, input_content) = trace_model_input(&request);
         let span = compaction_span(after_model_call_index, input_item_count, input_bytes);
         if let Some(input_content) = &input_content {

@@ -163,6 +163,7 @@ pub struct ResponsesAttempt {
     pub(crate) attempt: u32,
     pub(crate) max_attempts: u32,
     full_replay: bool,
+    display_events: bool,
     pub(crate) logical_turn: u64,
     session_transport: Arc<SessionTransport>,
 }
@@ -192,6 +193,7 @@ impl ResponsesAttempt {
             attempt: 1,
             max_attempts: 1,
             full_replay: false,
+            display_events: true,
             logical_turn: 0,
             session_transport,
         }
@@ -227,6 +229,7 @@ impl ResponsesAttempt {
             attempt: 1,
             max_attempts: RESPONSE_MAX_ATTEMPTS.get(),
             full_replay: previous_response_id.is_none(),
+            display_events: true,
             logical_turn: 0,
             session_transport,
         }
@@ -263,6 +266,7 @@ impl ResponsesAttempt {
             attempt: 1,
             max_attempts: RESPONSE_MAX_ATTEMPTS.get(),
             full_replay: previous_response_id.is_none(),
+            display_events: true,
             logical_turn: 0,
             session_transport,
         }
@@ -327,6 +331,19 @@ impl ResponsesAttempt {
     /// Iterates over the exact input items this physical attempt will send.
     pub fn input_items(&self) -> impl Iterator<Item = &ResponseItem> {
         self.input().iter()
+    }
+
+    pub(crate) const fn display_events(&self) -> bool {
+        self.display_events
+    }
+
+    /// Suppresses assistant and reasoning display projections for maintenance
+    /// generations while retaining transport diagnostics and the result.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn suppress_display_events(mut self) -> Self {
+        self.display_events = false;
+        self
     }
 
     /// Emits one normalized event for callers streaming this attempt.
