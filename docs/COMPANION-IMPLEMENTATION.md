@@ -2,6 +2,11 @@
 
 Status: implemented on `companion-dsh-wasm`
 
+The implementation is in `54f876f2` (`feat(companion): expose wasm
+continuity seams`); the focused review closure is in `ce4cbffb`
+(`fix(companion): close review contract gaps`). This report records the final
+verification of both commits.
+
 This document records the engine-side contract delivered for the DSH Companion
 embedding. It is intentionally narrower than a DSH integration acceptance
 report: the DSH application, plugin lifecycle, transcript projection, recall
@@ -74,6 +79,14 @@ tools. Agents without the option retain the existing provider compaction path.
 Compaction lifecycle events use the existing model-compaction started,
 completed, and failed event kinds; no DSH-specific event type was added.
 
+Maintenance summary generations are deliberately quiet in the user-facing
+display projection: assistant deltas, assistant messages, and reasoning-summary
+deltas from the private summary request are suppressed. The raw `api.event`
+transport projection still retains the provider payload for diagnostics, and
+the normal answer generation keeps its ordinary display events. The summary
+request therefore cannot leak its private marker through the assistant
+transcript while preserving the existing transport and lifecycle evidence.
+
 ## Evidence
 
 All model-facing checks use a local scripted Responses peer or an in-process
@@ -84,7 +97,7 @@ used.
 | --- | --- |
 | persona replacement, QuickJS/Code Mode host tool, events, and follow-ons | generated Node/WASM `test/node.test.mjs` existing host-tool journey |
 | ordinary and separately queued supplementary context | generated Node/WASM tests `Node WASM attaches supplementary context to the real prompt input` and `Node WASM preserves supplementary context on separately queued inputs` |
-| successful custom compaction and failed-summary preservation through WASM | generated Node/WASM test `Node WASM uses Companion compaction for success and preserves context on failure`; the existing native `cancellation_during_pre_turn_compaction_retains_the_accepted_prompt` test covers cancellation at the same accepted-boundary seam |
+| successful custom compaction, failed-summary preservation, and cancellation without publication through WASM | generated Node/WASM tests `Node WASM uses Companion compaction for success and preserves context on failure` and `Node WASM cancels an in-flight Companion summary without publishing it`; the streamed success case also proves normal answer display events remain while the private summary marker is retained only in raw API evidence |
 | explicit automatic pressure and provider overflow route through the custom policy | native `model::recovery::companion` scripted-service tests |
 | pressure during a tool turn and no repeated side effect | native `mid_tool_pressure_compacts_after_the_tool_without_rerunning_it` test; a test-owned marker is written once |
 | typed text/media/tool-pair hydration, no historical execution, and validation errors | generated Node/WASM `Node WASM hydrates typed history and rejects ambiguous or unsupported seeds` |
@@ -125,33 +138,30 @@ development; neither repository requires npm publication for this engine PR.
 
 ## Checks run for this implementation
 
-The focused native companion tests pass (3 tests), the generated Node/WASM
-node suite passes (23 tests), and the API/unit suites, type checks, package
-check, WASM build, tarball inspection, and corrected keyless packed consumer
-probe pass. The complete package functional suite also passes (558 tests).
-The package's combined `test` script reaches its performance benchmark after
-those 558 tests, but exits non-zero because the existing
-`a precompiled browser module instantiates once across isolated agents`
-benchmark measures 2,686,976 retained linear-memory bytes against its
-2,500,000-byte ceiling. A bounded fixed-point comparison built the
-2259311e297e28233336262a127132a44476fff7 WASM artifact with the same
-Rust/wasm-bindgen toolchain and measured the same 2,686,976 bytes after Agent
-creation, so this is a pre-existing benchmark/toolchain threshold issue rather
-than a Companion regression. No performance limit or unrelated memory rewrite
-was made. The benchmark's other four tests pass, including the 96-turn durable
-history test. The packed probe's resume and history-seed instances
-intentionally start with direct generation rather than warmup; that is the
-expected full-replay contract.
+The focused native Companion checks pass. The generated Node/WASM suite has 24
+total tests, the lifecycle checks pass, and the complete package functional
+suite has 559 tests. The API/unit suites,
+type checks, package check, current WASM build, fresh tarball inspection, and
+the corrected keyless packed consumer probe also pass. The packed probe's
+resume and history-seed instances intentionally start with direct generation
+rather than warmup; that is the expected full-replay contract.
 
-The implementation adds 3 native recovery tests and 2 generated Node/WASM
-contract tests, in addition to the public mapping/history/compaction coverage.
-The changed product/test surface is materially below the estimate in the
-working spec because it reuses the existing transport, host durability, event,
-QuickJS, and package-test infrastructure instead of carrying forward the
-native spike's sidecar or fixture workspace.
 The existing high-memory durability test was also corrected to call the
 generated wasm-bindgen allocator/free exports; this is a test-harness symbol
 correction, not a product memory change.
+
+## Change accounting
+
+Relative to fixed point `2259311e297e28233336262a127132a44476fff7`, the final
+implementation tree changes approximately 2,000 lines, within the working spec's
+1,400–2,600 estimate. The category breakdown counts additions plus deletions:
+
+| Surface | Additions | Deletions | Changed |
+| --- | ---: | ---: | ---: |
+| product | 719 | 62 | 781 |
+| tests | 919 | 2 | 921 |
+| docs | 266 | 0 | 266 |
+| total | 1,904 | 64 | 1,968 |
 
 ## Ticket coverage
 
@@ -160,9 +170,9 @@ The five implementation tickets are delivered together on this branch:
 | Ticket | Delivered surface |
 | --- | --- |
 | 01 — context and host tool | Rust prompt admission/queue propagation, public supplementary context, generated WASM host-tool journey, and queued-input capture |
-| 02 — continuity compaction | consumer-owned tool-free summary generation, explicit/pressure/overflow routing, retained-tail installation, and failure/cancellation preservation |
+| 02 — continuity compaction | consumer-owned tool-free summary generation, explicit/pressure/overflow routing, retained-tail installation, failure/cancellation preservation, and quiet private-summary display projections |
 | 03 — history and checkpoints | engine-owned typed history seed, validation and historical-tool suppression, public replay capture, and fresh host-store resume |
-| 04 — packed contract | generated artifacts, package/type checks, 558-test functional suite, local packed tarballs, and the keyless extracted consumer |
+| 04 — packed contract | generated artifacts, package/type checks, 559-test functional suite, local packed tarballs, and the keyless extracted consumer |
 | 05 — documentation | this report and the affected package README; root entrypoint and agent-convention files remain unchanged for the reasons below |
 
 ## Boundary and non-claims
