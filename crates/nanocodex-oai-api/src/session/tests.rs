@@ -823,7 +823,7 @@ async fn dropping_an_unpolled_response_performs_no_work() {
 }
 
 #[test]
-fn session_ids_are_serializable_uuid_v7_values() {
+fn session_ids_are_serializable_uuid_values() {
     let id = SessionId::new();
     assert_eq!(id.as_uuid().get_version_num(), 7);
 
@@ -831,6 +831,11 @@ fn session_ids_are_serializable_uuid_v7_values() {
     assert_eq!(serde_json::from_str::<SessionId>(&encoded).unwrap(), id);
     assert!(
         "550e8400-e29b-41d4-a716-446655440000"
+            .parse::<SessionId>()
+            .is_ok()
+    );
+    assert!(
+        "550e8400-e29b-11d4-a716-446655440000"
             .parse::<SessionId>()
             .is_err()
     );

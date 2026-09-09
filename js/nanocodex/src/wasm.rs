@@ -1358,7 +1358,7 @@ impl WasmNanocodex {
         self.inner.agent_id().to_owned()
     }
 
-    /// Returns the stable `UUIDv7` session identity.
+    /// Returns the stable UUID session identity (`UUIDv7` by default).
     #[wasm_bindgen(getter, js_name = sessionId)]
     #[must_use]
     pub fn session_id(&self) -> String {
