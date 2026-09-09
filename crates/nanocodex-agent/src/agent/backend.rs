@@ -34,6 +34,8 @@ pub struct BackendPrompt {
     pub key: BackendTurnKey,
     /// Validated prompt input.
     pub prompt: Prompt,
+    /// Optional descriptive context associated with this real input.
+    pub supplementary_context: Option<Arc<str>>,
     /// Optional caller-owned durable operation identity.
     pub request_id: Option<String>,
     /// Whether the prompt must be durably cancelled as part of admission.
@@ -258,6 +260,7 @@ impl LifecycleBackend for LocalLifecycle {
                 .send(Command::Prompt {
                     key: TurnKey(request.key.0),
                     prompt: request.prompt,
+                    supplementary_context: request.supplementary_context,
                     execution_operation,
                     accepted,
                     cancel_on_admission: request.cancel_on_admission,
@@ -304,6 +307,7 @@ impl LifecycleBackend for LocalLifecycle {
                 .send(Command::RoutePrompt {
                     key: TurnKey(request.key.0),
                     prompt: request.prompt,
+                    supplementary_context: request.supplementary_context,
                     parent,
                     events: EventSink::from_publisher(request.events),
                     turn_result,

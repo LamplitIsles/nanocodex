@@ -125,6 +125,7 @@ pub(super) fn queued_execution_operation(
 pub(super) fn queued_prompt(
     key: TurnKey,
     prompt: Prompt,
+    supplementary_context: Option<Arc<str>>,
     execution_operation: Option<String>,
     cancel_on_admission: bool,
     thinking: Thinking,
@@ -148,6 +149,7 @@ pub(super) fn queued_prompt(
         QueuedTurn::Pending {
             key,
             prompt,
+            supplementary_context,
             execution_operation,
             thinking,
             fast_mode,
@@ -174,6 +176,7 @@ pub(super) fn cancel_queued_turn(
     };
     let QueuedTurn::Pending {
         prompt,
+        supplementary_context: _,
         execution_operation,
         thinking,
         fast_mode,
@@ -206,6 +209,7 @@ pub(super) fn mark_all_queued_turns_cancelled(queued_turns: &mut VecDeque<Queued
     queued_turns.extend(accepted.into_iter().map(|queued| match queued {
         QueuedTurn::Pending {
             prompt,
+            supplementary_context: _,
             execution_operation,
             thinking,
             fast_mode,
@@ -247,6 +251,7 @@ pub(super) async fn begin_shutdown(
             Command::Prompt {
                 key,
                 prompt,
+                supplementary_context,
                 execution_operation,
                 accepted: None,
                 cancel_on_admission,
@@ -260,6 +265,7 @@ pub(super) async fn begin_shutdown(
                 queued_turns.push_back(queued_prompt(
                     key,
                     prompt,
+                    supplementary_context,
                     execution_operation,
                     cancel_on_admission,
                     thinking.unwrap_or(default_thinking),

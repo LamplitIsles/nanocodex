@@ -15,6 +15,12 @@ const SESSION_IDS = Object.freeze({
   original: "018f1f9a-7b3c-7a02-8000-000000000002",
   resumed: "018f1f9a-7b3c-7a03-8000-000000000003",
   embedded: "018f1f9a-7b3c-7a04-8000-000000000004",
+  hydrated: "018f1f9a-7b3c-7a07-8000-000000000007",
+  supplementary: "018f1f9a-7b3c-7a08-8000-000000000008",
+  invalidSeed: "018f1f9a-7b3c-7a09-8000-000000000009",
+  ambiguousSeed: "018f1f9a-7b3c-7a0a-8000-00000000000a",
+  queuedSupplementary: "018f1f9a-7b3c-7a0b-8000-00000000000b",
+  durableCompanion: "018f1f9a-7b3c-7a0c-8000-00000000000c",
   left: "018f1f9a-7b3c-7a05-8000-000000000005",
   right: "018f1f9a-7b3c-7a06-8000-000000000006",
 });
@@ -357,6 +363,106 @@ test("Node-hosted WASM preserves follow-ons, cache identity, events, and custom 
   watch.off();
   agent.dispose();
   await server.close();
+});
+
+test("Node WASM attaches supplementary context to the real prompt input", async () => {
+  const server = await startServer();
+  const agent = await createWarmAgent({
+    apiKey: "test-key",
+    websocketUrl: server.url,
+    thinking: "none",
+    sessionId: SESSION_IDS.supplementary,
+  });
+  try {
+    const scenario = (async () => {
+      const socket = await server.connection;
+      const reader = messageReader(socket);
+      await reader.next();
+      sendWarmup(socket, "resp-context-warmup");
+      const request = await reader.next();
+      const encoded = JSON.stringify(request.input);
+      assert.match(encoded, /real question/);
+      assert.match(encoded, /retrieved evidence/);
+      const userMessages = request.input.filter(
+        (item) => item.type === "message" && item.role === "user",
+      );
+      assert.equal(
+        userMessages.filter((item) => JSON.stringify(item).includes("real question")).length,
+        1,
+      );
+      sendFinal(socket, "resp-context-final", "accepted");
+    })();
+    assert.equal(
+      (await agent.turn.prompt({
+        input: "real question",
+        supplementaryContext: "<supplementary_context>retrieved evidence</supplementary_context>",
+      }).result()).finalMessage,
+      "accepted",
+    );
+    await scenario;
+  } finally {
+    agent.dispose();
+    await server.close();
+  }
+});
+
+test("Node WASM preserves supplementary context on separately queued inputs", async () => {
+  const server = await startServer();
+  const agent = await createWarmAgent({
+    apiKey: "test-key",
+    websocketUrl: server.url,
+    thinking: "none",
+    sessionId: SESSION_IDS.queuedSupplementary,
+  });
+  let resolveFirstRequest;
+  const firstRequest = new Promise((resolve) => { resolveFirstRequest = resolve; });
+  let releaseFirst;
+  const firstReleased = new Promise((resolve) => { releaseFirst = resolve; });
+  const scenario = (async () => {
+    const socket = await server.connection;
+    const reader = messageReader(socket);
+    await reader.next();
+    sendWarmup(socket, "resp-queued-context-warmup");
+
+    const first = await reader.next();
+    resolveFirstRequest(first);
+    await firstReleased;
+    sendFinal(socket, "resp-queued-context-first", "first accepted");
+
+    const second = await reader.next();
+    const secondInput = JSON.stringify(second.input);
+    assert.match(secondInput, /second queued question/);
+    assert.match(secondInput, /second queued evidence/);
+    assert.doesNotMatch(secondInput, /first queued evidence/);
+    sendFinal(socket, "resp-queued-context-second", "second accepted");
+  })();
+  try {
+    const firstTurn = agent.turn.prompt({
+      input: "first queued question",
+      supplementaryContext: "<supplementary_context>first queued evidence</supplementary_context>",
+    });
+    const firstResult = firstTurn.result();
+    const firstRequestValue = await bounded(firstRequest, "first queued input");
+    const firstInput = JSON.stringify(firstRequestValue.input);
+    assert.match(firstInput, /first queued question/);
+    assert.match(firstInput, /first queued evidence/);
+    assert.doesNotMatch(firstInput, /second queued evidence/);
+
+    const secondTurn = agent.turn.prompt({
+      input: "second queued question",
+      supplementaryContext: "<supplementary_context>second queued evidence</supplementary_context>",
+    });
+    const secondResult = secondTurn.result();
+    releaseFirst();
+    assert.equal((await firstResult).finalMessage, "first accepted");
+    assert.equal((await secondResult).finalMessage, "second accepted");
+    firstTurn.dispose();
+    secondTurn.dispose();
+    await bounded(scenario, "queued supplementary inputs");
+  } finally {
+    agent.dispose();
+    await server.close();
+  }
 });
 
 test("a durable Node-hosted root runs the canonical in-memory Rust subagent task tree", async () => {
@@ -904,6 +1010,256 @@ test("Node can load an application-owned web module and resume Codex rollout his
   await scenario;
   agent.dispose();
   await server.close();
+});
+
+test("Node WASM hydrates typed history and rejects ambiguous or unsupported seeds", async () => {
+  const server = await startServer();
+  const historySeed = {
+    history: [
+      {
+        type: "message",
+        role: "user",
+        content: [
+          { type: "input_text", text: "remember the blue room" },
+          { type: "input_image", image_url: "data:image/png;base64,AAAA" },
+        ],
+      },
+      {
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: "I will remember it." }],
+        status: "completed",
+      },
+      {
+        type: "custom_tool_call",
+        call_id: "historic-call",
+        name: "lookup",
+        input: "{}",
+      },
+      {
+        type: "custom_tool_call_output",
+        call_id: "historic-call",
+        output: "past result",
+      },
+    ],
+    continuitySummary: "The user is discussing the blue room.",
+  };
+  const agent = await createWarmAgent({
+    apiKey: "test-key",
+    websocketUrl: server.url,
+    thinking: "none",
+    sessionId: SESSION_IDS.hydrated,
+    workspace: "/virtual/hydrated-workspace",
+    historySeed,
+  });
+  const scenario = (async () => {
+    const socket = await server.connection;
+    assert.match(
+      socket.request.headers["session-id"],
+      /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
+    assert.equal(socket.request.headers["thread-id"], SESSION_IDS.hydrated);
+    const request = await messageReader(socket).next();
+    assert.equal(request.previous_response_id, undefined);
+    const encoded = JSON.stringify(request.input);
+    assert.match(encoded, /blue room/);
+    assert.match(encoded, /data:image\/png;base64,AAAA/);
+    assert.match(encoded, /historic-call/);
+    assert.match(encoded, /compacted-summary/);
+    sendFinal(socket, "resp-hydrated", "blue");
+  })();
+  assert.equal(
+    (await agent.turn.prompt({ input: "what room did I ask you to remember?" }).result())
+      .finalMessage,
+    "blue",
+  );
+  await scenario;
+  agent.dispose();
+  await server.close();
+
+  const invalidServer = await startServer();
+  await assert.rejects(
+    createWarmAgent({
+      apiKey: "test-key",
+      websocketUrl: invalidServer.url,
+      sessionId: SESSION_IDS.invalidSeed,
+      historySeed: {
+        history: [{ type: "future_item", payload: true }],
+      },
+    }),
+    /unsupported item|user message/,
+  );
+  await invalidServer.close();
+
+  const ambiguousServer = await startServer();
+  const seededMessage = {
+    type: "message",
+    role: "user",
+    content: [{ type: "input_text", text: "already selected" }],
+  };
+  await assert.rejects(
+    createWarmAgent({
+      apiKey: "test-key",
+      websocketUrl: ambiguousServer.url,
+      sessionId: SESSION_IDS.ambiguousSeed,
+      historySeed: { history: [seededMessage] },
+      resume: {
+        version: 1,
+        model: "gpt-5.6-sol",
+        lineage_id: "seeded-lineage",
+        prompt_cache_key: "seeded-lineage",
+        workspace: ".",
+        canonical_context: seededMessage,
+        history: [seededMessage],
+      },
+    }),
+    /resume and history_seed cannot be supplied together/,
+  );
+  await ambiguousServer.close();
+});
+
+test("Node WASM uses Companion compaction for success and preserves context on failure", async () => {
+  const server = await startServer();
+  const agent = await createWarmAgent({
+    apiKey: "test-key",
+    websocketUrl: server.url,
+    thinking: "none",
+    sessionId: SESSION_IDS.right,
+    companionCompactionInstruction: "Keep durable facts and recent work.",
+  });
+  const readerState = {};
+  try {
+    const scenario = (async () => {
+      const socket = await server.connection;
+      const reader = messageReader(socket);
+      await reader.next();
+      sendWarmup(socket, "resp-companion-warmup");
+      await reader.next();
+      sendFinal(socket, "resp-companion-first", "first answer");
+      const compact = await reader.next();
+      readerState.compact = compact;
+      assert.equal(compact.previous_response_id, undefined);
+      assert.doesNotMatch(JSON.stringify(compact.input), /additional_tools/);
+      assert.match(JSON.stringify(compact.input), /Keep durable facts and recent work/);
+      sendFinal(socket, "resp-companion-summary", "durable facts");
+      const followOn = await reader.next();
+      readerState.followOn = followOn;
+      assert.equal(followOn.previous_response_id, undefined);
+      assert.match(JSON.stringify(followOn.input), /durable facts/);
+      sendFinal(socket, "resp-companion-follow-on", "continued");
+      const failed = await reader.next();
+      readerState.failed = failed;
+      assert.equal(failed.previous_response_id, undefined);
+      sendCompleted(socket, "resp-companion-invalid-summary", []);
+      const retry = await reader.next();
+      readerState.retry = retry;
+      assert.equal(retry.previous_response_id, "resp-companion-follow-on");
+      sendFinal(socket, "resp-companion-retry", "recovered");
+    })();
+    assert.equal(
+      (await agent.turn.prompt({ input: "start the continuity test" }).result()).finalMessage,
+      "first answer",
+    );
+    await agent.session.compact();
+    assert.equal(
+      (await agent.turn.prompt({ input: "continue after compaction" }).result()).finalMessage,
+      "continued",
+    );
+    await assert.rejects(agent.session.compact(), /summary text/);
+    assert.equal(
+      (await agent.turn.prompt({ input: "retry after the rejected summary" }).result()).finalMessage,
+      "recovered",
+    );
+    await scenario;
+    assert.equal(readerState.compact.generate, undefined);
+    assert.equal(readerState.failed.generate, undefined);
+  } finally {
+    agent.dispose();
+    await server.close();
+  }
+});
+
+test("a fresh Node WASM agent resumes a host-owned Companion checkpoint", async () => {
+  const durabilityId = "node-companion-checkpoint";
+  const durability = createMemoryDurabilityStore(durabilityId);
+  const options = {
+    apiKey: "test-key",
+    thinking: "none",
+    sessionId: SESSION_IDS.durableCompanion,
+    durability,
+    durabilityId,
+    companionCompactionInstruction: "Keep the durable Companion facts.",
+  };
+  const firstServer = await startServer();
+  let firstAgent;
+  try {
+    firstAgent = await createWarmAgent({ ...options, websocketUrl: firstServer.url });
+    const firstScenario = (async () => {
+      const socket = await firstServer.connection;
+      const reader = messageReader(socket);
+      await reader.next();
+      sendWarmup(socket, "resp-durable-companion-warmup");
+
+      const first = await reader.next();
+      assert.match(JSON.stringify(first.input), /before durable Companion compaction/);
+      sendFinal(socket, "resp-durable-companion-first", "first durable answer");
+
+      const compact = await reader.next();
+      assert.equal(compact.previous_response_id, undefined);
+      assert.match(JSON.stringify(compact.input), /Keep the durable Companion facts/);
+      assert.doesNotMatch(JSON.stringify(compact.input), /additional_tools/);
+      sendFinal(socket, "resp-durable-companion-summary", "durable Companion summary");
+
+      const followOn = await reader.next();
+      assert.equal(followOn.previous_response_id, undefined);
+      assert.match(JSON.stringify(followOn.input), /durable Companion summary/);
+      assert.match(JSON.stringify(followOn.input), /after durable Companion compaction/);
+      sendFinal(socket, "resp-durable-companion-follow-on", "durable follow-on answer");
+    })();
+    assert.equal(
+      (await firstAgent.turn.prompt({ input: "before durable Companion compaction" }).result())
+        .finalMessage,
+      "first durable answer",
+    );
+    await firstAgent.session.compact();
+    assert.equal(
+      (await firstAgent.turn.prompt({ input: "after durable Companion compaction" }).result())
+        .finalMessage,
+      "durable follow-on answer",
+    );
+    await bounded(firstScenario, "durable Companion checkpoint");
+    assert.ok(durability.snapshot().payload, "the host store must retain a checkpoint payload");
+    await firstAgent.session.shutdown();
+    firstAgent = undefined;
+  } finally {
+    if (firstAgent) await firstAgent.session.shutdown().catch(() => {});
+    await firstServer.close();
+  }
+
+  const resumedServer = await startServer();
+  let resumed;
+  try {
+    resumed = await createWarmAgent({ ...options, websocketUrl: resumedServer.url });
+    const resumedScenario = (async () => {
+      const socket = await resumedServer.connection;
+      const request = await messageReader(socket).next();
+      assert.equal(request.previous_response_id, undefined);
+      const input = JSON.stringify(request.input);
+      assert.match(input, /durable Companion summary/);
+      assert.match(input, /after durable Companion compaction/);
+      assert.match(input, /fresh prompt after host restart/);
+      sendFinal(socket, "resp-durable-companion-resumed", "fresh durable answer");
+    })();
+    assert.equal(
+      (await resumed.turn.prompt({ input: "fresh prompt after host restart" }).result())
+        .finalMessage,
+      "fresh durable answer",
+    );
+    await bounded(resumedScenario, "fresh durable Companion resume");
+  } finally {
+    if (resumed) await resumed.session.shutdown().catch(() => {});
+    await resumedServer.close();
+  }
 });
 
 test("Node Astra sends its model prompt with additive host rules and preserves replacements", async () => {

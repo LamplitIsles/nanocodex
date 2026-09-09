@@ -147,8 +147,14 @@ impl ConversationState {
         &mut self,
         item: ResponseItem,
         request_prefix: &[ResponseItem],
+        companion: bool,
     ) {
-        self.managed.install_compaction(item, [], request_prefix);
+        if companion {
+            self.managed
+                .install_companion_compaction(item, [], request_prefix);
+        } else {
+            self.managed.install_compaction(item, [], request_prefix);
+        }
     }
 
     pub(super) fn install_mid_turn_compaction(
@@ -157,11 +163,17 @@ impl ConversationState {
         canonical_developer_context: ResponseItem,
         canonical_context: ResponseItem,
         request_prefix: &[ResponseItem],
+        companion: bool,
     ) {
         self.canonical_context = Arc::new(canonical_context.clone());
         let initial_context = [canonical_developer_context, canonical_context];
-        self.managed
-            .install_compaction(item, initial_context, request_prefix);
+        if companion {
+            self.managed
+                .install_companion_compaction(item, initial_context, request_prefix);
+        } else {
+            self.managed
+                .install_compaction(item, initial_context, request_prefix);
+        }
     }
 
     pub(super) fn append_canonical_context(

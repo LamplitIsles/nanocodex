@@ -91,9 +91,13 @@ export function prompt(agent, options) {
   const input = actionInput(options);
   const operationId = options?.id;
   const cancelOnAdmission = options?.cancelOnAdmission === true;
+  const supplementaryContext = options?.supplementaryContext;
+  if (supplementaryContext !== undefined && typeof supplementaryContext !== "string") {
+    throw new TypeError("supplementaryContext must be a string");
+  }
   const raw = typeof input === "string"
-    ? state.raw.prompt(input, operationId, cancelOnAdmission)
-    : state.raw.promptContent(JSON.stringify(input), operationId, cancelOnAdmission);
+    ? state.raw.prompt(input, operationId, cancelOnAdmission, supplementaryContext)
+    : state.raw.promptContent(JSON.stringify(input), operationId, cancelOnAdmission, supplementaryContext);
   return createTurn(raw, agent);
 }
 
@@ -314,6 +318,16 @@ export function toWasmConfig(options = {}) {
   copy(config, "api_base_url", options.apiBaseUrl);
   copy(config, "instructions", options.instructions);
   copy(config, "additional_instructions", options.additionalInstructions);
+  copy(config, "companion_compaction_instruction", options.companionCompactionInstruction);
+  if (options.historySeed !== undefined) {
+    const seed = options.historySeed;
+    if (!seed || typeof seed !== "object" || Array.isArray(seed)
+      || !Array.isArray(seed.history)) {
+      throw new TypeError("historySeed must contain a history array");
+    }
+    config.history_seed = { history: seed.history };
+    copy(config.history_seed, "continuity_summary", seed.continuitySummary);
+  }
   copy(config, "session_id", options.sessionId);
   copy(config, "workspace", options.workspace);
   if (options.executionEnvironment !== undefined) {

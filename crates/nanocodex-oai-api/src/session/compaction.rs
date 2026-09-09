@@ -194,6 +194,29 @@ pub fn install_history(
     installed
 }
 
+/// Builds a client-owned Companion checkpoint while retaining the newest
+/// non-contextual user input and its complete tail.
+///
+/// The caller supplies the validated developer summary and any canonical
+/// context that must precede it. Provider continuation state is intentionally
+/// not represented here; the managed session resets it after replacement.
+#[must_use]
+pub fn install_companion_history(
+    history: &[ResponseItem],
+    initial_context: &[ResponseItem],
+    summary: ResponseItem,
+) -> Vec<ResponseItem> {
+    let suffix_start = history
+        .iter()
+        .rposition(|item| item.is_user_message() && !is_contextual_user_message(item));
+    let suffix = suffix_start.map_or(&[][..], |start| &history[start..]);
+    let mut installed = Vec::with_capacity(initial_context.len() + 1 + suffix.len());
+    installed.extend(initial_context.iter().cloned());
+    installed.push(summary);
+    installed.extend(suffix.iter().cloned());
+    installed
+}
+
 fn is_client_developer_message(item: &ResponseItem) -> bool {
     let ResponseItem::Message {
         role: crate::MessageRole::Developer,
@@ -589,6 +612,64 @@ mod tests {
             &installed[5],
             ResponseItem::Compaction { id: Some(id), .. } if id.as_str() == "cmp-id"
         ));
+    }
+
+    #[test]
+    fn companion_history_keeps_the_latest_complete_tail_only() {
+        let old = message("old user input");
+        let recent = message("recent user input");
+        let contextual = message("<environment_context>\nupdated\n</environment_context>");
+        let call: ResponseItem = serde_json::from_value(serde_json::json!({
+            "type": "custom_tool_call",
+            "call_id": "call-1",
+            "name": "roll_dice",
+            "input": "{}"
+        }))
+        .unwrap();
+        let output = ResponseItem::custom_tool_output(
+            "call-1".to_owned(),
+            Some("roll_dice".to_owned()),
+            FunctionOutputBody::Text("{\"total\":4}".into()),
+        );
+        let summary = ResponseItem::message(
+            crate::MessageRole::Developer,
+            [ContentItem::input_text(
+                "<compacted-summary>recent facts</compacted-summary>",
+            )],
+        );
+        let initial_context = message("<environment_context>\n/workspace\n</environment_context>");
+        let history = vec![old, recent.clone(), call, output, contextual.clone()];
+
+        let installed = install_companion_history(&history, &[initial_context.clone()], summary);
+
+        assert_eq!(installed.len(), 6);
+        assert_eq!(
+            serde_json::to_value(&installed[0]).unwrap(),
+            serde_json::to_value(initial_context).unwrap()
+        );
+        assert!(matches!(
+            &installed[1],
+            ResponseItem::Message {
+                role: crate::MessageRole::Developer,
+                content,
+                ..
+            } if serde_json::to_value(&content[0])
+                .is_ok_and(|value| value.to_string().contains("recent facts"))
+        ));
+        assert_eq!(
+            serde_json::to_value(&installed[2]).unwrap(),
+            serde_json::to_value(recent).unwrap()
+        );
+        assert!(
+            matches!(&installed[3], ResponseItem::CustomToolCall { call_id, .. } if call_id.as_ref() == "call-1")
+        );
+        assert!(
+            matches!(&installed[4], ResponseItem::CustomToolCallOutput { call_id, .. } if call_id.as_ref() == "call-1")
+        );
+        assert_eq!(
+            serde_json::to_value(&installed[5]).unwrap(),
+            serde_json::to_value(contextual).unwrap()
+        );
     }
 
     #[test]

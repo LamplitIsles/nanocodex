@@ -48,6 +48,80 @@ await branch.session.shutdown();
 await agent.session.shutdown();
 ```
 
+### Companion continuity seams
+
+The Node and Web API WASM hosts can embed a Companion persona while Nanocodex
+continues to own the model loop, Code Mode, active context, compaction, and
+engine checkpoints. The existing `instructions` option replaces the selected
+coding persona; `companionCompactionInstruction` opts into the same
+consumer-owned continuity policy for explicit compaction, automatic pressure,
+and provider context-overflow recovery:
+
+```js
+const agent = await Agent.create({
+  transport: Transport.openAi({ apiKey: process.env.OPENAI_API_KEY }),
+  instructions: companionPersona,
+  companionCompactionInstruction: "Preserve relationship facts and recent work.",
+  historySeed: {
+    history: [
+      {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "Remember the blue room." }],
+      },
+      {
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: "I will remember it." }],
+        status: "completed",
+      },
+    ],
+    continuitySummary: "The conversation concerns the blue room.",
+  },
+});
+
+const turn = agent.turn.prompt({
+  input: "What room did I ask you to remember?",
+  supplementaryContext: "<recall>Selected host-owned evidence.</recall>",
+});
+const result = await turn.result();
+```
+
+`supplementaryContext` is host-resolved evidence appended to the same final
+user message as `input`. It neither replaces persona instructions nor starts a
+turn by itself, and it remains associated with its prompt while independently
+queued inputs wait behind an active turn. The host owns recall, timeouts, and
+its application transcript; Nanocodex only validates and carries the supplied
+string.
+
+`historySeed` is a validated active-history entry point, not a DSH event-log
+schema. Its public `HistoryItem` union accepts message text and supported
+image/audio content, function and Code Mode tool call/result pairs, and
+provider compaction items. `continuitySummary` is inserted as private model
+context. Unknown or malformed items, an empty history without a user message,
+an empty summary, and simultaneous `historySeed` plus `resume` are rejected
+before provider work. Historical tool calls are replayed as history and are
+never executed. The engine creates the lineage, cache key, and snapshot
+metadata; callers do not fabricate provider continuation IDs.
+
+When `companionCompactionInstruction` is configured, summaries are normal
+tool-free generations using the active context and persona. A successful
+summary replaces the active context with the summary and a coherent retained
+tail, then the next request performs a fresh replay. A failed or canceled
+summary leaves the previously committed context and continuation usable. The
+same policy covers explicit compaction, token pressure (including after a tool
+turn), and context-window overflow. Without the option, existing provider
+compaction behavior is unchanged.
+
+Host-owned checkpoints use the existing `durability`/`durabilityId` options.
+After a completed boundary is stored, a fresh Agent instance can reopen it and
+replay the summary, retained history, and completed tool pairs before accepting
+the next prompt. This is a checkpoint contract, not a claim of arbitrary-crash
+exactly-once semantics. DSH-specific translation, UI lifecycle mapping,
+recall policy, transcript persistence, and the official DSH 0.1.2-rc.1
+recovery-baseline verification remain the responsibility of the dependent DSH
+adapter.
+
 Transports are explicit, immutable configurations, like viem v3 transports:
 
 ```js

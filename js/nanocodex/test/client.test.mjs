@@ -535,6 +535,29 @@ test("the WASM config distinguishes prompt replacement from host additions", () 
   });
 });
 
+test("the WASM config carries Companion policy and engine-owned history seeds", () => {
+  const history = [{
+    type: "message",
+    role: "user",
+    content: [{ type: "input_text", text: "remember this" }],
+  }];
+  assert.deepEqual(toWasmConfig({
+    apiKey: "test-key",
+    companionCompactionInstruction: "Keep the important facts.",
+    historySeed: {
+      history,
+      continuitySummary: "The user supplied one fact.",
+    },
+  }), {
+    api_key: "test-key",
+    companion_compaction_instruction: "Keep the important facts.",
+    history_seed: {
+      history,
+      continuity_summary: "The user supplied one fact.",
+    },
+  });
+});
+
 test("the WASM host bridge routes owner-fenced durability per Agent binding", async () => {
   let state = { revision: "0", payload: null };
   let owner;

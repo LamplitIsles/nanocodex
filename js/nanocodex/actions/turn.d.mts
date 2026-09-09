@@ -13,7 +13,11 @@ export function prompt<const agent extends Agent<object>>(
   options: prompt.Options,
 ): prompt.ReturnType<agent>;
 export declare namespace prompt {
-  type Options = { input: PromptInput; id?: string | undefined };
+  type Options = {
+    input: PromptInput;
+    id?: string | undefined;
+    supplementaryContext?: string | undefined;
+  };
   type ReturnType<agent extends Agent<object> = Agent<object>> = Turn<agent>;
 }
 

@@ -103,6 +103,7 @@ where
         if !self.force_compaction && active_context_tokens < auto_compact_token_limit {
             return Ok(false);
         }
+        let companion = self.config.companion_compaction_instruction.is_some();
         let previous_response_id = conversation.previous_response_id();
         let (item, _usage, server_reasoning_included) = self
             .perform_compaction(
@@ -118,7 +119,11 @@ where
         conversation.observe_server_reasoning(server_reasoning_included);
         match phase {
             CompactionPhase::PreTurn => {
-                conversation.install_pre_turn_compaction(item, factory.profile().prefix());
+                conversation.install_pre_turn_compaction(
+                    item,
+                    factory.profile().prefix(),
+                    companion,
+                );
             }
             CompactionPhase::MidTurn => {
                 let snapshot = snapshot.ok_or(NanocodexError::InvalidAttemptState {
@@ -130,6 +135,7 @@ where
                     developer_context(),
                     canonical_context,
                     factory.profile().prefix(),
+                    companion,
                 );
             }
         }
@@ -392,12 +398,28 @@ where
             }
             None => history,
         };
-        if retained_request.is_none() {
+        if retained_request.is_none() && self.config.companion_compaction_instruction.is_none() {
             compaction::trim_tool_outputs_to_fit_context_window(
                 &mut history,
                 factory.profile().prefix(),
                 self.config.context_window_tokens,
             );
+        }
+        if let Some(instruction) = self.config.companion_compaction_instruction.clone() {
+            return self
+                .perform_companion_compaction(
+                    after_model_call_index,
+                    history,
+                    previous_response_id,
+                    active_context_tokens,
+                    auto_compact_token_limit,
+                    factory,
+                    model,
+                    thinking,
+                    fast_mode,
+                    instruction,
+                )
+                .await;
         }
         let started_at = Instant::now();
         self.stats.compactions += 1;
@@ -557,6 +579,142 @@ where
             },
         )?;
         Ok((item, usage, server_reasoning_included))
+    }
+
+    /// Executes consumer-owned continuity summarization as a normal generation.
+    ///
+    /// The request is replayed without a provider continuation and uses a
+    /// profile with no model-visible tools. The returned text is wrapped as a
+    /// private developer context item; it is installed by the caller only
+    /// after this method has validated the response completely.
+    #[allow(clippy::too_many_arguments)]
+    async fn perform_companion_compaction(
+        &mut self,
+        after_model_call_index: u32,
+        mut history: nanocodex_oai_api::responses::ResponseHistory,
+        previous_response_id: Option<&str>,
+        active_context_tokens: u64,
+        auto_compact_token_limit: u64,
+        factory: &ResponsesAttemptFactory,
+        model: Model,
+        thinking: Thinking,
+        fast_mode: bool,
+        instruction: Arc<str>,
+    ) -> Result<(ResponseItem, Option<Usage>, bool)> {
+        let started_at = Instant::now();
+        self.stats.compactions += 1;
+        self.events.emit(
+            AgentEventKind::ModelCompactionStarted,
+            CompactionStarted {
+                after_model_call_index,
+                active_context_tokens,
+                auto_compact_token_limit,
+                previous_response_id,
+            },
+        )?;
+        history.push(ResponseItem::message(
+            MessageRole::Developer,
+            [ContentItem::input_text(instruction.as_ref())],
+        ));
+        let factory = factory.without_tools();
+        let request = factory.generation(
+            after_model_call_index,
+            history.clone(),
+            history,
+            0,
+            None,
+            model,
+            thinking,
+            fast_mode,
+        );
+        let (input_item_count, input_bytes, input_content) = trace_model_input(&request);
+        let span = compaction_span(after_model_call_index, input_item_count, input_bytes);
+        if let Some(input_content) = &input_content {
+            record_span_content(&span, "model.input", input_content);
+        }
+        let success = match self.client.execute(request).instrument(span.clone()).await {
+            Ok(success) => success,
+            Err(error) => {
+                span.record("status", "failed");
+                span.record("otel.status_code", "ERROR");
+                span.record("duration_ns", elapsed_ns(started_at));
+                return self.compaction_failed(
+                    after_model_call_index,
+                    started_at,
+                    NanocodexError::Response(error.into()),
+                );
+            }
+        };
+        let attempt = success.attempt();
+        let connection_generation = success.connection_generation();
+        let server_reasoning_included = success.server_reasoning_included();
+        let ResponsesOutput::Generation(response) = success.into_output() else {
+            let error = NanocodexError::InvalidAttemptState {
+                detail: "Companion compaction returned a non-generation response",
+            };
+            span.record("status", "failed");
+            span.record("otel.status_code", "ERROR");
+            span.record("duration_ns", elapsed_ns(started_at));
+            return self.compaction_failed(after_model_call_index, started_at, error);
+        };
+        validate_provider_response_id(&response.id)?;
+        if !response.code_calls.is_empty() {
+            let error = NanocodexError::InvalidAttemptState {
+                detail: "Companion compaction attempted to execute a tool",
+            };
+            span.record("status", "failed");
+            span.record("otel.status_code", "ERROR");
+            span.record("duration_ns", elapsed_ns(started_at));
+            return self.compaction_failed(after_model_call_index, started_at, error);
+        }
+        let Some(summary) = response
+            .final_message
+            .filter(|message| !message.trim().is_empty())
+        else {
+            let error = NanocodexError::InvalidAttemptState {
+                detail: "Companion compaction returned no summary text",
+            };
+            span.record("status", "failed");
+            span.record("otel.status_code", "ERROR");
+            span.record("duration_ns", elapsed_ns(started_at));
+            return self.compaction_failed(after_model_call_index, started_at, error);
+        };
+        let item = ResponseItem::message(
+            MessageRole::Developer,
+            [ContentItem::input_text(format!(
+                "<compacted-summary>\n{summary}\n</compacted-summary>"
+            ))],
+        );
+        let duration_ns = elapsed_ns(started_at);
+        span.record("model.response.id", response.id.as_str());
+        if let Some(content) = serialize_trace_content(&item) {
+            record_span_content(&span, "model.output_item", &content);
+        }
+        span.record("status", "completed");
+        span.record("otel.status_code", "OK");
+        span.record("duration_ns", duration_ns);
+        self.stats.model_duration_ns += duration_ns;
+        self.stats.compaction_duration_ns += duration_ns;
+        if let Some(usage) = &response.usage {
+            record_usage(&span, usage, model, fast_mode);
+            self.stats.usage.add(usage, model, fast_mode);
+        }
+        self.stats.last_response_id = None;
+        self.events.emit(
+            AgentEventKind::ModelCompactionCompleted,
+            CompactionCompleted {
+                after_model_call_index,
+                response_id: &response.id,
+                attempt,
+                connection_generation,
+                status: &response.status,
+                duration_ns,
+                time_to_first_event_ns: response.time_to_first_event_ns,
+                time_to_first_output_ns: response.time_to_first_output_ns,
+                usage: response.usage.as_ref(),
+            },
+        )?;
+        Ok((item, response.usage, server_reasoning_included))
     }
 
     pub(super) fn compaction_failed<T>(

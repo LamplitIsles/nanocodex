@@ -529,6 +529,18 @@ impl ResponsesAttemptFactory {
         &self.profile
     }
 
+    /// Returns an attempt factory whose request prefix cannot expose tools.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn without_tools(&self) -> Self {
+        Self {
+            profile: Arc::new((*self.profile).clone().without_tools()),
+            observer: self.observer.clone(),
+            logical_turn: self.logical_turn,
+            session_transport: Arc::clone(&self.session_transport),
+        }
+    }
+
     /// Reconstructs retained request content on the current event and transport owner.
     #[doc(hidden)]
     pub fn with_request_content(

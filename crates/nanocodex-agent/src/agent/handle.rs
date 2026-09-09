@@ -264,22 +264,14 @@ impl Nanocodex {
     /// Returns an error for an empty prompt or request ID, when identified
     /// work is submitted without a configured policy, or if the driver stopped.
     pub async fn prompt(&self, request: impl Into<PromptRequest>) -> Result<Turn> {
+        let request = request.into();
+        validate_prompt_request(&request)?;
         let PromptRequest {
             prompt,
             request_id,
             cancel_on_admission,
-        } = request.into();
-        prompt
-            .validate()
-            .map_err(|error| NanocodexError::InvalidRequest(error.to_string()))?;
-        if request_id
-            .as_deref()
-            .is_some_and(|request_id| request_id.trim().is_empty())
-        {
-            return Err(NanocodexError::InvalidRequest(
-                "request ID must not be empty".to_owned(),
-            ));
-        }
+            supplementary_context,
+        } = request;
         let key = BackendTurnKey(self.next_turn.fetch_add(1, Ordering::Relaxed));
         let (events, event_stream) = self.events.mirrored_channel();
         let BackendTurn { request_id, result } = self
@@ -287,6 +279,7 @@ impl Nanocodex {
             .submit(BackendPrompt {
                 key,
                 prompt,
+                supplementary_context,
                 request_id,
                 cancel_on_admission,
                 events,
@@ -329,6 +322,7 @@ impl Nanocodex {
             .route(BackendPrompt {
                 key,
                 prompt,
+                supplementary_context: None,
                 request_id: None,
                 cancel_on_admission: false,
                 events,
@@ -507,6 +501,23 @@ impl Nanocodex {
     pub async fn fork_from(&self, completed: &TurnResult) -> Result<(Self, AgentEvents)> {
         self.backend.fork(Some(completed.clone())).await
     }
+}
+
+fn validate_prompt_request(request: &PromptRequest) -> Result<()> {
+    request
+        .prompt
+        .validate()
+        .map_err(|error| NanocodexError::InvalidRequest(error.to_string()))?;
+    if request
+        .request_id
+        .as_deref()
+        .is_some_and(|request_id| request_id.trim().is_empty())
+    {
+        return Err(NanocodexError::InvalidRequest(
+            "request ID must not be empty".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(feature = "openai")]
