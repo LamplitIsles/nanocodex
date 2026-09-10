@@ -180,9 +180,9 @@ impl From<ResponsesError> for ResponsesServiceError {
             ResponsesError::UnexpectedEnd
             | ResponsesError::Closed { .. }
             | ResponsesError::Receive { .. } => FailurePhase::Receive,
-            ResponsesError::HttpRequest { .. } | ResponsesError::InvalidSseUtf8 { .. } => {
-                FailurePhase::Receive
-            }
+            ResponsesError::HttpRequest { .. }
+            | ResponsesError::InvalidSseUtf8 { .. }
+            | ResponsesError::SseBufferExceeded { .. } => FailurePhase::Receive,
             ResponsesError::Api { .. }
             | ResponsesError::ContextWindowExceeded { .. }
             | ResponsesError::InvalidToolSchema { .. } => FailurePhase::Api,

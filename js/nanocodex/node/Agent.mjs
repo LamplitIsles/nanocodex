@@ -118,7 +118,6 @@ export function create(options = {}) {
           subagents: subagentConfig,
           hostDefinitionId,
           ...config,
-          hostHttp: mpp === undefined,
           durabilityHostId: durabilityOwner?.id,
         }));
         return subscription === undefined

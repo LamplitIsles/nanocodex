@@ -89,6 +89,9 @@ export function createNodeHost(options = {}) {
     return new Promise((resolve, reject) => {
       let settled = false;
       let upgradeResponse;
+      let upgradeRequest;
+      let deadline;
+      let rejectionResponse;
       const threadId = metadata.threadId ?? sessionId;
       const headers = {
         Authorization: `Bearer ${apiKey}`,
@@ -104,32 +107,44 @@ export function createNodeHost(options = {}) {
       if (metadata.fedramp) headers["X-OpenAI-Fedramp"] = "true";
       if (metadata.turnState) headers["x-codex-turn-state"] = metadata.turnState;
       const socket = new WebSocket(endpoint, {
-        handshakeTimeout: connectTimeoutMs,
         maxPayload: maxFrameBytes,
         headers,
       });
       const handle = nextHandle++;
       const connection = queueState(socket);
+      connection.connecting = true;
+      connections.set(handle, connection);
 
-      socket.on("upgrade", (response) => { upgradeResponse = response; });
-      socket.on("unexpected-response", (_request, response) => {
+      const fail = (error, reset = false) => {
         if (settled) return;
         settled = true;
-        response.setEncoding("utf8");
-        const chunks = [];
-        response.on("data", (chunk) => chunks.push(chunk));
-        response.on("end", () => {
-          const error = new Error(`WebSocket handshake was rejected with HTTP ${response.statusCode}`);
-          error.status = response.statusCode;
-          error.body = chunks.length ? chunks.join("") : "empty response body";
-          const retryAfter = Number(header(response.headers, "retry-after"));
-          if (Number.isFinite(retryAfter) && retryAfter >= 0) error.retryAfter = retryAfter;
-          reject(error);
-        });
+        clearTimeout(deadline);
+        connections.delete(handle);
+        connection.intentionallyClosed = true;
+        destroyWebSocket(socket, upgradeRequest, rejectionResponse, reset);
+        reject(error);
+      };
+      const rejectAsClosed = () => {
+        const error = new Error("WebSocket connection was closed by the host");
+        error.reconnectable = false;
+        fail(error, true);
+      };
+
+      socket.on("upgrade", (response) => { upgradeResponse = response; });
+      socket.on("unexpected-response", (request, response) => {
+        if (settled) return;
+        upgradeRequest = request;
+        rejectionResponse = response;
+        readHandshakeRejection(response, (error) => fail(error));
       });
       socket.on("open", () => {
+        if (settled) {
+          destroyWebSocket(socket);
+          return;
+        }
         settled = true;
-        connections.set(handle, connection);
+        clearTimeout(deadline);
+        connection.connecting = false;
         const headers = upgradeResponse?.headers || {};
         resolve(JSON.stringify({
           handle,
@@ -146,19 +161,29 @@ export function createNodeHost(options = {}) {
           : { kind: "text", text: data.toString("utf8") });
       });
       socket.on("close", (status, reason) => {
-        if (!connection.intentionallyClosed && !connection.overflowed) {
+        if (!settled) {
+          const suffix = reason.length ? `: ${reason.toString("utf8")}` : "";
+          fail(new Error(`WebSocket connection closed during handshake with code ${status}${suffix}`));
+        } else if (!connection.intentionallyClosed && !connection.overflowed) {
           const suffix = reason.length ? `: ${reason.toString("utf8")}` : "";
           enqueue(connection, { kind: "closed", detail: `with code ${status}${suffix}` });
         }
       });
       socket.on("error", (error) => {
         if (!settled) {
-          settled = true;
-          reject(error);
+          fail(error, true);
         } else {
           enqueue(connection, { kind: "error", detail: errorMessage(error) });
         }
       });
+      deadline = setTimeout(() => {
+        const error = new Error(
+          `WebSocket handshake exceeded ${connectTimeoutMs} milliseconds`,
+        );
+        error.reconnectable = true;
+        fail(error, true);
+      }, connectTimeoutMs);
+      connection.reject = rejectAsClosed;
     });
   }
 
@@ -389,6 +414,10 @@ export function createNodeHost(options = {}) {
     }
     const connection = connections.get(handle);
     if (!connection) return;
+    if (connection.connecting) {
+      connection.reject?.();
+      return;
+    }
     connections.delete(handle);
     connection.intentionallyClosed = true;
     connection.waiter?.({ kind: "closed", detail: "by the WASM runtime" });
@@ -590,6 +619,8 @@ export function createNodeHost(options = {}) {
 function queueState(socket) {
   return {
     socket,
+    connecting: false,
+    reject: undefined,
     queue: [],
     queuedBytes: 0,
     waiter: undefined,
@@ -597,6 +628,76 @@ function queueState(socket) {
     overflowed: false,
     managed: false,
   };
+}
+
+function readHandshakeRejection(response, finish) {
+  const chunks = [];
+  let bytes = 0;
+  let truncated = false;
+  let settled = false;
+  const complete = (error) => {
+    if (settled) return;
+    settled = true;
+    if (error) {
+      finish(error);
+      return;
+    }
+    const body = Buffer.concat(chunks).toString("utf8") + (truncated ? "…" : "");
+    const rejection = new Error(
+      `WebSocket handshake was rejected with HTTP ${response.statusCode}`,
+    );
+    rejection.status = response.statusCode;
+    rejection.body = body || "empty response body";
+    const retryAfter = Number(header(response.headers, "retry-after"));
+    if (Number.isFinite(retryAfter) && retryAfter >= 0) rejection.retryAfter = retryAfter;
+    finish(rejection);
+  };
+  response.on("data", (chunk) => {
+    if (settled || truncated) return;
+    const value = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    const remaining = MAX_HTTP_ERROR_BYTES - bytes;
+    if (remaining <= 0) {
+      truncated = true;
+      complete();
+      return;
+    }
+    const retained = value.subarray(0, remaining);
+    chunks.push(retained);
+    bytes += retained.byteLength;
+    if (retained.byteLength < value.byteLength) {
+      truncated = true;
+      complete();
+    }
+  });
+  response.once("end", () => complete());
+  response.once("aborted", () => complete(new Error("WebSocket handshake response was aborted")));
+  response.once("error", (error) => complete(error));
+  response.once("close", () => {
+    if (!response.complete) complete(new Error("WebSocket handshake response closed early"));
+  });
+}
+
+function destroyWebSocket(socket, ...httpObjects) {
+  const reset = httpObjects.at(-1) === true;
+  if (reset) httpObjects = httpObjects.slice(0, -1);
+  const sockets = new Set([
+    socket?._socket,
+    socket?._req?.socket,
+    ...httpObjects.map((object) => object?.socket),
+  ]);
+  for (const underlying of sockets) {
+    if (!underlying || underlying.destroyed) continue;
+    try {
+      if (reset && typeof underlying.resetAndDestroy === "function") underlying.resetAndDestroy();
+      else underlying.destroy();
+    } catch {}
+  }
+  if (!reset) {
+    try {
+      if (typeof socket.terminate === "function") socket.terminate();
+      else socket.close();
+    } catch {}
+  }
 }
 
 function header(headers, name) {

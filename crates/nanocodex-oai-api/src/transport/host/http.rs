@@ -98,10 +98,10 @@ impl ResponsesHttpStream {
                 .await
                 .map_err(map_host_error)?
             {
-                HostMessage::Chunk { text } => self.decoder.push(text.as_bytes()),
+                HostMessage::Chunk { text } => self.decoder.push(text.as_bytes())?,
                 HostMessage::Eof => {
                     self.ended = true;
-                    self.decoder.finish();
+                    self.decoder.finish()?
                 }
                 HostMessage::Text(_) => {
                     return Err(ResponsesError::HttpRequest {

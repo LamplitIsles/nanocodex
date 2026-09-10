@@ -171,6 +171,12 @@ pub enum ResponsesError {
         /// Complete UTF-8 failure detail.
         detail: String,
     },
+    /// An SSE event or unfinished record exceeded the decoder budget.
+    #[error("Responses HTTPS stream exceeded the {limit}-byte SSE record buffer")]
+    SseBufferExceeded {
+        /// Maximum bytes retained by the incremental SSE decoder.
+        limit: usize,
+    },
 }
 
 impl ResponsesError {
@@ -237,7 +243,7 @@ impl ResponsesError {
             Self::Handshake { reconnectable, .. } => *reconnectable,
             Self::HandshakeTimeout { .. } => true,
             Self::HandshakeRejected { status, .. } => {
-                *status == 403 || *status == 426 || *status == 429 || (500..=599).contains(status)
+                *status == 426 || *status == 429 || (500..=599).contains(status)
             }
             Self::Send { reconnectable, .. } | Self::Receive { reconnectable, .. } => {
                 *reconnectable
@@ -291,6 +297,7 @@ impl ResponsesError {
             Self::HttpRejected { status, .. } if (500..=599).contains(status) => "https_server",
             Self::HttpRejected { .. } => "https_rejected",
             Self::InvalidSseUtf8 { .. } => "invalid_sse_utf8",
+            Self::SseBufferExceeded { .. } => "sse_buffer_exceeded",
         }
     }
 

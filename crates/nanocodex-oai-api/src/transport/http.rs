@@ -125,10 +125,10 @@ impl ResponsesHttpStream {
                 return Err(ResponsesError::UnexpectedEnd);
             }
             if let Some(chunk) = self.response.chunk().await.map_err(map_http_error)? {
-                self.decoder.push(&chunk);
+                self.decoder.push(&chunk)?;
             } else {
                 self.ended = true;
-                self.decoder.finish();
+                self.decoder.finish()?;
             }
         }
     }

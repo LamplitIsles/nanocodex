@@ -1,4 +1,11 @@
+use std::{collections::VecDeque, mem};
+
 use crate::ResponsesError;
+
+/// Bounds the decoder's owned unfinished line, event data, and ready-event
+/// queue. The host reader may provide larger chunks, but the decoder never
+/// retains an unfinished SSE record beyond this budget.
+pub(crate) const MAX_SSE_BUFFER_BYTES: usize = 16 * 1024 * 1024;
 
 /// Incremental parser for the data fields of a server-sent event stream.
 ///
@@ -7,90 +14,115 @@ use crate::ResponsesError;
 /// shared Responses stream.
 #[derive(Default)]
 pub(crate) struct SseDecoder {
-    bytes: Vec<u8>,
-    cursor: usize,
-    data: Vec<String>,
-    finished: bool,
+    line: Vec<u8>,
+    data: String,
+    has_data: bool,
+    events: VecDeque<String>,
+    buffered_bytes: usize,
 }
 
 impl SseDecoder {
-    pub(crate) fn push(&mut self, chunk: &[u8]) {
-        self.compact();
-        self.bytes.extend_from_slice(chunk);
+    pub(crate) fn push(&mut self, chunk: &[u8]) -> Result<(), ResponsesError> {
+        for byte in chunk {
+            if *byte == b'\n' {
+                self.process_line()?;
+            } else {
+                self.buffered_bytes = self
+                    .buffered_bytes
+                    .checked_add(1)
+                    .ok_or_else(Self::buffer_exceeded)?;
+                if self.buffered_bytes > MAX_SSE_BUFFER_BYTES {
+                    return Err(Self::buffer_exceeded());
+                }
+                self.line.push(*byte);
+            }
+        }
+        Ok(())
     }
 
-    pub(crate) fn finish(&mut self) {
-        self.finished = true;
-        self.compact();
-        if !self.bytes.is_empty() {
-            self.bytes.push(b'\n');
+    pub(crate) fn finish(&mut self) -> Result<(), ResponsesError> {
+        if !self.line.is_empty() {
+            self.process_line()?;
         }
-        self.bytes.push(b'\n');
+        self.process_line()
     }
 
     pub(crate) fn next(&mut self) -> Result<Option<String>, ResponsesError> {
-        loop {
-            let Some(relative_newline) = self.bytes[self.cursor..]
-                .iter()
-                .position(|byte| *byte == b'\n')
-            else {
-                return Ok(None);
-            };
-            let line_start = self.cursor;
-            let newline = line_start + relative_newline;
-            self.cursor = newline + 1;
-            let line_end = if newline > line_start && self.bytes.get(newline - 1) == Some(&b'\r') {
-                newline - 1
-            } else {
-                newline
-            };
-            let line = std::str::from_utf8(&self.bytes[line_start..line_end]).map_err(|error| {
-                ResponsesError::InvalidSseUtf8 {
-                    detail: error.to_string(),
-                }
-            })?;
-            if line.is_empty() {
-                if self.data.is_empty() {
-                    if self.finished && self.cursor == self.bytes.len() {
-                        return Ok(None);
-                    }
-                    continue;
-                }
-                let event = self.data.join("\n");
-                self.data.clear();
-                if event == "[DONE]" {
-                    continue;
-                }
-                return Ok(Some(event));
-            }
-            if let Some(data) = line.strip_prefix("data:") {
-                self.data
-                    .push(data.strip_prefix(' ').unwrap_or(data).to_owned());
-            }
-        }
+        let Some(event) = self.events.pop_front() else {
+            return Ok(None);
+        };
+        self.buffered_bytes = self
+            .buffered_bytes
+            .saturating_sub(event.len().saturating_add(1));
+        Ok(Some(event))
     }
 
-    fn compact(&mut self) {
-        if self.cursor == 0 {
-            return;
+    fn process_line(&mut self) -> Result<(), ResponsesError> {
+        let mut line = mem::take(&mut self.line);
+        self.buffered_bytes = self.buffered_bytes.saturating_sub(line.len());
+        if line.last() == Some(&b'\r') {
+            line.pop();
         }
-        let remaining = self.bytes.len() - self.cursor;
-        self.bytes.copy_within(self.cursor.., 0);
-        self.bytes.truncate(remaining);
-        self.cursor = 0;
+        let line = std::str::from_utf8(&line).map_err(|error| ResponsesError::InvalidSseUtf8 {
+            detail: error.to_string(),
+        })?;
+        if line.is_empty() {
+            if !self.has_data {
+                return Ok(());
+            }
+            let event = mem::take(&mut self.data);
+            self.has_data = false;
+            if event == "[DONE]" {
+                self.buffered_bytes = self
+                    .buffered_bytes
+                    .saturating_sub(event.len().saturating_add(1));
+            } else {
+                self.events.push_back(event);
+            }
+            return Ok(());
+        }
+        let Some(data) = line.strip_prefix("data:") else {
+            return Ok(());
+        };
+        let data = data.strip_prefix(' ').unwrap_or(data);
+        let additional = data.len() + 1;
+        let next_size = self
+            .buffered_bytes
+            .checked_add(additional)
+            .ok_or_else(Self::buffer_exceeded)?;
+        if next_size > MAX_SSE_BUFFER_BYTES {
+            return Err(Self::buffer_exceeded());
+        }
+        if self.has_data {
+            self.data.push('\n');
+        }
+        self.data.push_str(data);
+        self.has_data = true;
+        self.buffered_bytes = next_size;
+        Ok(())
+    }
+
+    fn buffer_exceeded() -> ResponsesError {
+        ResponsesError::SseBufferExceeded {
+            limit: MAX_SSE_BUFFER_BYTES,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::SseDecoder;
+    use super::{MAX_SSE_BUFFER_BYTES, SseDecoder};
 
     #[test]
     fn decodes_fragmented_and_multiline_sse_events() {
         let mut decoder = SseDecoder::default();
-        decoder.push(b": keepalive\n\ndata: {\"type\":\"response.");
+        decoder
+            .push(b": keepalive\n\ndata: {\"type\":\"response.")
+            .unwrap();
         assert_eq!(decoder.next().unwrap(), None);
-        decoder.push(b"created\"}\r\n\r\ndata: first\ndata: second\n\n");
+        decoder
+            .push(b"created\"}\r\n\r\ndata: first\ndata: second\n\n")
+            .unwrap();
         assert_eq!(
             decoder.next().unwrap().as_deref(),
             Some("{\"type\":\"response.created\"}")
@@ -102,8 +134,8 @@ mod tests {
     #[test]
     fn skips_done_and_flushes_an_unterminated_final_event() {
         let mut decoder = SseDecoder::default();
-        decoder.push(b"data: [DONE]\n\ndata: final");
-        decoder.finish();
+        decoder.push(b"data: [DONE]\n\ndata: final").unwrap();
+        decoder.finish().unwrap();
         assert_eq!(decoder.next().unwrap().as_deref(), Some("final"));
         assert_eq!(decoder.next().unwrap(), None);
     }
@@ -118,7 +150,7 @@ mod tests {
         }
 
         let mut decoder = SseDecoder::default();
-        decoder.push(body.as_bytes());
+        decoder.push(body.as_bytes()).unwrap();
         for index in 0..4_096 {
             assert_eq!(
                 decoder.next().unwrap().as_deref(),
@@ -126,5 +158,29 @@ mod tests {
             );
         }
         assert_eq!(decoder.next().unwrap(), None);
+    }
+
+    #[test]
+    fn rejects_an_unfinished_line_that_exceeds_the_record_budget() {
+        let mut decoder = SseDecoder::default();
+        let line = vec![b'x'; MAX_SSE_BUFFER_BYTES + 1];
+        assert!(matches!(
+            decoder.push(&line),
+            Err(crate::ResponsesError::SseBufferExceeded { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_many_data_lines_without_an_event_delimiter() {
+        let mut decoder = SseDecoder::default();
+        let mut lines = Vec::new();
+        let line = format!("data: {}\n", "x".repeat(1024));
+        while lines.len() <= MAX_SSE_BUFFER_BYTES + 128 * 1024 {
+            lines.extend_from_slice(line.as_bytes());
+        }
+        assert!(matches!(
+            decoder.push(&lines),
+            Err(crate::ResponsesError::SseBufferExceeded { .. })
+        ));
     }
 }
