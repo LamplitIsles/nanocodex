@@ -455,23 +455,37 @@ export function releaseDefinitionHost(id) {
 }
 
 const hostBridge = Object.freeze({
-  async connect(endpoint, apiKey, accountId, fedramp, sessionId, threadId, turnState) {
+  connect(endpoint, apiKey, accountId, fedramp, sessionId, threadId, turnState) {
     const host = requiredSessionHost(threadId);
-    let result;
+    let pending;
     try {
-      result = JSON.parse(await host.connect(endpoint, apiKey, sessionId, {
+      pending = host.connect(endpoint, apiKey, sessionId, {
         accountId: accountId ?? undefined,
         fedramp,
         threadId,
         turnState: turnState ?? undefined,
-      }));
+      });
     } catch (error) {
-      throw JSON.stringify(connectFailure(error));
+      return Promise.reject(JSON.stringify(connectFailure(error)));
     }
-    const handle = nextHostConnection++;
-    hostConnections.set(handle, { host, handle: result.handle });
-    hostSessions.set(threadId, host);
-    return JSON.stringify({ ...result, handle });
+    const result = Promise.resolve(pending).then((wire) => {
+      let parsed;
+      try {
+        parsed = JSON.parse(wire);
+      } catch (error) {
+        throw JSON.stringify(connectFailure(error));
+      }
+      const handle = nextHostConnection++;
+      hostConnections.set(handle, { host, handle: parsed.handle });
+      hostSessions.set(threadId, host);
+      return JSON.stringify({ ...parsed, handle });
+    }, (error) => {
+      throw JSON.stringify(connectFailure(error));
+    });
+    if (typeof pending?.cancel === "function") {
+      result.cancel = () => pending.cancel();
+    }
+    return result;
   },
   async httpOpen(endpoint, apiKey, accountId, fedramp, sessionId, threadId, turnState, body) {
     const host = requiredSessionHost(threadId);

@@ -1,12 +1,12 @@
 use std::time::Duration;
 
-use js_sys::Promise;
+use js_sys::{Function, Promise, Reflect};
 use nanocodex::oai::transport::host::{
     ConnectedHost, HostConnectRequest, HostConnection, HostConnectionMetadata, HostError,
     HostFuture, HostHttpRequest, HostMessage, HostTransport,
 };
 use serde::Deserialize;
-use wasm_bindgen::prelude::*;
+use wasm_bindgen::{JsCast, prelude::*};
 use wasm_bindgen_futures::JsFuture;
 
 #[wasm_bindgen]
@@ -57,6 +57,31 @@ pub(super) struct JavaScriptResponsesHost {
 struct JavaScriptHostConnection {
     handle: u32,
     closed: bool,
+}
+
+struct PendingJavaScriptHostConnection {
+    cancel: Option<Function>,
+}
+
+impl PendingJavaScriptHostConnection {
+    fn new(promise: &Promise) -> Self {
+        let cancel = Reflect::get(promise.as_ref(), &JsValue::from_str("cancel"))
+            .ok()
+            .and_then(|value| value.dyn_into::<Function>().ok());
+        Self { cancel }
+    }
+
+    fn disarm(&mut self) {
+        self.cancel = None;
+    }
+}
+
+impl Drop for PendingJavaScriptHostConnection {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.call0(&JsValue::UNDEFINED);
+        }
+    }
 }
 
 impl JavaScriptHostConnection {
@@ -185,6 +210,7 @@ impl HostTransport for JavaScriptResponsesHost {
                 request.turn_state(),
             )
             .map_err(|error| decode_host_error(&error, true))?;
+            let mut pending = PendingJavaScriptHostConnection::new(&promise);
             let connection: HostConnectionWire = await_json(promise)
                 .await
                 .map_err(|error| decode_host_error(&error, true))?;
@@ -199,10 +225,10 @@ impl HostTransport for JavaScriptResponsesHost {
             if let Some(turn_state) = connection.turn_state {
                 metadata = metadata.with_turn_state(turn_state);
             }
-            Ok(ConnectedHost::new(
-                JavaScriptHostConnection::new(connection.handle),
-                metadata,
-            ))
+            let connected =
+                ConnectedHost::new(JavaScriptHostConnection::new(connection.handle), metadata);
+            pending.disarm();
+            Ok(connected)
         })
     }
 

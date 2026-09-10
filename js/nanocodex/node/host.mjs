@@ -86,12 +86,14 @@ export function createNodeHost(options = {}) {
 
   function connect(endpoint, apiKey, sessionId, metadata = {}) {
     if (options.mpp) return connectMpp(endpoint);
-    return new Promise((resolve, reject) => {
+    let cancelConnection = () => {};
+    const pending = new Promise((resolve, reject) => {
       let settled = false;
       let upgradeResponse;
       let upgradeRequest;
       let deadline;
       let rejectionResponse;
+      let rejectionSnapshot;
       const threadId = metadata.threadId ?? sessionId;
       const headers = {
         Authorization: `Bearer ${apiKey}`,
@@ -135,7 +137,7 @@ export function createNodeHost(options = {}) {
         if (settled) return;
         upgradeRequest = request;
         rejectionResponse = response;
-        readHandshakeRejection(response, (error) => fail(error));
+        rejectionSnapshot = readHandshakeRejection(response, (error) => fail(error));
       });
       socket.on("open", () => {
         if (settled) {
@@ -177,14 +179,17 @@ export function createNodeHost(options = {}) {
         }
       });
       deadline = setTimeout(() => {
-        const error = new Error(
-          `WebSocket handshake exceeded ${connectTimeoutMs} milliseconds`,
-        );
+        const error = rejectionSnapshot?.(
+          new Error(`WebSocket handshake exceeded ${connectTimeoutMs} milliseconds`),
+        ) || new Error(`WebSocket handshake exceeded ${connectTimeoutMs} milliseconds`);
         error.reconnectable = true;
         fail(error, true);
       }, connectTimeoutMs);
       connection.reject = rejectAsClosed;
+      cancelConnection = rejectAsClosed;
     });
+    pending.cancel = () => cancelConnection();
+    return pending;
   }
 
   async function connectMpp(endpoint) {
@@ -635,22 +640,23 @@ function readHandshakeRejection(response, finish) {
   let bytes = 0;
   let truncated = false;
   let settled = false;
-  const complete = (error) => {
-    if (settled) return;
-    settled = true;
-    if (error) {
-      finish(error);
-      return;
-    }
-    const body = Buffer.concat(chunks).toString("utf8") + (truncated ? "…" : "");
+  const rejectionError = (reason, partial = false) => {
+    const body = Buffer.concat(chunks).toString("utf8")
+      + (truncated || partial ? "…" : "");
+    const detail = reason ? `: ${errorMessage(reason)}` : "";
     const rejection = new Error(
-      `WebSocket handshake was rejected with HTTP ${response.statusCode}`,
+      `WebSocket handshake was rejected with HTTP ${response.statusCode}${detail}`,
     );
     rejection.status = response.statusCode;
     rejection.body = body || "empty response body";
     const retryAfter = Number(header(response.headers, "retry-after"));
     if (Number.isFinite(retryAfter) && retryAfter >= 0) rejection.retryAfter = retryAfter;
-    finish(rejection);
+    return rejection;
+  };
+  const complete = (error) => {
+    if (settled) return;
+    settled = true;
+    finish(rejectionError(error, Boolean(error)));
   };
   response.on("data", (chunk) => {
     if (settled || truncated) return;
@@ -675,6 +681,7 @@ function readHandshakeRejection(response, finish) {
   response.once("close", () => {
     if (!response.complete) complete(new Error("WebSocket handshake response closed early"));
   });
+  return (reason) => rejectionError(reason, true);
 }
 
 function destroyWebSocket(socket, ...httpObjects) {

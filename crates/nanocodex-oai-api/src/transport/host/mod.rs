@@ -41,10 +41,8 @@ pub trait HostTransport: Send + Sync + 'static {
     ///
     /// The standard client uses this capability to decide whether an initial
     /// WebSocket transport failure may switch to HTTPS. Hosts that do not
-    /// implement [`Self::http`] must leave this as `false`.
-    fn supports_http(&self) -> bool {
-        false
-    }
+    /// implement [`Self::http`] must return `false`.
+    fn supports_http(&self) -> bool;
 
     /// Starts one host-owned HTTPS Responses request.
     ///
@@ -53,12 +51,13 @@ pub trait HostTransport: Send + Sync + 'static {
     /// [`HostMessage::Chunk`] values followed by [`HostMessage::Eof`]. The
     /// shared Rust Responses machinery remains responsible for SSE parsing,
     /// event decoding, retries, and context updates.
+    ///
+    /// Implementations that return `false` from [`Self::supports_http`] must
+    /// still implement this method by returning [`HostError::http_unsupported`].
     fn http<'a>(
         &'a self,
-        _request: HostHttpRequest<'a>,
-    ) -> HostFuture<'a, Result<ConnectedHost, HostError>> {
-        Box::pin(async { Err(HostError::http_unsupported()) })
-    }
+        request: HostHttpRequest<'a>,
+    ) -> HostFuture<'a, Result<ConnectedHost, HostError>>;
 
     /// Waits without blocking the embedding thread.
     ///

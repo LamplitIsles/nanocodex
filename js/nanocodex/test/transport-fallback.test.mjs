@@ -123,13 +123,13 @@ test("Node WASM falls back to HTTP/SSE and keeps the session on SSE", async () =
 });
 
 test("Node WASM does not fall back for authorization or request rejection", async () => {
-  for (const [label, status, body] of [
-    ["unauthorized", 401, "API key is missing"],
-    ["forbidden", 403, "API key is forbidden"],
-    ["request validation", 400, "model is not available"],
+  for (const [label, status, body, upgradeOptions] of [
+    ["unauthorized", 401, "API key is missing", {}],
+    ["truncated forbidden", 403, "API key is partially forbidden", { contentLength: 100 }],
+    ["request validation", 400, "model is not available", {}],
   ]) {
     const fixture = await startFallbackFixture(async () => {}, {
-      upgrade: { status, body },
+      upgrade: { status, body, ...upgradeOptions },
     });
     const agent = await Agent.create({
       transport: Transport.openAi({
@@ -156,13 +156,14 @@ test("Node WASM does not fall back for authorization or request rejection", asyn
   }
 });
 
-test("Node host bounds a stalled WebSocket rejection and resets its socket", async () => {
+test("Node host preserves stalled authorization rejection detail through its deadline", async () => {
   const fixture = await startFallbackFixture(async () => {}, {
     upgrade: {
-      status: 426,
-      body: "partial rejection body",
+      status: 401,
+      body: "partial authorization rejection",
       contentLength: 100,
       stall: true,
+      retryAfter: 7,
     },
   });
   const host = createNodeHost({ connectTimeoutMs: 50 });
@@ -170,7 +171,13 @@ test("Node host bounds a stalled WebSocket rejection and resets its socket", asy
   try {
     await assert.rejects(
       host.connect(fixture.websocketUrl, "stalled-key", SESSION_ID),
-      /WebSocket handshake exceeded 50 milliseconds/,
+      (error) => {
+        assert.match(error.message, /WebSocket handshake exceeded 50 milliseconds/);
+        assert.equal(error.status, 401);
+        assert.equal(error.body, "partial authorization rejection…");
+        assert.equal(error.retryAfter, 7);
+        return true;
+      },
     );
     assert.ok(performance.now() - started < 500, "stalled handshake must honor its deadline");
     await bounded(fixture.waitForUpgradeClose(), "stalled WebSocket close");
@@ -212,6 +219,58 @@ test("Node WASM shutdown closes an initial stalled WebSocket without late fallba
     assert.equal(fixture.requestCount, 0, "shutdown must not trigger HTTP fallback");
   } finally {
     turn?.dispose();
+    await agent.session.shutdown().catch(() => {});
+    await fixture.close();
+  }
+});
+
+test("Node WASM turn cancellation closes only its pending WebSocket and keeps the session live", async () => {
+  const upgrade = {
+    status: 426,
+    body: "partial cancellation rejection",
+    contentLength: 100,
+    stall: true,
+  };
+  const fixture = await startFallbackFixture(async (_request, response) => {
+    await sendSse(response, completedResponse("after-cancel", [{
+      type: "message",
+      role: "assistant",
+      content: [{ type: "output_text", text: "live after cancellation" }],
+    }]));
+  }, { upgrade });
+  const agent = await Agent.create({
+    transport: Transport.openAi({
+      apiKey: "turn-cancel-key",
+      websocketUrl: fixture.websocketUrl,
+      apiBaseUrl: fixture.apiBaseUrl,
+      websocketWarmup: false,
+    }),
+    model: "gpt-5.6-sol",
+    thinking: "none",
+    sessionId: "018f1f9a-7b3c-7a20-8000-000000000030",
+  });
+  try {
+    const cancelled = agent.turn.prompt({ input: "Cancel the pending WebSocket." });
+    const cancelledResult = cancelled.result();
+    await bounded(fixture.waitForUpgrades(1), "pending WebSocket upgrade");
+    await bounded(cancelled.cancel(), "pending WebSocket cancellation");
+    await assert.rejects(cancelledResult);
+    await bounded(fixture.waitForUpgradeClose(), "cancelled WebSocket close");
+    assert.equal(fixture.requestCount, 0, "cancellation must not start HTTP fallback");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(fixture.requestCount, 0, "the cancelled attempt must not fall back late");
+
+    upgrade.stall = false;
+    delete upgrade.contentLength;
+    const resumed = agent.turn.prompt({ input: "Continue on the live session." });
+    const resumedResult = await bounded(resumed.result(), "live-session follow-on");
+    assert.equal(resumedResult.finalMessage, "live after cancellation");
+    assert.equal(fixture.upgrades, 2, "the live session may establish a fresh connection");
+    assert.equal(fixture.requestCount, 1, "only the subsequent turn may use HTTP fallback");
+    resumedResult.dispose();
+    resumed.dispose();
+    cancelled.dispose();
+  } finally {
     await agent.session.shutdown().catch(() => {});
     await fixture.close();
   }
@@ -299,8 +358,10 @@ test("Node WASM does not resubmit an SSE request after output starts", async () 
 test("cancelling an HTTP body closes the host-owned request", async () => {
   let bodyClosed;
   let bodySent;
+  let bodyEventObserved;
   const closed = new Promise((resolve) => { bodyClosed = resolve; });
   const bodyReady = new Promise((resolve) => { bodySent = resolve; });
+  const publicBodyEvent = new Promise((resolve) => { bodyEventObserved = resolve; });
   const fixture = await startFallbackFixture(async (_request, response) => {
     response.writeHead(200, {
       "content-type": "text/event-stream",
@@ -308,7 +369,10 @@ test("cancelling an HTTP body closes the host-owned request", async () => {
       "x-codex-turn-state": "cancelled-state",
     });
     response.flushHeaders();
-    response.write(": body flushed\n\n", bodySent);
+    response.write(`data: ${JSON.stringify({
+      type: "response.created",
+      response: { id: "cancelled-body-response" },
+    })}\n\n`, bodySent);
     response.once("close", () => bodyClosed());
   });
   const agent = await Agent.create({
@@ -322,11 +386,23 @@ test("cancelling an HTTP body closes the host-owned request", async () => {
     thinking: "none",
     sessionId: "018f1f9a-7b3c-7a23-8000-000000000023",
   });
+  const events = [];
+  const watch = agent.events.watch();
+  watch.onEvent((event) => {
+    events.push(event);
+    if (event.type === "api.event"
+      && JSON.stringify(event).includes("cancelled-body-response")) {
+      bodyEventObserved();
+    }
+  });
   try {
     const turn = agent.turn.prompt({ input: "Cancel while reading SSE." });
     const result = turn.result();
     await bounded(fixture.waitForRequests(1), "cancelled HTTP request");
     await bounded(bodyReady, "flushed HTTP body");
+    await bounded(publicBodyEvent, "public nonterminal Responses event");
+    assert.ok(events.some((event) => event.type === "api.event"
+      && JSON.stringify(event).includes("cancelled-body-response")));
     await bounded(turn.cancel(), "turn cancellation");
     await assert.rejects(result);
     await bounded(closed, "HTTP body close");
@@ -335,6 +411,7 @@ test("cancelling an HTTP body closes the host-owned request", async () => {
     assert.equal(fixture.requestCount, 1);
     turn.dispose();
   } finally {
+    watch.off();
     await agent.session.shutdown();
     await fixture.close();
   }
@@ -386,8 +463,9 @@ test("HTTP fallback preserves a history seed through manual compaction", async (
     }
     if (index === 1) {
       await sendSse(response, completedResponse("seeded-summary", [{
-        type: "compaction",
-        encrypted_content: "PRIVATE_SSE_SUMMARY",
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: "PRIVATE_SSE_SUMMARY" }],
       }]));
       return;
     }
@@ -408,6 +486,7 @@ test("HTTP fallback preserves a history seed through manual compaction", async (
     model: "gpt-5.6-sol",
     thinking: "none",
     sessionId: "018f1f9a-7b3c-7a20-8000-000000000029",
+    companionCompactionInstruction: "Summarize the private conversation for continuation.",
     historySeed: {
       history: [
         {
@@ -446,7 +525,7 @@ test("HTTP fallback preserves a history seed through manual compaction", async (
     assert.equal(requests.length, 3);
     assert.match(requests[0].body, /violet room/);
     assert.match(requests[0].body, /Continue the seeded conversation/);
-    assert.match(requests[1].body, /compaction_trigger/);
+    assert.match(requests[1].body, /Summarize the private conversation/);
     assert.match(requests[2].body, /PRIVATE_SSE_SUMMARY/);
     assert.match(requests[2].body, /Continue after SSE compaction/);
     assert.ok(events.some((event) => event.type === "model.compaction.completed"));
@@ -544,6 +623,7 @@ async function startFallbackFixture(onRequest, options = {}) {
     socket.write(
       `HTTP/1.1 ${status} ${reason}\r\n`
       + `Content-Type: text/plain\r\n`
+      + (upgrade.retryAfter === undefined ? "" : `Retry-After: ${upgrade.retryAfter}\r\n`)
       + `Content-Length: ${contentLength}\r\n`
       + `Connection: ${upgrade.stall ? "keep-alive" : "close"}\r\n\r\n`,
     );
