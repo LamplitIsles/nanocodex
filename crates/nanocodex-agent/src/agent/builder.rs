@@ -177,7 +177,8 @@ impl<F> NanocodexBuilder<F> {
         self
     }
 
-    /// Sets the root agent's `UUIDv7` session identity.
+    /// Sets the root agent's UUID session identity. New default identities are
+    /// `UUIDv7`; supplied `UUIDv4` identities are also accepted.
     ///
     /// The root identity also seeds its checkpoint lineage. Spawned siblings
     /// and forks receive fresh session IDs; forks retain the root's opaque

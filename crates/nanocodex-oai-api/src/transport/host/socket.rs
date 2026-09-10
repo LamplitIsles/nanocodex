@@ -122,6 +122,10 @@ impl ResponsesSocket {
             HostMessage::Timeout => Err(ResponsesError::IdleTimeout {
                 seconds: EVENT_IDLE_TIMEOUT.as_secs(),
             }),
+            HostMessage::Chunk { .. } | HostMessage::Eof => Err(ResponsesError::Receive {
+                detail: "host returned an HTTPS body message for a WebSocket connection".to_owned(),
+                reconnectable: false,
+            }),
             HostMessage::Binary => Err(ResponsesError::UnexpectedBinary),
         }
     }

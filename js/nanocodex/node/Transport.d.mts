@@ -14,8 +14,11 @@ export type ManagedTransport = Readonly<{ [managedTransport]: true }>;
 export type Transport = ResponsesTransport | ManagedTransport;
 
 type EndpointOptions = Readonly<{
+  /** HTTPS `/v1` base used for Node's pre-output SSE fallback. */
   apiBaseUrl?: string | undefined;
+  /** Preferred Responses WebSocket endpoint. */
   websocketUrl?: string | undefined;
+  /** Whether the Node host should probe the WebSocket with a non-generating request. */
   websocketWarmup?: boolean | undefined;
 }>;
 

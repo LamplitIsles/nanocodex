@@ -1,12 +1,12 @@
 use std::time::Duration;
 
-use js_sys::Promise;
+use js_sys::{Function, Promise, Reflect};
 use nanocodex::oai::transport::host::{
     ConnectedHost, HostConnectRequest, HostConnection, HostConnectionMetadata, HostError,
-    HostFuture, HostMessage, HostTransport,
+    HostFuture, HostHttpRequest, HostMessage, HostTransport,
 };
 use serde::Deserialize;
-use wasm_bindgen::prelude::*;
+use wasm_bindgen::{JsCast, prelude::*};
 use wasm_bindgen_futures::JsFuture;
 
 #[wasm_bindgen]
@@ -25,6 +25,21 @@ extern "C" {
     #[wasm_bindgen(catch, js_namespace = ["globalThis", "nanocodexHost"], js_name = send)]
     fn host_send(handle: u32, message: &str) -> Result<Promise, JsValue>;
 
+    #[wasm_bindgen(catch, js_namespace = ["globalThis", "nanocodexHost"], js_name = httpOpen)]
+    fn host_http_open(
+        endpoint: &str,
+        bearer_token: &str,
+        account_id: Option<&str>,
+        fedramp: bool,
+        session_id: &str,
+        thread_id: &str,
+        turn_state: Option<&str>,
+        body: &str,
+    ) -> Result<Promise, JsValue>;
+
+    #[wasm_bindgen(catch, js_namespace = ["globalThis", "nanocodexHost"], js_name = httpHeaders)]
+    fn host_http_headers(handle: u32) -> Result<Promise, JsValue>;
+
     #[wasm_bindgen(catch, js_namespace = ["globalThis", "nanocodexHost"], js_name = next)]
     fn host_next(handle: u32, timeout_ms: u32) -> Result<Promise, JsValue>;
 
@@ -35,10 +50,53 @@ extern "C" {
     fn host_sleep(session_id: &str, milliseconds: u32) -> Result<Promise, JsValue>;
 }
 
-pub(super) struct JavaScriptResponsesHost;
+pub(super) struct JavaScriptResponsesHost {
+    http: bool,
+}
 
 struct JavaScriptHostConnection {
     handle: u32,
+    closed: bool,
+}
+
+struct PendingJavaScriptHostConnection {
+    cancel: Option<Function>,
+}
+
+impl PendingJavaScriptHostConnection {
+    fn new(promise: &Promise) -> Self {
+        let cancel = Reflect::get(promise.as_ref(), &JsValue::from_str("cancel"))
+            .ok()
+            .and_then(|value| value.dyn_into::<Function>().ok());
+        Self { cancel }
+    }
+
+    fn disarm(&mut self) {
+        self.cancel = None;
+    }
+}
+
+impl Drop for PendingJavaScriptHostConnection {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.call0(&JsValue::UNDEFINED);
+        }
+    }
+}
+
+impl JavaScriptHostConnection {
+    fn new(handle: u32) -> Self {
+        Self {
+            handle,
+            closed: false,
+        }
+    }
+}
+
+impl JavaScriptResponsesHost {
+    pub(super) const fn new(http: bool) -> Self {
+        Self { http }
+    }
 }
 
 #[derive(Deserialize)]
@@ -67,11 +125,35 @@ struct HostSendWire {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HostHttpOpenWire {
+    handle: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HostHttpHeadersWire {
+    status: u16,
+    #[serde(default)]
+    request_id: Option<String>,
+    #[serde(default)]
+    server_model: Option<String>,
+    #[serde(default)]
+    reasoning_included: bool,
+    #[serde(default)]
+    turn_state: Option<String>,
+}
+
+#[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum HostMessageWire {
     Text {
         text: String,
     },
+    Chunk {
+        text: String,
+    },
+    Eof,
     Closed {
         detail: String,
     },
@@ -99,9 +181,20 @@ enum HostFailureWire {
         #[serde(default)]
         retry_after: Option<f64>,
     },
+    HttpRejected {
+        status: u16,
+        #[serde(default)]
+        body: String,
+        #[serde(default)]
+        retry_after: Option<f64>,
+    },
 }
 
 impl HostTransport for JavaScriptResponsesHost {
+    fn supports_http(&self) -> bool {
+        self.http
+    }
+
     fn connect<'a>(
         &'a self,
         request: HostConnectRequest<'a>,
@@ -117,6 +210,7 @@ impl HostTransport for JavaScriptResponsesHost {
                 request.turn_state(),
             )
             .map_err(|error| decode_host_error(&error, true))?;
+            let mut pending = PendingJavaScriptHostConnection::new(&promise);
             let connection: HostConnectionWire = await_json(promise)
                 .await
                 .map_err(|error| decode_host_error(&error, true))?;
@@ -131,12 +225,62 @@ impl HostTransport for JavaScriptResponsesHost {
             if let Some(turn_state) = connection.turn_state {
                 metadata = metadata.with_turn_state(turn_state);
             }
-            Ok(ConnectedHost::new(
-                JavaScriptHostConnection {
-                    handle: connection.handle,
-                },
-                metadata,
-            ))
+            let connected =
+                ConnectedHost::new(JavaScriptHostConnection::new(connection.handle), metadata);
+            pending.disarm();
+            Ok(connected)
+        })
+    }
+
+    fn http<'a>(
+        &'a self,
+        request: HostHttpRequest<'a>,
+    ) -> HostFuture<'a, Result<ConnectedHost, HostError>> {
+        Box::pin(async move {
+            if !self.http {
+                return Err(HostError::http_unsupported());
+            }
+            let promise = host_http_open(
+                request.endpoint(),
+                request.bearer_token(),
+                request.account_id(),
+                request.is_fedramp(),
+                request.session_id(),
+                request.thread_id(),
+                request.turn_state(),
+                request.body(),
+            )
+            .map_err(|error| decode_host_error(&error, true))?;
+            let opened: HostHttpOpenWire = await_json(promise)
+                .await
+                .map_err(|error| decode_host_error(&error, true))?;
+            let mut connection = JavaScriptHostConnection::new(opened.handle);
+            let promise = match host_http_headers(opened.handle) {
+                Ok(promise) => promise,
+                Err(error) => {
+                    connection.close();
+                    return Err(decode_host_error(&error, true));
+                }
+            };
+            let headers: HostHttpHeadersWire = match await_json(promise).await {
+                Ok(headers) => headers,
+                Err(error) => {
+                    connection.close();
+                    return Err(decode_host_error(&error, true));
+                }
+            };
+            let mut metadata = HostConnectionMetadata::new(headers.status)
+                .with_reasoning_included(headers.reasoning_included);
+            if let Some(request_id) = headers.request_id {
+                metadata = metadata.with_request_id(request_id);
+            }
+            if let Some(server_model) = headers.server_model {
+                metadata = metadata.with_server_model(server_model);
+            }
+            if let Some(turn_state) = headers.turn_state {
+                metadata = metadata.with_turn_state(turn_state);
+            }
+            Ok(ConnectedHost::new(connection, metadata))
         })
     }
 
@@ -181,6 +325,8 @@ impl HostConnection for JavaScriptHostConnection {
                 .map_err(|error| decode_host_error(&error, true))?;
             match message {
                 HostMessageWire::Text { text } => Ok(HostMessage::Text(text)),
+                HostMessageWire::Chunk { text } => Ok(HostMessage::Chunk { text }),
+                HostMessageWire::Eof => Ok(HostMessage::Eof),
                 HostMessageWire::Closed { detail } => Ok(HostMessage::Closed { detail }),
                 HostMessageWire::Error {
                     detail,
@@ -193,7 +339,16 @@ impl HostConnection for JavaScriptHostConnection {
     }
 
     fn close(&mut self) {
-        host_close(self.handle);
+        if !self.closed {
+            self.closed = true;
+            host_close(self.handle);
+        }
+    }
+}
+
+impl Drop for JavaScriptHostConnection {
+    fn drop(&mut self) {
+        self.close();
     }
 }
 
@@ -232,6 +387,15 @@ fn decode_host_error(error: &JsValue, reconnectable: bool) -> HostError {
             body,
             retry_after.and_then(|seconds| Duration::try_from_secs_f64(seconds).ok()),
         ),
+        HostFailureWire::HttpRejected {
+            status,
+            body,
+            retry_after,
+        } => HostError::HttpRejected {
+            status,
+            body,
+            retry_after: retry_after.and_then(|seconds| Duration::try_from_secs_f64(seconds).ok()),
+        },
     }
 }
 

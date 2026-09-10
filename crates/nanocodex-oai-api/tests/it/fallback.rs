@@ -239,7 +239,7 @@ async fn upgrade_required_falls_back_without_another_websocket_attempt() -> Resu
 }
 
 #[tokio::test]
-async fn forbidden_websocket_handshake_retries_then_falls_back_to_https() -> Result<()> {
+async fn forbidden_websocket_handshake_retries_without_falling_back_to_https() -> Result<()> {
     let websocket_listener = TcpListener::bind("127.0.0.1:0").await?;
     let websocket_url = format!("ws://{}", websocket_listener.local_addr()?);
     let http_listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -270,22 +270,6 @@ async fn forbidden_websocket_handshake_retries_then_falls_back_to_https() -> Res
         );
         Result::<()>::Ok(())
     });
-    let http_server = tokio::spawn(async move {
-        let request = read_http_json(&http_listener).await?;
-        assert!(request.body.get("previous_response_id").is_none());
-        assert!(
-            request
-                .body
-                .to_string()
-                .contains("recover forbidden upgrade")
-        );
-        send_http_events(
-            request.stream,
-            None,
-            [completed_response("resp-forbidden", "recovered")],
-        )
-        .await
-    });
 
     let openai = OpenAi::builder("test-key")
         .websocket_url(websocket_url)
@@ -295,20 +279,24 @@ async fn forbidden_websocket_handshake_retries_then_falls_back_to_https() -> Res
     let mut session = openai
         .instructions("Recover transient WebSocket upgrade failures.")
         .build()?;
-    assert_eq!(
-        session
-            .turn()
-            .create("recover forbidden upgrade")
-            .await?
-            .output_text(),
-        "recovered"
-    );
+    let error = session
+        .turn()
+        .create("recover forbidden upgrade")
+        .await
+        .expect_err("HTTP 403 must not fall back to HTTPS");
+    assert!(error.to_string().contains("HTTP 403"));
     timeout(std::time::Duration::from_secs(5), websocket_server)
         .await
         .map_err(|_| eyre!("mock 403 WebSocket server did not finish"))???;
-    timeout(std::time::Duration::from_secs(5), http_server)
+    assert!(
+        timeout(
+            std::time::Duration::from_millis(250),
+            http_listener.accept()
+        )
         .await
-        .map_err(|_| eyre!("mock 403 fallback HTTP server did not finish"))???;
+        .is_err(),
+        "HTTP 403 unexpectedly triggered HTTPS fallback"
+    );
     Ok(())
 }
 

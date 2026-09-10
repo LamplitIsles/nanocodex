@@ -799,6 +799,8 @@ struct WasmConfig {
     #[serde(default)]
     websocket_warmup: bool,
     #[serde(default)]
+    host_http: bool,
+    #[serde(default)]
     websocket_url: Option<String>,
     #[serde(default)]
     api_base_url: Option<String>,
@@ -1253,7 +1255,7 @@ impl WasmNanocodex {
             openai = openai.api_base_url(api_base_url);
         }
         let openai = openai
-            .host_transport(JavaScriptResponsesHost)
+            .host_transport(JavaScriptResponsesHost::new(config.host_http))
             .build()
             .map_err(js_error)?;
         let tools = Tools::builder()
@@ -1358,7 +1360,7 @@ impl WasmNanocodex {
         self.inner.agent_id().to_owned()
     }
 
-    /// Returns the stable `UUIDv7` session identity.
+    /// Returns the stable UUID session identity (`UUIDv7` by default).
     #[wasm_bindgen(getter, js_name = sessionId)]
     #[must_use]
     pub fn session_id(&self) -> String {

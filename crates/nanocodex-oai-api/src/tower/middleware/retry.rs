@@ -24,6 +24,7 @@ pub struct ResponsesRetryPolicy {
     max_attempts: NonZeroU32,
     delay: RetryDelay,
     standard_transport: Option<ResponsesTransport>,
+    immediate_transport_fallback: bool,
 }
 
 impl ResponsesRetryPolicy {
@@ -37,6 +38,7 @@ impl ResponsesRetryPolicy {
             max_attempts,
             delay: RetryDelay::unconfigured(),
             standard_transport: None,
+            immediate_transport_fallback: false,
         }
     }
 
@@ -49,14 +51,17 @@ impl ResponsesRetryPolicy {
             max_attempts,
             delay: RetryDelay::from_config(config),
             standard_transport: None,
+            immediate_transport_fallback: false,
         }
     }
 
     pub(crate) const fn with_standard_transport_fallback(
         mut self,
         transport: ResponsesTransport,
+        supported: bool,
     ) -> Self {
-        self.standard_transport = Some(transport);
+        self.standard_transport = if supported { Some(transport) } else { None };
+        self.immediate_transport_fallback = supported && cfg!(target_family = "wasm");
         self
     }
 }
@@ -79,6 +84,9 @@ impl Policy<ResponsesAttempt, ResponsesServiceResponse, ResponsesServiceError>
     ) -> Option<Self::Future> {
         request.limit_attempts(self.max_attempts);
         let failure = result.as_ref().err()?;
+        if failure.output_started() {
+            return None;
+        }
         let checkpoint_missing =
             failure.is_checkpoint_missing() && request.previous_response_id().is_some();
         let advice = failure.retry_advice;
@@ -86,11 +94,20 @@ impl Policy<ResponsesAttempt, ResponsesServiceResponse, ResponsesServiceError>
             failure.responses_error(),
             Some(ResponsesError::HandshakeRejected { status: 426, .. })
         );
+        let transport_failure = failure
+            .responses_error()
+            .is_some_and(ResponsesError::is_transport_fallback_candidate);
+        let immediate_transport_failure = transport_failure
+            && (matches!(failure.phase, FailurePhase::Connect)
+                || matches!(request.kind, ResponsesAttemptKind::Warmup));
         let exhausted_websocket_budget = !matches!(request.kind, ResponsesAttemptKind::Warmup)
+            && transport_failure
             && advice.is_some()
             && request.attempt >= request.max_attempts;
         let fallback_reason = if upgrade_required {
             Some("upgrade_required")
+        } else if self.immediate_transport_fallback && immediate_transport_failure {
+            Some("transport_unavailable")
         } else if exhausted_websocket_budget {
             Some("retry_exhausted")
         } else {
@@ -101,7 +118,11 @@ impl Policy<ResponsesAttempt, ResponsesServiceResponse, ResponsesServiceError>
             && request.activate_https_fallback()
         {
             let failed_attempt = request.attempt;
-            let message = failure.source.to_string();
+            let message = if matches!(request.kind, ResponsesAttemptKind::Warmup) {
+                "WebSocket transport failed before response output; subsequent requests will use HTTPS SSE"
+            } else {
+                "WebSocket transport failed before response output; request replayed over HTTPS SSE"
+            };
             tracing::warn!(
                 target: "nanocodex_oai_api",
                 previous_transport = "responses_websocket_v2",
@@ -112,9 +133,6 @@ impl Policy<ResponsesAttempt, ResponsesServiceResponse, ResponsesServiceError>
                 attempt = failed_attempt,
                 "falling back from WebSocket to HTTPS Responses transport"
             );
-            if matches!(request.kind, ResponsesAttemptKind::Warmup) {
-                return None;
-            }
             if let Err(error) = request.observer.emit(
                 AgentEventKind::ModelAttemptRetrying,
                 AttemptRetrying {
@@ -131,6 +149,9 @@ impl Policy<ResponsesAttempt, ResponsesServiceResponse, ResponsesServiceError>
                     replay_mode: "full_history",
                     connection_generation: failure.connection_generation,
                     error: &message,
+                    previous_transport: Some("responses_websocket_v2"),
+                    next_transport: Some("responses_https_sse"),
+                    reason: Some(fallback_reason),
                 },
             ) {
                 *result = Err(ResponsesServiceError::event(
@@ -141,6 +162,9 @@ impl Policy<ResponsesAttempt, ResponsesServiceResponse, ResponsesServiceError>
                 return None;
             }
             request.prepare_transport_fallback();
+            if matches!(request.kind, ResponsesAttemptKind::Warmup) {
+                return None;
+            }
             request
                 .observer
                 .stats
@@ -187,6 +211,9 @@ impl Policy<ResponsesAttempt, ResponsesServiceResponse, ResponsesServiceError>
                 replay_mode: "full_history",
                 connection_generation: failure.connection_generation,
                 error: &message,
+                previous_transport: None,
+                next_transport: None,
+                reason: None,
             },
         ) {
             *result = Err(ResponsesServiceError::event(

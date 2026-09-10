@@ -171,6 +171,12 @@ pub enum ResponsesError {
         /// Complete UTF-8 failure detail.
         detail: String,
     },
+    /// An SSE event or unfinished record exceeded the decoder budget.
+    #[error("Responses HTTPS stream exceeded the {limit}-byte SSE record buffer")]
+    SseBufferExceeded {
+        /// Maximum bytes retained by the incremental SSE decoder.
+        limit: usize,
+    },
 }
 
 impl ResponsesError {
@@ -230,6 +236,26 @@ impl ResponsesError {
         })
     }
 
+    /// Returns whether this is a pre-output WebSocket failure that can move
+    /// to a separately configured HTTPS Responses endpoint.
+    pub(crate) fn is_transport_fallback_candidate(&self) -> bool {
+        match self {
+            Self::Handshake { reconnectable, .. } => *reconnectable,
+            Self::HandshakeTimeout { .. } => true,
+            Self::HandshakeRejected { status, .. } => {
+                *status == 426 || *status == 429 || (500..=599).contains(status)
+            }
+            Self::Send { reconnectable, .. } | Self::Receive { reconnectable, .. } => {
+                *reconnectable
+            }
+            Self::SendTimeout { .. }
+            | Self::IdleTimeout { .. }
+            | Self::UnexpectedEnd
+            | Self::Closed { .. } => true,
+            _ => false,
+        }
+    }
+
     /// Returns a stable low-cardinality error class for telemetry.
     #[must_use]
     pub fn class(&self) -> &'static str {
@@ -271,6 +297,7 @@ impl ResponsesError {
             Self::HttpRejected { status, .. } if (500..=599).contains(status) => "https_server",
             Self::HttpRejected { .. } => "https_rejected",
             Self::InvalidSseUtf8 { .. } => "invalid_sse_utf8",
+            Self::SseBufferExceeded { .. } => "sse_buffer_exceeded",
         }
     }
 

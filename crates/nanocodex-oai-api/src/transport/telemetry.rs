@@ -89,6 +89,12 @@ pub(crate) struct AttemptRetrying<'a> {
     pub(crate) replay_mode: &'static str,
     pub(crate) connection_generation: u32,
     pub(crate) error: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) previous_transport: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) next_transport: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) reason: Option<&'static str>,
 }
 
 #[derive(Serialize)]

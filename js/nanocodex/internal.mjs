@@ -314,6 +314,7 @@ export function toWasmConfig(options = {}) {
   copy(config, "reasoning_mode", options.reasoningMode);
   copy(config, "fast_mode", options.fastMode);
   copy(config, "websocket_warmup", options.websocketWarmup);
+  copy(config, "host_http", options.hostHttp);
   copy(config, "websocket_url", options.websocketUrl);
   copy(config, "api_base_url", options.apiBaseUrl);
   copy(config, "instructions", options.instructions);
@@ -454,11 +455,43 @@ export function releaseDefinitionHost(id) {
 }
 
 const hostBridge = Object.freeze({
-  async connect(endpoint, apiKey, accountId, fedramp, sessionId, threadId, turnState) {
+  connect(endpoint, apiKey, accountId, fedramp, sessionId, threadId, turnState) {
+    const host = requiredSessionHost(threadId);
+    let pending;
+    try {
+      pending = host.connect(endpoint, apiKey, sessionId, {
+        accountId: accountId ?? undefined,
+        fedramp,
+        threadId,
+        turnState: turnState ?? undefined,
+      });
+    } catch (error) {
+      return Promise.reject(JSON.stringify(connectFailure(error)));
+    }
+    const result = Promise.resolve(pending).then((wire) => {
+      let parsed;
+      try {
+        parsed = JSON.parse(wire);
+      } catch (error) {
+        throw JSON.stringify(connectFailure(error));
+      }
+      const handle = nextHostConnection++;
+      hostConnections.set(handle, { host, handle: parsed.handle });
+      hostSessions.set(threadId, host);
+      return JSON.stringify({ ...parsed, handle });
+    }, (error) => {
+      throw JSON.stringify(connectFailure(error));
+    });
+    if (typeof pending?.cancel === "function") {
+      result.cancel = () => pending.cancel();
+    }
+    return result;
+  },
+  async httpOpen(endpoint, apiKey, accountId, fedramp, sessionId, threadId, turnState, body) {
     const host = requiredSessionHost(threadId);
     let result;
     try {
-      result = JSON.parse(await host.connect(endpoint, apiKey, sessionId, {
+      result = JSON.parse(await host.httpOpen(endpoint, apiKey, sessionId, body, {
         accountId: accountId ?? undefined,
         fedramp,
         threadId,
@@ -471,6 +504,23 @@ const hostBridge = Object.freeze({
     hostConnections.set(handle, { host, handle: result.handle });
     hostSessions.set(threadId, host);
     return JSON.stringify({ ...result, handle });
+  },
+  httpHeaders(handle) {
+    const connection = hostConnections.get(handle);
+    if (!connection) {
+      return Promise.reject(JSON.stringify({
+        kind: "transport",
+        detail: "unknown HTTPS handle",
+        reconnectable: false,
+      }));
+    }
+    return connection.host.httpHeaders(connection.handle)
+      .catch((error) => {
+        // Header rejection closes the host-owned handle before Rust can build
+        // its HostConnection wrapper; do not retain the outer bridge entry.
+        hostConnections.delete(handle);
+        throw JSON.stringify(httpFailure(error));
+      });
   },
   send(handle, message) {
     const connection = hostConnections.get(handle);
@@ -963,6 +1013,32 @@ function connectFailure(error) {
     kind: "transport",
     detail: errorDetail(error),
     reconnectable: true,
+  };
+}
+
+function httpFailure(error) {
+  if (typeof error === "string") {
+    try {
+      const encoded = JSON.parse(error);
+      if (encoded?.kind === "http_rejected" || encoded?.kind === "transport") {
+        return encoded;
+      }
+    } catch {}
+  }
+  const status = Number(error?.status);
+  if (Number.isInteger(status) && status >= 100 && status <= 599) {
+    const retryAfter = Number(error?.retryAfter);
+    return {
+      kind: "http_rejected",
+      status,
+      body: typeof error?.body === "string" ? error.body : errorDetail(error),
+      ...(Number.isFinite(retryAfter) && retryAfter >= 0 ? { retry_after: retryAfter } : {}),
+    };
+  }
+  return {
+    kind: "transport",
+    detail: errorDetail(error),
+    reconnectable: error?.reconnectable === true,
   };
 }
 

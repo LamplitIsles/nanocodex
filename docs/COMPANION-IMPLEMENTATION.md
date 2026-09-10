@@ -55,6 +55,34 @@ direct full replay of the selected history; it does not perform a warmup or
 reuse a foreign provider continuation. The existing host-owned
 `durability`/`durabilityId` store contract remains the persistence boundary.
 
+## Node/WASM Responses transport fallback
+
+The Node `Transport.openAi` and `Transport.chatGpt` bindings prefer the
+Responses WebSocket and use the configured `apiBaseUrl` only for an eligible
+pre-output transport failure. The Node host caps WebSocket establishment and
+HTTP response headers at 15 seconds, sends the exact engine-encoded request to
+`POST <apiBaseUrl>/responses`, and incrementally decodes the owned
+`text/event-stream` body. The same live session then stays on HTTPS/SSE, so a
+follow-up retains its thread identity, authoritative history, tool results,
+and any server turn-state header without another WebSocket probe.
+
+Fallback is not a provider or auth failover. Authentication, validation,
+caller cancellation, and failures after an assistant delta, response item, or
+tool execution begins remain terminal under the existing retry semantics. The
+Node host owns fetch cancellation, readers, bounded rejection bodies, and
+cleanup. Browser/current-isolate and MPP hosts leave the HTTP capability
+disabled until they implement an equivalent host boundary.
+
+The public diagnostic is the existing `model.attempt.retrying` event. A
+fallback event uses `error_class: "websocket_fallback"` and includes
+`previous_transport: "responses_websocket_v2"`,
+`next_transport: "responses_https_sse"`, and a low-cardinality `reason`.
+Those fields are session-correlated by the normal `request_id`; bearer
+credentials, request headers, prompts, and request bodies are not included.
+The generated WASM binding receives this capability through its private host
+bridge, while the public Node package exposes only `apiBaseUrl`,
+`websocketUrl`, and `websocketWarmup`.
+
 ## Companion compaction behavior
 
 Setting `companionCompactionInstruction` opts the session into a normal

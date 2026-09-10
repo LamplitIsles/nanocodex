@@ -382,6 +382,11 @@ not infer provider portability from them. See the complete
 [JavaScript guide](js/nanocodex/README.md) and runnable
 [Node session](examples/node/session.mjs).
 
+The Node OpenAI/ChatGPT hosts can use a configured HTTPS `/v1` `apiBaseUrl` as
+a one-way fallback when the preferred Responses WebSocket cannot establish
+before output. The fallback is session-scoped and emits a sanitized transport
+event; browser, current-isolate, and MPP hosts do not claim this capability.
+
 ### A complete coding workspace in a browser
 
 The browser entrypoint runs the same Rust agent in a Worker. It can open a

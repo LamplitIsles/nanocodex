@@ -114,6 +114,7 @@ export function create(options = {}) {
             : "wss://openai.mpp.tempo.xyz/v1/responses"),
           apiBaseUrl,
           websocketWarmup,
+          hostHttp: mpp === undefined,
           subagents: subagentConfig,
           hostDefinitionId,
           ...config,

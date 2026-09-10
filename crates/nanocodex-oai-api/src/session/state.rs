@@ -11,9 +11,10 @@ use super::{
 
 /// Stable client-owned identity for one managed conversation.
 ///
-/// Session IDs are `UUIDv7` values so they remain globally unique while sorting
-/// by creation time. They are not `OpenAI` response IDs and are safe to persist
-/// as application lineage.
+/// Session IDs are UUID values. Newly generated IDs are `UUIDv7` values so they
+/// remain globally unique while sorting by creation time; callers may also
+/// supply `UUIDv4` values. They are not `OpenAI` response IDs and are safe to
+/// persist as application lineage.
 #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[repr(transparent)]
 #[serde(try_from = "uuid::Uuid", into = "uuid::Uuid")]
@@ -63,7 +64,7 @@ impl TryFrom<uuid::Uuid> for SessionId {
     type Error = SessionIdError;
 
     fn try_from(value: uuid::Uuid) -> Result<Self, Self::Error> {
-        if value.get_version_num() != 7 {
+        if !matches!(value.get_version_num(), 4 | 7) {
             return Err(SessionIdError::WrongVersion {
                 version: value.get_version_num(),
             });
@@ -84,8 +85,8 @@ pub enum SessionIdError {
     /// The value was not a UUID.
     #[error("invalid session UUID")]
     InvalidUuid(#[from] uuid::Error),
-    /// The UUID used a version other than `UUIDv7`.
-    #[error("session IDs must be UUIDv7, got UUIDv{version}")]
+    /// The UUID used a version other than `UUIDv4` or `UUIDv7`.
+    #[error("session IDs must be UUIDv4 or UUIDv7, got UUIDv{version}")]
     WrongVersion {
         /// Parsed UUID version number.
         version: usize,
