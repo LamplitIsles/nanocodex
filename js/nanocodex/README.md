@@ -132,6 +132,28 @@ Transport.managed({ agent: { create: true } });
 Transport.managed({ agent: { id: retainedAgentId } });
 ```
 
+For `nanocodex/node`, `Transport.openAi` and `Transport.chatGpt` prefer the
+Responses WebSocket. Set `apiBaseUrl` to the matching HTTPS `/v1` base when
+the WebSocket endpoint is not guaranteed to be reachable. A failed upgrade or
+other eligible transport failure before response output begins is replayed
+once over that endpoint as an incremental `text/event-stream` request. The
+Node host caps WebSocket establishment and HTTP response headers at 15 seconds,
+owns the fetch reader and bearer headers, and keeps the selected HTTPS
+transport for the rest of that live Agent session. The request body, session
+ID, thread ID, tool results, and authoritative history remain engine-owned;
+the host never needs to resubmit a turn after output has started.
+
+Fallback is deliberately not used for authentication, model/request
+validation, caller cancellation, or a failure after an assistant delta,
+response item, or tool execution has begun. The browser/current-isolate and
+MPP hosts do not advertise this Node-only host capability. When fallback is
+selected, `agent.events.watch()` receives one sanitized
+`model.attempt.retrying` event whose payload includes:
+`previous_transport: "responses_websocket_v2"`,
+`next_transport: "responses_https_sse"`, and a low-cardinality `reason` such
+as `"upgrade_required"` or `"transport_unavailable"`; it contains no bearer
+token, headers, prompt, or request body.
+
 Managed identity is always explicit. `{ create: true }` provisions one new
 account-owned durable Agent; `{ id }` eagerly verifies and opens that existing
 Agent. Omitting `agent` never creates a durable resource. Both return the same

@@ -248,7 +248,10 @@ impl ResponsesService {
     ) -> DefaultResponsesService {
         let service = Self::new(Arc::clone(&config)).with_max_attempts(max_attempts);
         let retry = ResponsesRetryPolicy::for_config(max_attempts, &config)
-            .with_standard_transport_fallback(config.responses_transport);
+            .with_standard_transport_fallback(
+                config.responses_transport,
+                config.supports_https_fallback(),
+            );
         Retry::new(retry, service)
     }
 
@@ -265,7 +268,10 @@ impl ResponsesService {
         let service = Self::new_with_http_client(Arc::clone(&config), http_client)
             .with_max_attempts(max_attempts);
         let retry = ResponsesRetryPolicy::for_config(max_attempts, &config)
-            .with_standard_transport_fallback(config.responses_transport);
+            .with_standard_transport_fallback(
+                config.responses_transport,
+                config.supports_https_fallback(),
+            );
         Retry::new(retry, service)
     }
 

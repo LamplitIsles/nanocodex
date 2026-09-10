@@ -13,6 +13,7 @@ pub struct ResponsesServiceError {
     class: &'static str,
     pub(crate) retry_advice: Option<RetryAdvice>,
     pub(crate) connection_generation: u32,
+    output_started: bool,
 }
 
 impl ResponsesServiceError {
@@ -29,6 +30,7 @@ impl ResponsesServiceError {
             class,
             retry_advice,
             connection_generation,
+            output_started: false,
         }
     }
 
@@ -91,13 +93,26 @@ impl ResponsesServiceError {
         self
     }
 
+    pub(crate) const fn with_output_started(mut self, output_started: bool) -> Self {
+        self.output_started |= output_started;
+        self
+    }
+
+    pub(crate) const fn output_started(&self) -> bool {
+        self.output_started
+    }
+
     pub(crate) fn with_request_input(self, request: &crate::ResponsesAttempt) -> Self {
         match self.source {
-            ResponsesServiceErrorSource::Responses(source) => Self::responses(
-                source.with_request_input(request.input_items()),
-                self.phase,
-                self.connection_generation,
-            ),
+            ResponsesServiceErrorSource::Responses(source) => {
+                let output_started = self.output_started;
+                Self::responses(
+                    source.with_request_input(request.input_items()),
+                    self.phase,
+                    self.connection_generation,
+                )
+                .with_output_started(output_started)
+            }
             _ => self,
         }
     }

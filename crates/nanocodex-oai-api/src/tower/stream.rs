@@ -250,9 +250,10 @@ where
     let mut done_items = Vec::with_capacity(2);
     let mut assistant_items = HashMap::new();
     let mut timing = StreamTiming::new(started_at);
+    let mut output_started = false;
 
     loop {
-        let received = next_event(
+        let received = match next_event(
             source,
             transport,
             observer,
@@ -260,7 +261,12 @@ where
             call_index,
             &mut timing,
         )
-        .await?;
+        .await
+        {
+            Ok(received) => received,
+            Err(error) => return Err(error.with_output_started(output_started)),
+        };
+        output_started |= is_output_event(&received.event);
         match received.event {
             ServerEvent::OutputItemAdded { output_index, item } => {
                 let Some(output_index) = output_index else {
@@ -412,9 +418,10 @@ where
 {
     let mut done_items = Vec::with_capacity(2);
     let mut timing = StreamTiming::new(started_at);
+    let mut output_started = false;
 
     loop {
-        let received = next_event(
+        let received = match next_event(
             source,
             transport,
             observer,
@@ -422,7 +429,12 @@ where
             call_index,
             &mut timing,
         )
-        .await?;
+        .await
+        {
+            Ok(received) => received,
+            Err(error) => return Err(error.with_output_started(output_started)),
+        };
+        output_started |= is_output_event(&received.event);
         match received.event {
             ServerEvent::OutputItemDone { item } => done_items.push(item),
             ServerEvent::Completed { mut response } => {
@@ -437,10 +449,12 @@ where
                 let item = compactions.next();
                 let count = usize::from(item.is_some()) + compactions.count();
                 if count != 1 {
-                    return Err(ResponsesServiceError::invalid_compaction(count));
+                    return Err(ResponsesServiceError::invalid_compaction(count)
+                        .with_output_started(output_started));
                 }
                 let Some(item) = item else {
-                    return Err(ResponsesServiceError::invalid_compaction(0));
+                    return Err(ResponsesServiceError::invalid_compaction(0)
+                        .with_output_started(output_started));
                 };
                 return Ok(CompactionOutput {
                     id: response.id,
@@ -455,6 +469,17 @@ where
             _ => {}
         }
     }
+}
+
+fn is_output_event(event: &ServerEvent) -> bool {
+    matches!(
+        event,
+        ServerEvent::OutputTextDelta { .. }
+            | ServerEvent::ReasoningSummaryTextDelta { .. }
+            | ServerEvent::ReasoningSummaryDelta { .. }
+            | ServerEvent::OutputItemAdded { .. }
+            | ServerEvent::OutputItemDone { .. }
+    )
 }
 
 async fn next_event<S>(

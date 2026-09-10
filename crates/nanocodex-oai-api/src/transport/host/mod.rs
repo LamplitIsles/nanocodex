@@ -10,6 +10,8 @@
 use std::{future::Future, pin::Pin, time::Duration};
 
 #[cfg(target_family = "wasm")]
+pub(crate) mod http;
+#[cfg(target_family = "wasm")]
 pub(crate) mod socket;
 
 /// Boxed future returned by a native embedding host.
@@ -34,6 +36,29 @@ pub trait HostTransport: Send + Sync + 'static {
         &'a self,
         request: HostConnectRequest<'a>,
     ) -> HostFuture<'a, Result<ConnectedHost, HostError>>;
+
+    /// Returns whether this host can stream an HTTPS Responses body.
+    ///
+    /// The standard client uses this capability to decide whether an initial
+    /// WebSocket transport failure may switch to HTTPS. Hosts that do not
+    /// implement [`Self::http`] must leave this as `false`.
+    fn supports_http(&self) -> bool {
+        false
+    }
+
+    /// Starts one host-owned HTTPS Responses request.
+    ///
+    /// The host resolves the request headers, owns the fetch/read body and
+    /// returns a connection whose [`HostConnection::next`] yields
+    /// [`HostMessage::Chunk`] values followed by [`HostMessage::Eof`]. The
+    /// shared Rust Responses machinery remains responsible for SSE parsing,
+    /// event decoding, retries, and context updates.
+    fn http<'a>(
+        &'a self,
+        _request: HostHttpRequest<'a>,
+    ) -> HostFuture<'a, Result<ConnectedHost, HostError>> {
+        Box::pin(async { Err(HostError::http_unsupported()) })
+    }
 
     /// Waits without blocking the embedding thread.
     ///
@@ -66,6 +91,103 @@ pub struct HostConnectRequest<'a> {
     session_id: &'a str,
     thread_id: &'a str,
     turn_state: Option<&'a str>,
+}
+
+/// Immutable inputs for one host-owned HTTPS Responses request.
+///
+/// `endpoint` is the complete `/responses` URL and `body` is the exact JSON
+/// request encoded by Nanocodex. The host owns credential use, request
+/// cancellation, response readers, and connection cleanup.
+///
+/// `Debug` is intentionally not implemented because the value contains the
+/// resolved bearer credential and request body.
+#[derive(Clone, Copy)]
+pub struct HostHttpRequest<'a> {
+    endpoint: &'a str,
+    bearer_token: &'a str,
+    account_id: Option<&'a str>,
+    fedramp: bool,
+    session_id: &'a str,
+    thread_id: &'a str,
+    turn_state: Option<&'a str>,
+    body: &'a str,
+}
+
+impl<'a> HostHttpRequest<'a> {
+    /// Creates the immutable inputs for one HTTPS Responses request.
+    #[must_use]
+    pub const fn new(
+        endpoint: &'a str,
+        bearer_token: &'a str,
+        account_id: Option<&'a str>,
+        fedramp: bool,
+        session_id: &'a str,
+        thread_id: &'a str,
+        turn_state: Option<&'a str>,
+        body: &'a str,
+    ) -> Self {
+        Self {
+            endpoint,
+            bearer_token,
+            account_id,
+            fedramp,
+            session_id,
+            thread_id,
+            turn_state,
+            body,
+        }
+    }
+
+    /// Returns the complete HTTPS Responses endpoint.
+    #[must_use]
+    pub const fn endpoint(&self) -> &'a str {
+        self.endpoint
+    }
+
+    /// Returns the resolved bearer credential for this request.
+    ///
+    /// Hosts must treat this value as a secret and must not retain it beyond
+    /// the request.
+    #[must_use]
+    pub const fn bearer_token(&self) -> &'a str {
+        self.bearer_token
+    }
+
+    /// Returns the `ChatGPT` account ID when authentication is account-scoped.
+    #[must_use]
+    pub const fn account_id(&self) -> Option<&'a str> {
+        self.account_id
+    }
+
+    /// Returns whether the credential targets a `FedRAMP` environment.
+    #[must_use]
+    pub const fn is_fedramp(&self) -> bool {
+        self.fedramp
+    }
+
+    /// Returns the stable session identity sent with the request.
+    #[must_use]
+    pub const fn session_id(&self) -> &'a str {
+        self.session_id
+    }
+
+    /// Returns the current agent thread identity sent with the request.
+    #[must_use]
+    pub const fn thread_id(&self) -> &'a str {
+        self.thread_id
+    }
+
+    /// Returns opaque server turn state retained across requests.
+    #[must_use]
+    pub const fn turn_state(&self) -> Option<&'a str> {
+        self.turn_state
+    }
+
+    /// Returns the exact encoded JSON request body.
+    #[must_use]
+    pub const fn body(&self) -> &'a str {
+        self.body
+    }
 }
 
 impl<'a> HostConnectRequest<'a> {
@@ -270,6 +392,13 @@ impl HostConnectionMetadata {
 pub enum HostMessage {
     /// One complete text frame containing a Responses event.
     Text(String),
+    /// One incrementally decoded HTTPS response-body chunk.
+    Chunk {
+        /// UTF-8 text from the host-owned response reader.
+        text: String,
+    },
+    /// The HTTPS response body reached EOF.
+    Eof,
     /// The peer closed the connection with retained detail.
     Closed {
         /// Close code and reason formatted by the host.
@@ -302,6 +431,16 @@ pub enum HostError {
         /// Provider-requested minimum retry delay.
         retry_after: Option<Duration>,
     },
+    /// The provider rejected an HTTPS Responses request.
+    #[error("HTTPS Responses request was rejected with HTTP {status}: {body}")]
+    HttpRejected {
+        /// HTTP response status.
+        status: u16,
+        /// Bounded retained response body.
+        body: String,
+        /// Provider-requested minimum retry delay.
+        retry_after: Option<Duration>,
+    },
 }
 
 impl HostError {
@@ -328,6 +467,15 @@ impl HostError {
         }
     }
 
+    /// Creates an error for a host that does not implement HTTPS streaming.
+    #[must_use]
+    pub fn http_unsupported() -> Self {
+        Self::Transport {
+            detail: "the Responses host does not support HTTPS streaming".to_owned(),
+            reconnectable: false,
+        }
+    }
+
     /// Marks whether replacing the connection may safely recover this failure.
     #[must_use]
     pub fn with_reconnectable(self, reconnectable: bool) -> Self {
@@ -337,6 +485,7 @@ impl HostError {
                 reconnectable,
             },
             rejected @ Self::HandshakeRejected { .. } => rejected,
+            rejected @ Self::HttpRejected { .. } => rejected,
         }
     }
 
@@ -346,6 +495,7 @@ impl HostError {
         match self {
             Self::Transport { detail, .. } => detail,
             Self::HandshakeRejected { body, .. } => body,
+            Self::HttpRejected { body, .. } => body,
         }
     }
 

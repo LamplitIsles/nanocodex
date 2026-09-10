@@ -63,6 +63,19 @@ pub struct ModelConfig {
 }
 
 impl ModelConfig {
+    pub(crate) fn supports_https_fallback(&self) -> bool {
+        #[cfg(not(target_family = "wasm"))]
+        {
+            true
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            self.host_transport
+                .as_ref()
+                .is_some_and(|host| host.supports_http())
+        }
+    }
+
     pub(crate) fn wire_model_id(&self, model: Model) -> Cow<'static, str> {
         match self.model_id_prefix.as_deref() {
             Some(prefix) => Cow::Owned(format!("{prefix}/{}", model.as_str())),

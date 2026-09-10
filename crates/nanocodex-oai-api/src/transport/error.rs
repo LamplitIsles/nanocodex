@@ -230,6 +230,26 @@ impl ResponsesError {
         })
     }
 
+    /// Returns whether this is a pre-output WebSocket failure that can move
+    /// to a separately configured HTTPS Responses endpoint.
+    pub(crate) fn is_transport_fallback_candidate(&self) -> bool {
+        match self {
+            Self::Handshake { reconnectable, .. } => *reconnectable,
+            Self::HandshakeTimeout { .. } => true,
+            Self::HandshakeRejected { status, .. } => {
+                *status == 403 || *status == 426 || *status == 429 || (500..=599).contains(status)
+            }
+            Self::Send { reconnectable, .. } | Self::Receive { reconnectable, .. } => {
+                *reconnectable
+            }
+            Self::SendTimeout { .. }
+            | Self::IdleTimeout { .. }
+            | Self::UnexpectedEnd
+            | Self::Closed { .. } => true,
+            _ => false,
+        }
+    }
+
     /// Returns a stable low-cardinality error class for telemetry.
     #[must_use]
     pub fn class(&self) -> &'static str {

@@ -15,6 +15,7 @@ pub(crate) mod http;
 pub(crate) mod platform;
 #[cfg(not(target_family = "wasm"))]
 pub(crate) mod socket;
+mod sse;
 pub(crate) mod telemetry;
 mod wire;
 
