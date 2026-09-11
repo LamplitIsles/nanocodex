@@ -346,16 +346,18 @@ impl ManagedSessionState {
         summary: ResponseItem,
         initial_context: impl IntoIterator<Item = ResponseItem>,
         request_prefix: &[ResponseItem],
-    ) {
+    ) -> compaction::CompactionInstallation {
         let initial_context = initial_context.into_iter().collect::<Vec<_>>();
-        let history = compaction::install_companion_history(
+        let installation = compaction::install_companion_history(
             &self.context.flattened_items(),
             &initial_context,
             summary,
         );
-        self.context.replace_and_recompute(history, request_prefix);
+        self.context
+            .replace_and_recompute(installation.history.clone(), request_prefix);
         self.reset_for_full_request();
         self.history_revision = self.history_revision.saturating_add(1);
+        installation
     }
 
     /// Returns the monotonic number of installed history replacements.

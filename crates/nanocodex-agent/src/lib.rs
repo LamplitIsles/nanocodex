@@ -11,6 +11,8 @@ compile_error!(
 extern crate self as nanocodex_agent;
 
 mod agent;
+#[cfg(feature = "openai")]
+mod compaction;
 mod error;
 #[cfg(feature = "openai")]
 mod model;
@@ -44,6 +46,12 @@ pub use agent::{
     AgentSessionContext, BuilderBackend, Nanocodex, PromptRequest, PromptRoute, SpawnOptions, Turn,
     TurnControl, TurnResult,
 };
+#[cfg(feature = "openai")]
+#[cfg_attr(docsrs, doc(cfg(feature = "openai")))]
+pub use compaction::{
+    CompactionInstructionContext, CompactionInstructionFuture, CompactionInstructionResolver,
+    CompactionItemIdentity, CompactionOutcome, CompactionPhase, CompactionRange, CompactionTrigger,
+};
 pub use error::{ExecutionPolicyDisposition, NanocodexError, Result};
 pub use nanocodex_oai_api::{Model, ReasoningMode, Thinking, events::AgentEvents};
 #[cfg(feature = "openai")]
@@ -55,6 +63,7 @@ pub use nanocodex_tools::tool;
 #[cfg(feature = "openai")]
 #[cfg_attr(docsrs, doc(cfg(feature = "openai")))]
 pub use nanocodex_tools::{Tool, Tools};
+pub use session::SessionSnapshot;
 pub use usage::{
     CostStatus, EstimatedUsdCost, ReportedTurnUsage, ServiceTier, TurnUsage, UsdAmount,
 };
@@ -69,7 +78,8 @@ pub mod events {
     };
     pub use nanocodex_oai_api::events::{
         AgentEventData, AssistantDelta, AssistantEvent, AssistantMessage, CompactionCompleted,
-        CompactionFailed, CompactionStarted, ContextEvent, EventUsage, ModelCallCompleted,
+        CompactionFailed, CompactionItemIdentity, CompactionRange, CompactionReplaced,
+        CompactionSessionContext, CompactionStarted, ContextEvent, EventUsage, ModelCallCompleted,
         ModelCallFailed, ModelCallStarted, ModelEvent, ModelWarmupCompleted, ModelWarmupFailed,
         ModelWarmupStarted, ReasoningEvent, ReasoningSummaryDelta, RunError, RunEvent, RunMetrics,
         RunStarted, RunStatus, RunSteered, RunTerminal, ToolCall, ToolEvent, ToolResultEvent,

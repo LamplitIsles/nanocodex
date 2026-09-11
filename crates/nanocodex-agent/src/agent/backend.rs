@@ -92,6 +92,12 @@ pub trait LifecycleBackend: Send + Sync + 'static {
     /// Compacts retained context.
     fn compact(&self) -> BackendFuture<Result<()>>;
 
+    /// Compacts retained context and returns the private replacement mapping.
+    fn compact_with_outcome(&self) -> BackendFuture<Result<Option<CompactionOutcome>>>;
+
+    /// Returns the latest committed, resumable session snapshot.
+    fn snapshot(&self) -> BackendFuture<Result<SessionSnapshot>>;
+
     /// Appends adapter-owned developer context.
     fn append_developer_message(&self, text: String) -> BackendFuture<Result<AgentSessionContext>>;
 
@@ -410,6 +416,29 @@ impl LifecycleBackend for LocalLifecycle {
                 result,
             })
             .await
+            .map(|_| ())
+        })
+    }
+
+    fn compact_with_outcome(&self) -> BackendFuture<Result<Option<CompactionOutcome>>> {
+        let commands = self.commands.clone();
+        let shutdown = self.shutdown.clone();
+        Box::pin(async move {
+            let parent = tracing::Span::current();
+            let parent = (!parent.is_disabled()).then_some(parent);
+            request_command(&commands, &shutdown, |result| Command::Compact {
+                parent,
+                result,
+            })
+            .await
+        })
+    }
+
+    fn snapshot(&self) -> BackendFuture<Result<SessionSnapshot>> {
+        let commands = self.commands.clone();
+        let shutdown = self.shutdown.clone();
+        Box::pin(async move {
+            request_command(&commands, &shutdown, |result| Command::Snapshot { result }).await
         })
     }
 

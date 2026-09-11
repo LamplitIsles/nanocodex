@@ -88,6 +88,8 @@ export type AgentOptions = {
   additionalInstructions?: string | undefined;
   /** Generates client-owned context summaries instead of provider compaction. */
   companionCompactionInstruction?: string | undefined;
+  /** Selects the final private compaction instruction for each operation. */
+  resolveCompactionInstruction?: CompactionInstructionResolver | undefined;
   /** Hydrates a validated active history; cannot be combined with resume. */
   historySeed?: HistorySeed | undefined;
   model?: Model | undefined;
@@ -98,6 +100,19 @@ export type AgentOptions = {
   workspace?: string | undefined;
   resume?: SessionSnapshot | undefined;
 };
+
+export type CompactionInstructionContext = Readonly<{
+  after_model_call_index: number;
+  phase: "pre_turn" | "mid_turn";
+  trigger: "manual" | "automatic";
+  active_context_tokens: number;
+  auto_compact_token_limit: number;
+}>;
+
+export type CompactionInstructionResolver = (
+  context: CompactionInstructionContext,
+  signal: AbortSignal,
+) => string | PromiseLike<string>;
 
 /** Model-visible facts for tools executing outside the embedding process. */
 export type ExecutionEnvironment = Readonly<{
@@ -368,6 +383,29 @@ export type AgentSessionContext = Readonly<{
   history: readonly Record<string, unknown>[];
 }>;
 
+export type CompactionItemIdentity = Readonly<{
+  index: number;
+  kind: string;
+  id: string | null;
+  call_id: string | null;
+}>;
+
+export type CompactionOutcome = Readonly<{
+  revision: string;
+  trigger: "manual" | "automatic";
+  /** Generated private summary text; never an assistant display event. */
+  summary: string | null;
+  replaced_history: Readonly<{ start: number; end: number }>;
+  retained_tail: readonly CompactionItemIdentity[];
+  context: AgentSessionContext;
+}>;
+
+/** Payload for the ordered event emitted after a custom replacement installs. */
+export type CompactionReplacedEventPayload = CompactionOutcome & Readonly<{
+  after_model_call_index: number;
+  phase: "pre_turn" | "mid_turn";
+}>;
+
 export type RealtimeTranscriptEntry = Readonly<{
   role: "user" | "assistant";
   text: string;
@@ -385,8 +423,11 @@ export type AgentActions = {
   };
   session: {
     appendDeveloperMessage(text: string): Promise<AgentSessionContext>;
-    compact(): Promise<void>;
+    /** Returns the exact custom replacement, or null for provider-default compaction. */
+    compact(): Promise<CompactionOutcome | null>;
     context(): Promise<AgentSessionContext>;
+    /** Returns the latest committed, resumable engine-owned snapshot. */
+    snapshot(): Promise<SessionSnapshot>;
     fork(options?: ForkOptions): Promise<DefaultAgent>;
     setModel(model: Model): Promise<void>;
     setFastMode(enabled: boolean): Promise<void>;
@@ -510,10 +551,13 @@ export type TurnResult = Readonly<{
 
 import type { NamedTool, ToolMap } from "nanocodex-tools";
 export type {
+  CustomToolFormat,
   NamedTool,
   SubagentToolContext,
   Tool,
   ToolContext,
+  ToolDefinition,
+  ToolJson,
   ToolMap,
 } from "nanocodex-tools";
 

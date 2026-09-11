@@ -27,6 +27,23 @@ const ORIGINAL_IMAGE_ESTIMATE_CACHE_SIZE: usize = 32;
 const CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE: &str =
     "Output exceeded the available model context and was truncated";
 
+/// Exact history selection made by a consumer-owned compaction install.
+///
+/// The agent maps the retained items into its public identity type after the
+/// managed session installs this history. Keeping the selection beside the
+/// installer prevents callers from reconstructing it with a second predicate.
+#[derive(Debug)]
+pub struct CompactionInstallation {
+    /// Complete history installed into the managed session.
+    pub history: Vec<ResponseItem>,
+    /// Half-open range removed from the pre-compaction history.
+    pub replaced_start: usize,
+    /// Exclusive end of the removed pre-compaction range.
+    pub replaced_end: usize,
+    /// Retained suffix items paired with their pre-compaction indexes.
+    pub retained_tail: Vec<(usize, ResponseItem)>,
+}
+
 #[cfg(not(target_family = "wasm"))]
 #[derive(Default)]
 struct OriginalImageEstimateCache {
@@ -205,16 +222,26 @@ pub fn install_companion_history(
     history: &[ResponseItem],
     initial_context: &[ResponseItem],
     summary: ResponseItem,
-) -> Vec<ResponseItem> {
+) -> CompactionInstallation {
     let suffix_start = history
         .iter()
         .rposition(|item| item.is_user_message() && !is_contextual_user_message(item));
     let suffix = suffix_start.map_or(&[][..], |start| &history[start..]);
+    let retained_tail = suffix
+        .iter()
+        .enumerate()
+        .map(|(offset, item)| (suffix_start.unwrap_or(history.len()) + offset, item.clone()))
+        .collect();
     let mut installed = Vec::with_capacity(initial_context.len() + 1 + suffix.len());
     installed.extend(initial_context.iter().cloned());
     installed.push(summary);
     installed.extend(suffix.iter().cloned());
-    installed
+    CompactionInstallation {
+        history: installed,
+        replaced_start: 0,
+        replaced_end: suffix_start.unwrap_or(history.len()),
+        retained_tail,
+    }
 }
 
 fn is_client_developer_message(item: &ResponseItem) -> bool {
@@ -640,7 +667,8 @@ mod tests {
         let initial_context = message("<environment_context>\n/workspace\n</environment_context>");
         let history = vec![old, recent.clone(), call, output, contextual.clone()];
 
-        let installed = install_companion_history(&history, &[initial_context.clone()], summary);
+        let installed =
+            install_companion_history(&history, &[initial_context.clone()], summary).history;
 
         assert_eq!(installed.len(), 6);
         assert_eq!(

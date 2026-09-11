@@ -9,7 +9,8 @@ pub use data::OpenAiEvent;
 #[doc(inline)]
 pub use data::{
     AgentEventData, AssistantDelta, AssistantEvent, AssistantMessage, CompactionCompleted,
-    CompactionFailed, CompactionStarted, ContextEvent, EventUsage, ModelCallCompleted,
+    CompactionFailed, CompactionItemIdentity, CompactionRange, CompactionReplaced,
+    CompactionSessionContext, CompactionStarted, ContextEvent, EventUsage, ModelCallCompleted,
     ModelCallFailed, ModelCallStarted, ModelEvent, ModelWarmupCompleted, ModelWarmupFailed,
     ModelWarmupStarted, ReasoningEvent, ReasoningSummaryDelta, RunError, RunEvent, RunMetrics,
     RunStarted, RunStatus, RunSteered, RunTerminal, ToolCall, ToolEvent, ToolResultEvent,

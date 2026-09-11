@@ -51,10 +51,13 @@ export type {
   SshStream,
 } from "../tools/ssh.mjs";
 export type {
+  CustomToolFormat,
   NamedTool,
   SubagentToolContext,
   Tool,
   ToolContext,
+  ToolDefinition,
+  ToolJson,
   ToolMap,
   Workspace,
   WorkspaceEntry,

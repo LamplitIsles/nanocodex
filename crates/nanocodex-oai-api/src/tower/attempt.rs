@@ -333,6 +333,19 @@ impl ResponsesAttempt {
         self.input().iter()
     }
 
+    /// Returns the immutable request prefix shared by this attempt and the
+    /// session's warm cache identity.
+    #[must_use]
+    pub fn request_prefix(&self) -> &[ResponseItem] {
+        self.profile.prefix()
+    }
+
+    /// Returns the prompt-cache identity sent with this attempt.
+    #[must_use]
+    pub fn prompt_cache_key(&self) -> &str {
+        self.profile.prompt_cache_key()
+    }
+
     pub(crate) const fn display_events(&self) -> bool {
         self.display_events
     }

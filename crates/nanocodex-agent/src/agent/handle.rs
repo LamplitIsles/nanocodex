@@ -415,6 +415,35 @@ impl Nanocodex {
         self.backend.compact().await
     }
 
+    /// Compacts retained context and returns the exact private replacement mapping.
+    ///
+    /// The result contains the generated summary, the pre-compaction range it
+    /// replaced, the complete retained tail identities, and the resulting
+    /// model-visible context for custom host compaction. Provider-default
+    /// compaction returns `None` because its non-contiguous retention policy
+    /// does not have this custom replacement shape. The summary is never
+    /// emitted as assistant text.
+    /// Call this from idle maintenance when an active turn must not be
+    /// cancelled by the embedding host.
+    pub async fn compact_with_outcome(&self) -> Result<Option<CompactionOutcome>> {
+        self.backend.compact_with_outcome().await
+    }
+
+    /// Returns the latest committed, resumable session snapshot.
+    ///
+    /// The snapshot is produced by the same engine-owned checkpoint used for
+    /// forks and durable recovery. Call this after a successful manual
+    /// compaction when the embedding host needs to persist that exact
+    /// post-install boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NanocodexError::ForkBeforeCompletedTurn`] when no committed
+    /// session boundary exists, or when the backend has stopped.
+    pub async fn snapshot(&self) -> Result<SessionSnapshot> {
+        self.backend.snapshot().await
+    }
+
     /// Appends adapter-owned developer context at the next safe model boundary.
     ///
     /// The returned read-only view is captured from the latest safe boundary

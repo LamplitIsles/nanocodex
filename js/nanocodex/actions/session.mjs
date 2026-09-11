@@ -3,6 +3,7 @@ import {
   compact as compactAgent,
   context as agentContext,
   fork as forkAgent,
+  snapshot as snapshotAgent,
   setFastMode as setAgentFastMode,
   setModel as setAgentModel,
   setThinking as setAgentThinking,
@@ -27,6 +28,10 @@ export function compact(agent) {
 
 export function context(agent) {
   return agentContext(agent);
+}
+
+export function snapshot(agent) {
+  return snapshotAgent(agent);
 }
 
 export function fork(agent, options = {}) {

@@ -9,6 +9,7 @@ pub(super) fn build_agent<S>(
     prompt_cache: PromptCacheConfig,
     codex: CodexCompatibility,
     resume: Option<SessionSnapshot>,
+    compaction_instruction_resolver: Option<Arc<dyn CompactionInstructionResolver + Send + Sync>>,
     service_factory: ServiceFactory<S>,
 ) -> Result<(Nanocodex, AgentEvents)>
 where
@@ -116,6 +117,7 @@ where
             depth: 0,
             execution: codex.execution,
             host_context: None,
+            compaction_instruction_resolver,
             service_factory,
         },
         session_id,

@@ -1,4 +1,13 @@
-import type { Agent, AgentSessionContext, DefaultAgent, ForkOptions, RealtimeTranscriptEntry, Thinking } from "../types.mjs";
+import type {
+  Agent,
+  AgentSessionContext,
+  CompactionOutcome,
+  DefaultAgent,
+  ForkOptions,
+  RealtimeTranscriptEntry,
+  SessionSnapshot,
+  Thinking,
+} from "../types.mjs";
 
 /** Appends adapter-owned developer context and returns the latest safe session context. */
 export function appendDeveloperMessage(
@@ -25,11 +34,14 @@ export function realtimeTailDelegation(
   transcript: readonly RealtimeTranscriptEntry[],
 ): Promise<string | undefined>;
 
-/** Compacts retained history immediately without fabricating a user prompt. */
-export function compact(agent: Agent<object>): Promise<void>;
+/** Compacts retained history; provider-default compaction returns null. */
+export function compact(agent: Agent<object>): Promise<CompactionOutcome | null>;
 
 /** Returns complete read-only model context at the latest safe boundary. */
 export function context(agent: Agent<object>): Promise<AgentSessionContext>;
+
+/** Returns the latest committed, resumable engine-owned session snapshot. */
+export function snapshot(agent: Agent<object>): Promise<SessionSnapshot>;
 
 /** Forks the latest checkpoint, or the exact completed result supplied in `options.at`. */
 export function fork(agent: Agent<object>, options?: fork.Options): Promise<fork.ReturnType>;

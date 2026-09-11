@@ -27,6 +27,14 @@ const SESSION_IDS = Object.freeze({
   queuedSupplementary: "018f1f9a-7b3c-7a0b-8000-00000000000b",
   durableCompanion: "018f1f9a-7b3c-7a0c-8000-00000000000c",
   cancelledCompanion: "018f1f9a-7b3c-7a0d-8000-00000000000d",
+  dynamicCompaction: "018f1f9a-7b3c-7a0e-8000-00000000000e",
+  failedResolverCompaction: "018f1f9a-7b3c-7a0f-8000-00000000000f",
+  cancelledResolverCompaction: "018f1f9a-7b3c-7a10-8000-000000000010",
+  snapshotBoundary: "018f1f9a-7b3c-7a11-8000-000000000011",
+  snapshotCompaction: "018f1f9a-7b3c-7a12-8000-000000000012",
+  snapshotResumed: "018f1f9a-7b3c-7a13-8000-000000000013",
+  rawApplicationTool: "018f1f9a-7b3c-7a14-8000-000000000014",
+  rawApplicationToolResumed: "018f1f9a-7b3c-7a15-8000-000000000015",
   left: "018f1f9a-7b3c-7a05-8000-000000000005",
   right: "018f1f9a-7b3c-7a06-8000-000000000006",
 });
@@ -258,7 +266,19 @@ test("Node host preserves structured WebSocket handshake rejection detail", asyn
   }
 });
 
-test("Node-hosted WASM preserves follow-ons, cache identity, events, and custom tools", async () => {
+test("Node rejects conflicting or invalid subagent configuration", () => {
+  assert.throws(() => createWarmAgent({
+    apiKey: "test-key",
+    subagents: false,
+    tools: [...Subagents.create()],
+  }), /Subagents.create\(\) conflicts with subagents: false/);
+  assert.throws(() => createWarmAgent({
+    apiKey: "test-key",
+    subagents: "false",
+  }), /subagents must be a boolean/);
+});
+
+test("Node-hosted WASM preserves custom tools and follow-ons with subagents disabled", async () => {
   const server = await startServer();
   const events = [];
   const agent = await createWarmAgent({
@@ -267,6 +287,7 @@ test("Node-hosted WASM preserves follow-ons, cache identity, events, and custom 
     thinking: "none",
     reasoningMode: "pro",
     sessionId: SESSION_IDS.primary,
+    subagents: false,
     codeEvaluator: createQuickJsEvaluator(quickJs),
     tools: {
       multiply: {
@@ -299,6 +320,7 @@ test("Node-hosted WASM preserves follow-ons, cache identity, events, and custom 
     assert.equal(warmup.reasoning.effort, "none");
     assert.equal(warmup.input[0].tools[0].name, "exec");
     assert.match(warmup.input[0].tools[0].description, /multiply\(args:/);
+    assert.deepEqual(warmup.input[0].tools.map((tool) => tool.name), ["exec", "wait"]);
     sendWarmup(socket, "resp-warmup");
 
     const generation = await reader.next();
@@ -370,6 +392,145 @@ test("Node-hosted WASM preserves follow-ons, cache identity, events, and custom 
   watch.off();
   agent.dispose();
   await server.close();
+});
+
+test("Node/WASM exposes a raw custom apply_patch tool through cold history resume", async () => {
+  const server = await startServer();
+  const calls = [];
+  const patch = "*** Begin Patch\n*** Update File: note.txt\n@@\n-before\n+after\n*** End Patch";
+  const grammar = 'start: "dsh_patch"';
+  const tools = {
+    apply_patch: {
+      description: "Apply one raw patch string through the host.",
+      definition: {
+        type: "custom",
+        name: "definition-name-is-not-canonical",
+        description: "Apply one raw patch string through the host.",
+        format: { type: "grammar", syntax: "lark", definition: grammar },
+      },
+      handler(input, context) {
+        calls.push({
+          input,
+          callId: context.callId,
+          parentCallId: context.parentCallId,
+          sessionId: context.sessionId,
+          model: context.model,
+          signal: context.signal,
+        });
+        return `host-applied:${context.callId}`;
+      },
+    },
+  };
+  let agent;
+  let first;
+  let resumed;
+  let resumedResult;
+  let resumedServer;
+  try {
+    agent = await createWarmAgent({
+      apiKey: "test-key",
+      websocketUrl: server.url,
+      thinking: "none",
+      sessionId: SESSION_IDS.rawApplicationTool,
+      subagents: false,
+      codeEvaluator: createQuickJsEvaluator(quickJs),
+      tools,
+    });
+    const scenario = (async () => {
+      const socket = await server.connection;
+      const reader = messageReader(socket);
+      const warmup = await reader.next();
+      const definitions = warmup.input[0].tools;
+      const applyPatch = definitions.find((definition) => definition.name === "apply_patch");
+      assert.equal(applyPatch.type, "custom");
+      assert.equal(applyPatch.name, "apply_patch");
+      assert.match(applyPatch.description, /^Apply one raw patch string through the host\./);
+      assert.match(applyPatch.description, /apply_patch\(input: string\)/);
+      assert.deepEqual(applyPatch.format, { type: "grammar", syntax: "lark", definition: grammar });
+      assert(!definitions.some((definition) => definition.name === "spawn_agent"));
+      sendWarmup(socket, "raw-tool-warmup");
+
+      const generation = await reader.next();
+      assert.match(JSON.stringify(generation.input), /raw apply_patch/);
+      sendCompleted(socket, "raw-tool-call", [
+        {
+          type: "custom_tool_call",
+          call_id: "call-patch",
+          name: "apply_patch",
+          input: patch,
+        },
+      ]);
+
+      const continuation = await reader.next();
+      const patchOutput = continuation.input.find((item) => item.call_id === "call-patch");
+      assert.equal(patchOutput.type, "custom_tool_call_output");
+      assert.equal(patchOutput.output, "host-applied:call-patch");
+      sendFinal(socket, "raw-tool-final", "patched");
+    })();
+    const firstTurn = agent.turn.prompt({ input: "Use the raw apply_patch tool." });
+    first = await bounded(Promise.all([firstTurn.result(), scenario]), "raw application tool").then(
+      ([result]) => result,
+    );
+    assert.equal(first.finalMessage, "patched");
+    assert.deepEqual(calls.map(({ input, callId }) => ({ input, callId })), [{
+      input: patch,
+      callId: "call-patch",
+    }]);
+    assert.equal(calls[0].parentCallId, "");
+    assert.equal(calls[0].sessionId, SESSION_IDS.rawApplicationTool);
+    assert.equal(calls[0].model, "gpt-5.6-sol");
+    assert.equal(calls[0].signal instanceof AbortSignal, true);
+
+    const snapshot = await first.snapshot();
+    const customCall = snapshot.history.find((item) => item.type === "custom_tool_call");
+    const customOutput = snapshot.history.find((item) => item.type === "custom_tool_call_output");
+    assert.equal(customCall.input, patch);
+    assert.equal(customOutput.output, "host-applied:call-patch");
+    first.dispose();
+    await agent.session.shutdown();
+    agent = undefined;
+    await server.close();
+
+    resumedServer = await startServer();
+    resumed = await createWarmAgent({
+      apiKey: "test-key",
+      websocketUrl: resumedServer.url,
+      thinking: "none",
+      sessionId: SESSION_IDS.rawApplicationToolResumed,
+      subagents: false,
+      codeEvaluator: createQuickJsEvaluator(quickJs),
+      tools,
+      resume: snapshot,
+    });
+    const resumedScenario = (async () => {
+      const socket = await resumedServer.connection;
+      const reader = messageReader(socket);
+      const request = await reader.next();
+      assert.equal(request.input[0].tools.find((definition) => definition.name === "apply_patch").type, "custom");
+      const encoded = JSON.stringify(request.input);
+      assert.match(encoded, /custom_tool_call/);
+      assert.match(encoded, /host-applied:call-patch/);
+      assert.match(encoded, /note\.txt/);
+      sendFinal(socket, "raw-resume-final", "resumed without replay");
+    })();
+    resumedResult = await bounded(Promise.all([
+      resumed.turn.prompt({ input: "Continue after the persisted patch." }).result(),
+      resumedScenario,
+    ]), "raw application tool resume").then(([result]) => result);
+    assert.equal(resumedResult.finalMessage, "resumed without replay");
+    assert.equal(calls.length, 1);
+    await resumed.session.shutdown();
+    resumed = undefined;
+    await resumedServer.close();
+    resumedServer = undefined;
+  } finally {
+    first?.dispose();
+    resumedResult?.dispose();
+    await agent?.session.shutdown().catch(() => {});
+    await resumed?.session.shutdown().catch(() => {});
+    await server.close().catch(() => {});
+    await resumedServer?.close().catch(() => {});
+  }
 });
 
 test("Node WASM attaches supplementary context to the real prompt input", async () => {
@@ -1125,6 +1286,140 @@ test("Node WASM hydrates typed history and rejects ambiguous or unsupported seed
   await ambiguousServer.close();
 });
 
+test("Node WASM snapshots the committed post-compaction boundary for cold resume", async () => {
+  const boundaryServer = await startServer();
+  const boundaryAgent = await createWarmAgent({
+    apiKey: "test-key",
+    websocketUrl: boundaryServer.url,
+    thinking: "none",
+    sessionId: SESSION_IDS.snapshotBoundary,
+  });
+  await assert.rejects(
+    boundaryAgent.session.snapshot(),
+    /safe conversation boundary/,
+  );
+  await boundaryAgent.session.shutdown();
+  await boundaryServer.close();
+
+  let historicalToolCalls = 0;
+  const tools = {
+    lookup: {
+      description: "Looks up a historical fixture.",
+      parameters: { type: "object", additionalProperties: false },
+      handler: () => {
+        historicalToolCalls += 1;
+        return "live lookup";
+      },
+    },
+  };
+  const historySeed = {
+    history: [
+      {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "OLD_REMOVED_MARKER" }],
+      },
+      {
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: "old answer" }],
+        status: "completed",
+      },
+      {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "RETAINED_USER_MARKER" }],
+      },
+      {
+        type: "custom_tool_call",
+        call_id: "historic-lookup",
+        name: "lookup",
+        input: "{}",
+      },
+      {
+        type: "custom_tool_call_output",
+        call_id: "historic-lookup",
+        output: "RETAINED_TOOL_MARKER",
+      },
+    ],
+  };
+  const server = await startServer();
+  const agent = await createWarmAgent({
+    apiKey: "test-key",
+    websocketUrl: server.url,
+    thinking: "none",
+    sessionId: SESSION_IDS.snapshotCompaction,
+    historySeed,
+    companionCompactionInstruction: "Keep the selected facts and complete tool tail.",
+    tools,
+  });
+  try {
+    const scenario = (async () => {
+      const socket = await server.connection;
+      const request = await messageReader(socket).next();
+      assert.equal(request.previous_response_id, undefined);
+      const encoded = JSON.stringify(request.input);
+      assert.match(encoded, /OLD_REMOVED_MARKER/);
+      assert.match(encoded, /RETAINED_USER_MARKER/);
+      assert.match(encoded, /RETAINED_TOOL_MARKER/);
+      sendStreamedFinal(socket, "resp-snapshot-summary", "COMPACTED_SNAPSHOT_SUMMARY");
+    })();
+
+    const outcome = await agent.session.compact();
+    const snapshot = await agent.session.snapshot();
+    assert.equal(outcome.trigger, "manual");
+    assert.equal(outcome.summary, "COMPACTED_SNAPSHOT_SUMMARY");
+    assert.deepEqual(snapshot.history, outcome.context.history);
+    assert.match(JSON.stringify(snapshot.history), /COMPACTED_SNAPSHOT_SUMMARY/);
+    assert.match(JSON.stringify(snapshot.history), /RETAINED_USER_MARKER/);
+    assert.match(JSON.stringify(snapshot.history), /RETAINED_TOOL_MARKER/);
+    assert.doesNotMatch(JSON.stringify(snapshot.history), /OLD_REMOVED_MARKER/);
+    assert.ok(Object.isFrozen(snapshot));
+    assert.ok(Object.isFrozen(snapshot.history));
+    assert.equal(historicalToolCalls, 0);
+    await scenario;
+    await agent.session.shutdown();
+    await server.close();
+
+    const resumedServer = await startServer();
+    const resumed = await createWarmAgent({
+      apiKey: "test-key",
+      websocketUrl: resumedServer.url,
+      thinking: "none",
+      sessionId: SESSION_IDS.snapshotResumed,
+      resume: snapshot,
+      tools,
+    });
+    try {
+      const resumedScenario = (async () => {
+        const socket = await resumedServer.connection;
+        const request = await messageReader(socket).next();
+        assert.equal(request.previous_response_id, undefined);
+        const encoded = JSON.stringify(request.input);
+        assert.match(encoded, /COMPACTED_SNAPSHOT_SUMMARY/);
+        assert.match(encoded, /RETAINED_USER_MARKER/);
+        assert.match(encoded, /RETAINED_TOOL_MARKER/);
+        assert.match(encoded, /NEW_SNAPSHOT_PROMPT/);
+        assert.doesNotMatch(encoded, /OLD_REMOVED_MARKER/);
+        sendFinal(socket, "resp-snapshot-resumed", "resumed from compacted snapshot");
+      })();
+      assert.equal(
+        (await resumed.turn.prompt({ input: "NEW_SNAPSHOT_PROMPT" }).result()).finalMessage,
+        "resumed from compacted snapshot",
+      );
+      await resumedScenario;
+      assert.equal(historicalToolCalls, 0);
+    } finally {
+      await resumed.session.shutdown();
+      await resumedServer.close();
+    }
+  } catch (error) {
+    await agent.session.shutdown().catch(() => {});
+    await server.close().catch(() => {});
+    throw error;
+  }
+});
+
 test("Node WASM uses Companion compaction for success and preserves context on failure", async () => {
   const server = await startServer();
   const events = [];
@@ -1148,8 +1443,7 @@ test("Node WASM uses Companion compaction for success and preserves context on f
       sendStreamedFinal(socket, "resp-companion-first", "first answer");
       const compact = await reader.next();
       readerState.compact = compact;
-      assert.equal(compact.previous_response_id, undefined);
-      assert.doesNotMatch(JSON.stringify(compact.input), /additional_tools/);
+      assert.equal(compact.previous_response_id, "resp-companion-first");
       assert.match(JSON.stringify(compact.input), /Keep durable facts and recent work/);
       sendStreamedFinal(socket, "resp-companion-summary", "PRIVATE_SUMMARY_MARKER");
       const followOn = await reader.next();
@@ -1159,7 +1453,7 @@ test("Node WASM uses Companion compaction for success and preserves context on f
       sendFinal(socket, "resp-companion-follow-on", "continued");
       const failed = await reader.next();
       readerState.failed = failed;
-      assert.equal(failed.previous_response_id, undefined);
+      assert.equal(failed.previous_response_id, "resp-companion-follow-on");
       sendCompleted(socket, "resp-companion-invalid-summary", []);
       const retry = await reader.next();
       readerState.retry = retry;
@@ -1201,6 +1495,191 @@ test("Node WASM uses Companion compaction for success and preserves context on f
   }
 });
 
+test("Node WASM resolves every manual compaction and returns ordered private outcomes", async () => {
+  const server = await startServer();
+  const resolverCalls = [];
+  const events = [];
+  const agent = await createWarmAgent({
+    apiKey: "test-key",
+    websocketUrl: server.url,
+    thinking: "none",
+    sessionId: SESSION_IDS.dynamicCompaction,
+    resolveCompactionInstruction: async (context, signal) => {
+      assert.equal(signal.aborted, false);
+      resolverCalls.push(context);
+      return `Keep the dynamic facts for compaction ${resolverCalls.length}.`;
+    },
+  });
+  const watch = agent.events.watch();
+  watch.onEvent((event) => events.push(event));
+  try {
+    const scenario = (async () => {
+      const socket = await server.connection;
+      const reader = messageReader(socket);
+      await reader.next();
+      sendWarmup(socket, "resp-dynamic-warmup");
+      const first = await reader.next();
+      assert.match(JSON.stringify(first.input), /before dynamic compaction/);
+      sendFinal(socket, "resp-dynamic-first", "first dynamic answer");
+
+      const firstSummary = await reader.next();
+      assert.equal(firstSummary.previous_response_id, "resp-dynamic-first");
+      assert.match(JSON.stringify(firstSummary.input), /Keep the dynamic facts for compaction 1/);
+      sendFinal(socket, "resp-dynamic-summary-1", "DYNAMIC_SUMMARY_ONE");
+
+      const followOn = await reader.next();
+      assert.equal(followOn.previous_response_id, undefined);
+      assert.match(JSON.stringify(followOn.input), /DYNAMIC_SUMMARY_ONE/);
+      sendFinal(socket, "resp-dynamic-follow-on", "second dynamic answer");
+
+      const secondSummary = await reader.next();
+      assert.equal(secondSummary.previous_response_id, "resp-dynamic-follow-on");
+      assert.match(JSON.stringify(secondSummary.input), /Keep the dynamic facts for compaction 2/);
+      sendFinal(socket, "resp-dynamic-summary-2", "DYNAMIC_SUMMARY_TWO");
+    })();
+
+    assert.equal(
+      (await agent.turn.prompt({ input: "before dynamic compaction" }).result()).finalMessage,
+      "first dynamic answer",
+    );
+    const firstOutcome = await agent.session.compact();
+    assert.equal(firstOutcome.revision, "1");
+    assert.equal(firstOutcome.trigger, "manual");
+    assert.equal(firstOutcome.summary, "DYNAMIC_SUMMARY_ONE");
+    assert.equal(firstOutcome.replaced_history.start, 0);
+    assert.ok(firstOutcome.replaced_history.end > 0);
+    assert.ok(firstOutcome.retained_tail.some((item) => item.kind === "message"));
+    assert.match(JSON.stringify(firstOutcome.context.history), /DYNAMIC_SUMMARY_ONE/);
+
+    assert.equal(
+      (await agent.turn.prompt({ input: "after dynamic compaction" }).result()).finalMessage,
+      "second dynamic answer",
+    );
+    const secondOutcome = await agent.session.compact();
+    assert.equal(secondOutcome.revision, "2");
+    assert.equal(secondOutcome.summary, "DYNAMIC_SUMMARY_TWO");
+    assert.ok(secondOutcome.replaced_history.end > firstOutcome.replaced_history.end);
+    assert.match(JSON.stringify(secondOutcome.context.history), /DYNAMIC_SUMMARY_TWO/);
+    await scenario;
+    const replacements = events.filter((event) => event.type === "model.compaction.replaced");
+    assert.equal(replacements.length, 2);
+    assert.deepEqual(
+      replacements.map((event) => ({
+        revision: event.payload.revision,
+        trigger: event.payload.trigger,
+        phase: event.payload.phase,
+        summary: event.payload.summary,
+      })),
+      [
+        { revision: "1", trigger: "manual", phase: "pre_turn", summary: "DYNAMIC_SUMMARY_ONE" },
+        { revision: "2", trigger: "manual", phase: "pre_turn", summary: "DYNAMIC_SUMMARY_TWO" },
+      ],
+    );
+    assert.ok(replacements[0].seq < replacements[1].seq);
+    assert.match(JSON.stringify(replacements[1].payload.context.history), /DYNAMIC_SUMMARY_TWO/);
+  } finally {
+    watch.off();
+    await agent.session.shutdown().catch(() => {});
+    await server.close();
+  }
+  assert.deepEqual(
+    resolverCalls.map(({ trigger, phase }) => ({ trigger, phase })),
+    [
+      { trigger: "manual", phase: "pre_turn" },
+      { trigger: "manual", phase: "pre_turn" },
+    ],
+  );
+});
+
+test("Node WASM resolver failure preserves the warm history without a summary request", async () => {
+  const server = await startServer();
+  let resolverCalls = 0;
+  const agent = await createWarmAgent({
+    apiKey: "test-key",
+    websocketUrl: server.url,
+    thinking: "none",
+    sessionId: SESSION_IDS.failedResolverCompaction,
+    resolveCompactionInstruction: async () => {
+      resolverCalls += 1;
+      throw new Error("host resolver failed");
+    },
+  });
+  try {
+    const scenario = (async () => {
+      const socket = await server.connection;
+      const reader = messageReader(socket);
+      await reader.next();
+      sendWarmup(socket, "resp-resolver-failure-warmup");
+      const first = await reader.next();
+      sendFinal(socket, "resp-resolver-failure-first", "before resolver failure");
+      const recovered = await reader.next();
+      assert.equal(recovered.previous_response_id, "resp-resolver-failure-first");
+      const encoded = JSON.stringify(recovered.input);
+      assert.match(encoded, /after resolver failure/);
+      assert.doesNotMatch(encoded, /host resolver failed/);
+      sendFinal(socket, "resp-resolver-failure-recovered", "recovered without summary");
+    })();
+    assert.equal(
+      (await agent.turn.prompt({ input: "before resolver failure" }).result()).finalMessage,
+      "before resolver failure",
+    );
+    const snapshotBeforeFailure = await agent.session.snapshot();
+    await assert.rejects(agent.session.compact(), /host resolver failed/);
+    assert.equal(resolverCalls, 1);
+    assert.deepEqual(await agent.session.snapshot(), snapshotBeforeFailure);
+    assert.equal(
+      (await agent.turn.prompt({ input: "after resolver failure" }).result()).finalMessage,
+      "recovered without summary",
+    );
+    await scenario;
+  } finally {
+    await agent.session.shutdown().catch(() => {});
+    await server.close();
+  }
+});
+
+test("Node WASM cancels a pending host compaction resolver on shutdown", async () => {
+  const server = await startServer();
+  let resolveAborted;
+  const aborted = new Promise((resolve) => { resolveAborted = resolve; });
+  const agent = await createWarmAgent({
+    apiKey: "test-key",
+    websocketUrl: server.url,
+    thinking: "none",
+    sessionId: SESSION_IDS.cancelledResolverCompaction,
+    resolveCompactionInstruction: (_context, signal) => new Promise((_resolve, reject) => {
+      signal.addEventListener("abort", () => {
+        resolveAborted();
+        reject(signal.reason ?? new Error("resolver cancelled"));
+      }, { once: true });
+    }),
+  });
+  try {
+    const scenario = (async () => {
+      const socket = await server.connection;
+      const reader = messageReader(socket);
+      await reader.next();
+      sendWarmup(socket, "resp-resolver-cancel-warmup");
+      await reader.next();
+      sendFinal(socket, "resp-resolver-cancel-first", "before resolver cancellation");
+    })();
+    assert.equal(
+      (await agent.turn.prompt({ input: "before resolver cancellation" }).result()).finalMessage,
+      "before resolver cancellation",
+    );
+    const compacting = agent.session.compact();
+    const shuttingDown = agent.session.shutdown();
+    await bounded(aborted, "host resolver cancellation");
+    await assert.rejects(compacting);
+    await shuttingDown;
+    await assert.rejects(agent.session.snapshot(), /disposed/);
+    await scenario;
+  } finally {
+    await agent.session.shutdown().catch(() => {});
+    await server.close();
+  }
+});
+
 test("Node WASM cancels an in-flight Companion summary without publishing it", async () => {
   const durabilityId = "node-cancelled-companion-summary";
   const durability = createMemoryDurabilityStore(durabilityId);
@@ -1231,7 +1710,7 @@ test("Node WASM cancels an in-flight Companion summary without publishing it", a
       assert.match(JSON.stringify(first.input), /before Companion cancellation/);
       sendFinal(socket, "resp-cancelled-companion-first", "before cancellation");
       const summary = await reader.next();
-      assert.equal(summary.previous_response_id, undefined);
+      assert.equal(summary.previous_response_id, "resp-cancelled-companion-first");
       assert.match(JSON.stringify(summary.input), /Keep the durable cancellation facts/);
       resolveSummarySeen(summary);
     })();
@@ -1308,9 +1787,8 @@ test("a fresh Node WASM agent resumes a host-owned Companion checkpoint", async 
       sendFinal(socket, "resp-durable-companion-first", "first durable answer");
 
       const compact = await reader.next();
-      assert.equal(compact.previous_response_id, undefined);
+      assert.equal(compact.previous_response_id, "resp-durable-companion-first");
       assert.match(JSON.stringify(compact.input), /Keep the durable Companion facts/);
-      assert.doesNotMatch(JSON.stringify(compact.input), /additional_tools/);
       sendFinal(socket, "resp-durable-companion-summary", "durable Companion summary");
 
       const followOn = await reader.next();

@@ -24,6 +24,10 @@ const MAX_HTTP_ERROR_BYTES = 64 * 1024;
 const MPP_CLIENT_PROTOCOL_ERROR_CLOSE_CODE = 3008;
 
 export function createNodeHost(options = {}) {
+  if (options.resolveCompactionInstruction !== undefined
+    && typeof options.resolveCompactionInstruction !== "function") {
+    throw new TypeError("resolveCompactionInstruction must be a function");
+  }
   const toolMode = options.toolMode ?? "code";
   if (toolMode !== "code" && toolMode !== "direct") {
     throw new TypeError("toolMode must be code or direct");
@@ -614,6 +618,12 @@ export function createNodeHost(options = {}) {
     cancelCode: code.cancel,
     toolMode: () => toolMode,
     toolDefinitions: code.toolDefinitions,
+    resolveCompactionInstruction: (context, signal) => {
+      if (typeof options.resolveCompactionInstruction !== "function") {
+        throw new Error("resolveCompactionInstruction is not configured");
+      }
+      return options.resolveCompactionInstruction(context, signal);
+    },
     releaseSession: code.releaseSession,
     emitEvent: onEvent,
     reset: code.reset,

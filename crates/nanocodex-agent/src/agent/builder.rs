@@ -14,6 +14,8 @@ pub struct NanocodexBuilder<F = StandardServiceFactory> {
     pub(super) prompt_cache: PromptCacheConfig,
     pub(super) codex: CodexCompatibility,
     pub(super) resume: Option<SessionSnapshot>,
+    pub(super) compaction_instruction_resolver:
+        Option<Arc<dyn CompactionInstructionResolver + Send + Sync>>,
     pub(super) factory: F,
 }
 
@@ -33,6 +35,7 @@ where
             prompt_cache: PromptCacheConfig::default(),
             codex: CodexCompatibility::default(),
             resume: None,
+            compaction_instruction_resolver: None,
             factory,
         }
     }
@@ -91,6 +94,20 @@ impl<F> NanocodexBuilder<F> {
     #[must_use]
     pub fn companion_compaction_instruction(mut self, instruction: impl Into<Arc<str>>) -> Self {
         self.config.companion_compaction_instruction = Some(instruction.into());
+        self
+    }
+
+    /// Resolves the final instruction for each client-owned compaction.
+    ///
+    /// The resolver is awaited before any summary request. Dropping or
+    /// cancelling the surrounding operation drops the resolver future too;
+    /// failures never fall back to the static instruction.
+    #[must_use]
+    pub fn compaction_instruction_resolver(
+        mut self,
+        resolver: Arc<dyn CompactionInstructionResolver + Send + Sync>,
+    ) -> Self {
+        self.compaction_instruction_resolver = Some(resolver);
         self
     }
 
@@ -386,6 +403,7 @@ where
         builder.prompt_cache,
         builder.codex,
         builder.resume,
+        builder.compaction_instruction_resolver,
         service_factory,
     )
 }

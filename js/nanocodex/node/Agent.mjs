@@ -38,6 +38,7 @@ export function create(options = {}) {
     instructions,
     additionalInstructions,
     companionCompactionInstruction,
+    resolveCompactionInstruction,
     historySeed,
     sessionId,
     workspace,
@@ -48,6 +49,7 @@ export function create(options = {}) {
     module,
     filesystem,
     tools,
+    subagents = true,
     toolMode,
     mcp,
     codeEvaluator,
@@ -61,7 +63,15 @@ export function create(options = {}) {
     apiBaseUrl,
     websocketWarmup,
   } = resolveResponsesTransport(transport);
-  const { tools: hostTools, subagents: subagentConfig } = resolveTools(tools);
+  if (typeof subagents !== "boolean") {
+    throw new TypeError("subagents must be a boolean");
+  }
+  const { tools: hostTools, subagents: subagentConfig } = resolveTools(tools, {
+    defaultSubagents: subagents,
+  });
+  if (!subagents && subagentConfig !== undefined) {
+    throw new TypeError("Subagents.create() conflicts with subagents: false");
+  }
   const events = createEventChannel();
   if (filesystem && workspace !== undefined && workspace !== filesystem.root) {
     throw new TypeError("workspace must match filesystem.root when both are provided");
@@ -79,6 +89,7 @@ export function create(options = {}) {
     toolMode,
     workspace: workspace ?? filesystem?.root ?? resume?.workspace,
     codeEvaluator,
+    resolveCompactionInstruction,
     onDispose: () => releaseDefinitionHost(hostDefinitionId),
   });
   let durabilityOwner;
@@ -163,6 +174,7 @@ export function create(options = {}) {
     instructions,
     additionalInstructions,
     companionCompactionInstruction,
+    resolveCompactionInstruction,
     historySeed,
     sessionId: stableSessionId,
     workspace: workspace ?? filesystem?.root,

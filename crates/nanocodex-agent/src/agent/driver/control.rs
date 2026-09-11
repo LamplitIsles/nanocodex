@@ -298,12 +298,17 @@ pub(super) async fn begin_shutdown(
             Command::Context { result } => {
                 drop(result.send(Err(NanocodexError::AgentStopped)));
             }
+            Command::Snapshot { result } => {
+                drop(result.send(Err(NanocodexError::AgentStopped)));
+            }
             Command::Steer { result, .. }
             | Command::Cancel { result, .. }
             | Command::SetModel { result, .. }
             | Command::SetThinking { result, .. }
-            | Command::SetFastMode { result, .. }
-            | Command::Compact { result, .. } => {
+            | Command::SetFastMode { result, .. } => {
+                drop(result.send(Err(NanocodexError::AgentStopped)));
+            }
+            Command::Compact { result, .. } => {
                 drop(result.send(Err(NanocodexError::AgentStopped)));
             }
             Command::Shutdown => {}
@@ -416,6 +421,15 @@ pub(super) fn handle_idle_command<S>(
                 workspace.as_deref(),
                 &spawner.context_source,
             )));
+        }
+        Command::Snapshot { result } => {
+            drop(
+                result.send(
+                    latest
+                        .map(|checkpoint| checkpoint.snapshot())
+                        .ok_or(NanocodexError::ForkBeforeCompletedTurn),
+                ),
+            );
         }
         Command::Prompt { .. } => {}
     }

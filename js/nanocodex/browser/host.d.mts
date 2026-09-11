@@ -1,4 +1,5 @@
 import type {
+  CompactionInstructionResolver,
   CodeEvaluator,
   McpServers,
   MppSession,
@@ -67,6 +68,8 @@ export function createBrowserHost(options?: {
   /** Remote MCP servers exposed through native and Code Mode tool_search plus deferred tools. */
   mcp?: McpServers;
   codeEvaluator?: CodeEvaluator;
+  /** Selects the private summary instruction in the current isolate for each compaction operation. */
+  resolveCompactionInstruction?: CompactionInstructionResolver;
   toolMode?: "code" | "direct";
   /** @internal Durable host lifecycle for Rust-owned subagent descriptors. */
   subagentSessions?: {

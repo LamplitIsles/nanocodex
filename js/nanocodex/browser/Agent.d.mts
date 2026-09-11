@@ -8,6 +8,8 @@ import type { ManagedTransport, WorkerTransport } from "./Transport.mjs";
 import type { Tools } from "../tools/Tools.mjs";
 
 export type Agent = DefaultAgent;
+/** Worker options exclude function-valued resolver callbacks. */
+type WorkerAgentOptions = Omit<AgentOptions, "resolveCompactionInstruction">;
 
 type WorkerMcpServer = Readonly<{
   url?: string | URL | undefined;
@@ -33,7 +35,7 @@ export declare namespace create {
     transport: ManagedTransport;
     tools?: Tools | undefined;
   }>;
-  type Options = AgentOptions & WorkerToolExposureOptions & {
+  type Options = WorkerAgentOptions & WorkerToolExposureOptions & {
     /** Precompiled browser module; WebAssembly modules are structured-clone-safe. */
     module?: WebAssembly.Module | undefined;
     /** Fixed browser workspace facts, including its AGENTS.md snapshot. */

@@ -26,6 +26,8 @@ export declare namespace create {
     tools?: Tools | undefined;
   }>;
   type Options = AgentOptions & ToolExposureOptions & {
+    /** Enable built-in subagents (default true). False conflicts with Subagents.create(). */
+    subagents?: boolean | undefined;
     codeEvaluator?: CodeEvaluator | undefined;
     /** Caller-owned rooted filesystem mounted through standard workspace tools. */
     filesystem?: Workspace | undefined;

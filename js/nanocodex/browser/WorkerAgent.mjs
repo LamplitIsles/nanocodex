@@ -595,6 +595,7 @@ async function dispatch(message, state) {
   if (method === "agent.spawn") return state.allocateAgent(await agent.session.spawn());
   if (method === "agent.compact") return agent.session.compact();
   if (method === "agent.context") return agent.session.context();
+  if (method === "agent.snapshot") return agent.session.snapshot();
   if (method === "agent.setModel") return agent.session.setModel(args[1]);
   if (method === "agent.setThinking") return agent.session.setThinking(args[1]);
   if (method === "agent.setFastMode") return agent.session.setFastMode(args[1]);
@@ -773,6 +774,7 @@ class WorkerConnection {
       spawn: async () => connection.rawAgent(await connection.rpc("agent.spawn", [handleId])),
       compact: () => connection.rpc("agent.compact", [handleId]),
       context: async () => JSON.stringify(await connection.rpc("agent.context", [handleId])),
+      snapshot: async () => JSON.stringify(await connection.rpc("agent.snapshot", [handleId])),
       setModel: (value) => connection.rpc("agent.setModel", [handleId, value]),
       setThinking: (value) => connection.rpc("agent.setThinking", [handleId, value]),
       setFastMode: (value) => connection.rpc("agent.setFastMode", [handleId, value]),
@@ -1294,6 +1296,11 @@ function listenForAbort(signal, listener) {
 
 function serializeConfig(options) {
   const config = { ...options };
+  if (typeof config.resolveCompactionInstruction === "function") {
+    throw new TypeError(
+      "resolveCompactionInstruction is supported in Node and current-isolate WASM hosts, not the default browser Worker API",
+    );
+  }
   const workerDurability = config.durability !== false;
   if (!workerDurability) delete config.durability;
   const stableThreadId = nonEmptyString(options.threadId) ?? nonEmptyString(options.sessionId);

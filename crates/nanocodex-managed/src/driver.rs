@@ -8,7 +8,8 @@ use std::{
 
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use nanocodex_agent::{
-    AgentSessionContext, Model, NanocodexError, Thinking, TurnResult, TurnUsage,
+    AgentSessionContext, CompactionOutcome, Model, NanocodexError, SessionSnapshot, Thinking,
+    TurnResult, TurnUsage,
     backend::{
         BackendFuture, BackendPrompt, BackendPromptRoute, BackendTurn, BackendTurnKey,
         LifecycleBackend,
@@ -226,6 +227,16 @@ impl LifecycleBackend for ManagedAgent {
 
     fn compact(&self) -> BackendFuture<nanocodex_agent::Result<()>> {
         unsupported("compact")
+    }
+
+    fn compact_with_outcome(
+        &self,
+    ) -> BackendFuture<nanocodex_agent::Result<Option<CompactionOutcome>>> {
+        unsupported("compact_with_outcome")
+    }
+
+    fn snapshot(&self) -> BackendFuture<nanocodex_agent::Result<SessionSnapshot>> {
+        unsupported("snapshot")
     }
 
     fn append_developer_message(

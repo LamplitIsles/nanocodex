@@ -523,6 +523,29 @@ test("HTTP fallback preserves a history seed through manual compaction", async (
     const requests = await bounded(fixture.waitForRequests(3), "seeded SSE requests");
     assert.equal(fixture.upgrades, 1);
     assert.equal(requests.length, 3);
+    const firstBody = JSON.parse(requests[0].body);
+    const summaryBody = JSON.parse(requests[1].body);
+    const followOnBody = JSON.parse(requests[2].body);
+    const firstHistoryIndex = firstBody.input.findIndex(
+      (item) => item.type === "message" && item.role === "user",
+    );
+    assert.ok(firstHistoryIndex > 0, "the ordinary request has a warm prefix");
+    assert.equal(summaryBody.previous_response_id, undefined);
+    assert.equal(summaryBody.prompt_cache_key, firstBody.prompt_cache_key);
+    assert.deepEqual(
+      summaryBody.input.slice(0, firstHistoryIndex),
+      firstBody.input.slice(0, firstHistoryIndex),
+      "full-replay compaction keeps the exact instruction/tool prefix",
+    );
+    assert.deepEqual(
+      summaryBody.input.slice(firstHistoryIndex, firstHistoryIndex + 2),
+      firstBody.input.slice(firstHistoryIndex, firstHistoryIndex + 2),
+      "full-replay compaction keeps the seeded history prefix",
+    );
+    assert.ok(
+      firstBody.input.some((item) => item.type === "additional_tools"),
+      "the ordinary request carries tool declarations",
+    );
     assert.match(requests[0].body, /violet room/);
     assert.match(requests[0].body, /Continue the seeded conversation/);
     assert.match(requests[1].body, /Summarize the private conversation/);

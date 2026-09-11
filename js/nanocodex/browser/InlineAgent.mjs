@@ -48,6 +48,7 @@ export async function create(options = {}) {
     instructions,
     additionalInstructions,
     companionCompactionInstruction,
+    resolveCompactionInstruction,
     historySeed,
     sessionId,
     workspace,
@@ -118,6 +119,7 @@ export async function create(options = {}) {
       ? undefined
       : tempoMcp ? { ...tempoMcp, ...mcp } : mcp,
     codeEvaluator,
+    resolveCompactionInstruction,
     applyPatch: applyBrowserPatch,
     websocketPreconnect,
     websocketUrl,
@@ -237,6 +239,7 @@ export async function create(options = {}) {
       instructions,
       additionalInstructions,
       companionCompactionInstruction,
+      resolveCompactionInstruction,
       historySeed,
       sessionId: stableSessionId,
       workspace: workspace ?? filesystem?.root,

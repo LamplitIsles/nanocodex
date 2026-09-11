@@ -15,6 +15,35 @@ validator, and `X_API` discovery metadata. Hosts inject transport to the
 Hosts own persistence, network policy, credentials, and socket transports and
 inject those capabilities through the package's narrow interfaces.
 
+Application tools may provide a provider-native `definition` in addition to
+the convenience `description`, `parameters`, and `outputSchema` fields. Use a
+`type: "custom"` definition for a grammar-constrained free-form tool; its
+handler receives the exact input string and the usual `ToolContext`:
+
+```js
+const applyPatch = {
+  description: "Apply one patch through the host-owned workspace.",
+  definition: {
+    type: "custom",
+    description: "Apply one patch through the host-owned workspace.",
+    format: {
+      type: "grammar",
+      syntax: "lark",
+      definition: 'start: "patch"',
+    },
+  },
+  handler(input, context) {
+    return applyPatchInHost(input, context);
+  },
+};
+```
+
+The router canonicalizes the definition name from the containing map key or
+`NamedTool.name`. `ToolDefinition`, `CustomToolFormat`, and `ToolJson` are
+exported types for hosts that want to annotate this shape directly. Nanocodex
+executes completed custom calls once; history, snapshots, and resumed sessions
+retain their call and output items without replaying the handler.
+
 `nanocodex` owns the Rust/WASM agent runtime and composes WASM, workspace, and
 MCP adapters around these capabilities. It imports and reexports this package's
 JS-only host capabilities; `nanocodex-tools` never imports `nanocodex`.

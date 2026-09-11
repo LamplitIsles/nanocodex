@@ -94,6 +94,8 @@ pub(crate) struct ModelRun<S> {
     force_compaction: bool,
     pending_developer_messages: Vec<ResponseItem>,
     execution_steps: Option<ExecutionSteps>,
+    compaction_instruction_resolver:
+        Option<Arc<dyn crate::CompactionInstructionResolver + Send + Sync>>,
 }
 
 pub(crate) struct TurnSteering {
@@ -112,7 +114,10 @@ pub(crate) enum ModelTurnOutcome {
 }
 
 pub(crate) enum ModelCompactOutcome {
-    Completed(ModelCheckpoint),
+    Completed {
+        checkpoint: ModelCheckpoint,
+        outcome: Option<crate::CompactionOutcome>,
+    },
     Cancelled(ModelCheckpoint),
     Failed {
         error: NanocodexError,
@@ -231,6 +236,9 @@ impl<S> ModelRun<S> {
         prompt_cache: ModelPromptCache,
         context_source: ContextSource,
         host_context: Option<Arc<str>>,
+        compaction_instruction_resolver: Option<
+            Arc<dyn crate::CompactionInstructionResolver + Send + Sync>,
+        >,
     ) -> Self {
         let model = config.model;
         let thinking = config.thinking;
@@ -260,6 +268,7 @@ impl<S> ModelRun<S> {
             force_compaction: false,
             pending_developer_messages: Vec::new(),
             execution_steps: None,
+            compaction_instruction_resolver,
         }
     }
 
@@ -276,6 +285,9 @@ impl<S> ModelRun<S> {
         prompt_cache: ModelPromptCache,
         prepared: PreparedCheckpoint,
         host_context: Option<Arc<str>>,
+        compaction_instruction_resolver: Option<
+            Arc<dyn crate::CompactionInstructionResolver + Send + Sync>,
+        >,
     ) -> Self {
         let PreparedCheckpoint {
             checkpoint,
@@ -336,6 +348,7 @@ impl<S> ModelRun<S> {
             force_compaction: false,
             pending_developer_messages: Vec::new(),
             execution_steps: None,
+            compaction_instruction_resolver,
         }
     }
 

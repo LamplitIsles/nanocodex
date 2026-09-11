@@ -1,220 +1,151 @@
-# Companion engine implementation
+# Host-owned compaction contract
 
-Status: implemented on `companion-dsh-wasm`
+This document records the Nanocodex side of the host-compaction boundary. It
+does not implement a Companion or DSH adapter, persist an application
+transcript, or claim a provider cache hit from scripted tests.
 
-The implementation is in `54f876f2` (`feat(companion): expose wasm
-continuity seams`); the focused review closure is in `ce4cbffb`
-(`fix(companion): close review contract gaps`). This report records the final
-verification of both commits.
+## Ownership
 
-This document records the engine-side contract delivered for the DSH Companion
-embedding. It is intentionally narrower than a DSH integration acceptance
-report: the DSH application, plugin lifecycle, transcript projection, recall
-policy, and deployment remain in the dependent `dsh-plugins` repository.
+Nanocodex owns one Rust model loop, typed Responses history, model/tool
+execution, compaction, cancellation, lifecycle events, and engine checkpoints.
+An embedding host owns persona instructions, the fixed
+`companionCompactionInstruction` value when it uses one, and the optional
+per-operation resolver. Nanocodex invokes the resolver and performs exactly
+one summary generation; the host does not call public `session.compact()`
+reentrantly or create a second agent.
 
-## Ownership and public surface
+## Public contract
 
-Nanocodex owns the single Rust model loop used by the Node/WASM binding:
-ordered turn admission, the active typed Responses history, Code Mode and
-tool execution, compaction, cancellation, lifecycle events, and engine-owned
-checkpoints. Companion supplies its persona through the existing
-`instructions` option and its continuity policy through:
+The Rust embedding surface exports:
 
-- `companionCompactionInstruction` on `Agent.create` (Node, browser, and host
-  type surfaces); and
-- `supplementaryContext` on `agent.turn.prompt({ input, ... })` and the native
-  `PromptRequest::supplementary_context` builder seam.
+```rust
+pub trait CompactionInstructionResolver: 'static {
+    fn resolve(
+        &self,
+        context: CompactionInstructionContext,
+    ) -> CompactionInstructionFuture;
+}
 
-The latter is a host-resolved string carried with one real input. It is
-appended to that input's final user message, does not replace the persona or
-start a turn on its own, and remains attached when later inputs are queued.
-Recall lookup, timeouts, cancellation before admission, and DSH transcript
-translation remain host responsibilities.
+pub struct CompactionInstructionContext {
+    pub after_model_call_index: u32,
+    pub phase: CompactionPhase,       // PreTurn | MidTurn
+    pub trigger: CompactionTrigger,   // Manual | Automatic
+    pub active_context_tokens: u64,
+    pub auto_compact_token_limit: u64,
+}
 
-`historySeed` is the public Node/WASM hydration seam. It contains an active
-`history` array and an optional `continuitySummary`; it is not a raw DSH event
-log. The accepted typed history representations are:
-
-- `message` items with `developer`, `user`, or `assistant` roles and supported
-  `input_text`, `input_image`, `input_audio`, or `output_text` content;
-- `function_call` / `function_call_output` pairs;
-- `custom_tool_call` / `custom_tool_call_output` pairs; and
-- existing `compaction` items with their encrypted content.
-
-Tool outputs may be text, supported input media, or encrypted content. The
-engine validates the item structure, call identities, ordering, and required
-user history before a provider request. Unknown or unsupported items, an
-empty/invalid summary, an empty workspace, and ambiguous `historySeed` plus
-`resume` configuration fail before provider work. Historical tool calls are
-history only; the engine never executes them while hydrating a session.
-
-The engine creates the session lineage, prompt-cache key, canonical context,
-and serialized snapshot metadata. A caller does not fabricate private fields
-or a provider continuation ID. A seeded or resumed session starts with a
-direct full replay of the selected history; it does not perform a warmup or
-reuse a foreign provider continuation. The existing host-owned
-`durability`/`durabilityId` store contract remains the persistence boundary.
-
-## Node/WASM Responses transport fallback
-
-The Node `Transport.openAi` and `Transport.chatGpt` bindings prefer the
-Responses WebSocket and use the configured `apiBaseUrl` only for an eligible
-pre-output transport failure. The Node host caps WebSocket establishment and
-HTTP response headers at 15 seconds, sends the exact engine-encoded request to
-`POST <apiBaseUrl>/responses`, and incrementally decodes the owned
-`text/event-stream` body. The same live session then stays on HTTPS/SSE, so a
-follow-up retains its thread identity, authoritative history, tool results,
-and any server turn-state header without another WebSocket probe.
-
-Fallback is not a provider or auth failover. Authentication, validation,
-caller cancellation, and failures after an assistant delta, response item, or
-tool execution begins remain terminal under the existing retry semantics. The
-Node host owns fetch cancellation, readers, bounded rejection bodies, and
-cleanup. Browser/current-isolate and MPP hosts leave the HTTP capability
-disabled until they implement an equivalent host boundary.
-
-The public diagnostic is the existing `model.attempt.retrying` event. A
-fallback event uses `error_class: "websocket_fallback"` and includes
-`previous_transport: "responses_websocket_v2"`,
-`next_transport: "responses_https_sse"`, and a low-cardinality `reason`.
-Those fields are session-correlated by the normal `request_id`; bearer
-credentials, request headers, prompts, and request bodies are not included.
-The generated WASM binding receives this capability through its private host
-bridge, while the public Node package exposes only `apiBaseUrl`,
-`websocketUrl`, and `websocketWarmup`.
-
-## Companion compaction behavior
-
-Setting `companionCompactionInstruction` opts the session into a normal
-tool-free generation for all three engine compaction routes:
-
-1. explicit `agent.session.compact()`;
-2. automatic context-pressure compaction, including after a tool turn; and
-3. recovery after a provider context-window overflow.
-
-The generation receives the active model-visible history, the configured
-persona/request policy, and the continuity instruction. It has no model-visible
-tools and no provider continuation. The response must contain non-empty final
-text and no tool calls. Nanocodex wraps the validated text in private
-`<compacted-summary>` developer context, installs it with the newest coherent
-tail and complete tool pairs, clears superseded provider continuation state,
-and forces the next request to replay the replacement history.
-
-Installation is transactional at the session boundary: provider failure,
-invalid summary output, or cancellation leaves the previous committed history
-and continuation usable. A successful compaction does not re-execute completed
-tools. Agents without the option retain the existing provider compaction path.
-Compaction lifecycle events use the existing model-compaction started,
-completed, and failed event kinds; no DSH-specific event type was added.
-
-Maintenance summary generations are deliberately quiet in the user-facing
-display projection: assistant deltas, assistant messages, and reasoning-summary
-deltas from the private summary request are suppressed. The raw `api.event`
-transport projection still retains the provider payload for diagnostics, and
-the normal answer generation keeps its ordinary display events. The summary
-request therefore cannot leak its private marker through the assistant
-transcript while preserving the existing transport and lifecycle evidence.
-
-## Evidence
-
-All model-facing checks use a local scripted Responses peer or an in-process
-scripted service. No paid model, DSH state, credentials, or deployment is
-used.
-
-| Contract | Evidence |
-| --- | --- |
-| persona replacement, QuickJS/Code Mode host tool, events, and follow-ons | generated Node/WASM `test/node.test.mjs` existing host-tool journey |
-| ordinary and separately queued supplementary context | generated Node/WASM tests `Node WASM attaches supplementary context to the real prompt input` and `Node WASM preserves supplementary context on separately queued inputs` |
-| successful custom compaction, failed-summary preservation, and cancellation without publication through WASM | generated Node/WASM tests `Node WASM uses Companion compaction for success and preserves context on failure` and `Node WASM cancels an in-flight Companion summary without publishing it`; the streamed success case also proves normal answer display events remain while the private summary marker is retained only in raw API evidence |
-| explicit automatic pressure and provider overflow route through the custom policy | native `model::recovery::companion` scripted-service tests |
-| pressure during a tool turn and no repeated side effect | native `mid_tool_pressure_compacts_after_the_tool_without_rerunning_it` test; a test-owned marker is written once |
-| typed text/media/tool-pair hydration, no historical execution, and validation errors | generated Node/WASM `Node WASM hydrates typed history and rejects ambiguous or unsupported seeds` |
-| fresh host-owned checkpoint resume after custom compaction | generated Node/WASM `a fresh Node WASM agent resumes a host-owned Companion checkpoint` |
-| public mapping and package contracts | `client.test.mjs`, TypeScript checks, package validation, and packed consumer below |
-
-The generated WASM tests load the repository's actual `pkg-node`/WASM binding
-and use only public Node exports. The packed probe extracts the actual
-`nanocodex` and local `nanocodex-tools` tarballs into a test-owned directory;
-it verifies context/tool dispatch, custom compaction, hydrated history, and
-fresh checkpoint resume without importing the sibling DSH checkout or the
-abandoned native Companion workspace.
-
-## Reproduction checks
-
-Run from the repository root after dependencies and the WASM target are
-available:
-
-```sh
-cargo test -p nanocodex-oai-api
-cargo test -p nanocodex-agent
-cargo test -p nanocodex-agent --test it model::recovery::companion
-corepack pnpm --filter nanocodex test:typecheck
-corepack pnpm --filter nanocodex exec node --test test/node.test.mjs
-corepack pnpm --filter nanocodex exec node --test test/lifecycle.test.mjs
-corepack pnpm --filter nanocodex exec node --test test/*.test.mjs
-corepack pnpm --filter nanocodex-vite run build:wasm
-corepack pnpm --filter nanocodex check:package
-corepack pnpm --filter nanocodex pack --pack-destination <test-owned-directory>
-corepack pnpm --filter nanocodex-tools pack --pack-destination <test-owned-directory>
+pub async fn Nanocodex::compact_with_outcome(
+    &self,
+) -> Result<Option<CompactionOutcome>>;
 ```
 
-The packed consumer installs those two local tarballs and its declared public
-dependencies into a separate temporary directory. It is keyless: the scripted
-WebSocket peer supplies every response. The exact local dependency decision is
-to use workspace `link:`/`file:` references or local packed tarballs during
-development; neither repository requires npm publication for this engine PR.
+The Node/current-isolate `AgentOptions` equivalent is:
 
-## Checks run for this implementation
+```ts
+resolveCompactionInstruction?: (
+  context: CompactionInstructionContext,
+  signal: AbortSignal,
+) => string | PromiseLike<string>;
+```
 
-The focused native Companion checks pass. The generated Node/WASM suite has 24
-total tests, the lifecycle checks pass, and the complete package functional
-suite has 559 tests. The API/unit suites,
-type checks, package check, current WASM build, fresh tarball inspection, and
-the corrected keyless packed consumer probe also pass. The packed probe's
-resume and history-seed instances intentionally start with direct generation
-rather than warmup; that is the expected full-replay contract.
+The resolver is called before manual, automatic pressure, mid-tool, and
+provider-overflow summary generation. Its result must be a non-empty string.
+When configured, it supplies the instruction for that operation; a failure or
+cancellation is returned to the caller and never falls back to the static
+instruction. `companionCompactionInstruction` remains available for a fixed
+host-owned instruction.
 
-The existing high-memory durability test was also corrected to call the
-generated wasm-bindgen allocator/free exports; this is a test-harness symbol
-correction, not a product memory change.
+`agent.session.compact()` and `Actions.session.compact(agent)` return the
+custom replacement below, or `null` when provider-default compaction is
+active (its retention policy is not the contiguous custom range described
+here):
 
-## Change accounting
+```ts
+type CompactionOutcome = Readonly<{
+  revision: string;
+  trigger: "manual" | "automatic";
+  summary: string | null;
+  replaced_history: Readonly<{ start: number; end: number }>;
+  retained_tail: readonly CompactionItemIdentity[];
+  context: AgentSessionContext;
+}>;
+```
 
-Relative to fixed point `2259311e297e28233336262a127132a44476fff7`, the final
-implementation tree changes approximately 2,000 lines, within the working spec's
-1,400–2,600 estimate. The category breakdown counts additions plus deletions:
+`summary` is private and is never emitted as assistant output. The half-open
+`replaced_history` range refers to the pre-replacement managed history. Each
+`retained_tail` identity includes its pre-replacement index, Responses item
+kind, provider/client item ID when present, and tool `call_id` when present.
+`context.history` is the complete post-replacement model-visible history.
+The monotonic revision and ordered result calls let a host distinguish
+multiple completed replacements; no private snapshot fields or summary-text
+boundary inference are required.
 
-| Surface | Additions | Deletions | Changed |
-| --- | ---: | ---: | ---: |
-| product | 719 | 62 | 781 |
-| tests | 919 | 2 | 921 |
-| docs | 266 | 0 | 266 |
-| total | 1,904 | 64 | 1,968 |
+Automatic custom replacements do not return through the manual action. At the
+safe installation boundary they emit `model.compaction.replaced` with the
+same fields plus `phase` and `after_model_call_index`. Manual custom
+compaction emits the event too, after `model.compaction.completed` and after
+the managed history has been replaced. Each event contains the actual
+post-install `context`, so repeated replacements can be projected in event
+order without inspecting a snapshot.
 
-## Ticket coverage
+## Generation and installation behavior
 
-The five implementation tickets are delivered together on this branch:
+For a host-owned summary, the live request factory keeps the complete request
+prefix: instructions, tool declarations and namespace metadata, model/effort
+settings, prompt-cache key, and typed history. The final host instruction is
+appended at the end. Eligible Responses Lite continuation and the existing
+full-replay transport policy remain in use. A successful summary installation
+clears the old provider continuation and makes the next ordinary request a
+full replay; cache preservation is required for summary generation, not for
+the post-installation request.
 
-| Ticket | Delivered surface |
-| --- | --- |
-| 01 — context and host tool | Rust prompt admission/queue propagation, public supplementary context, generated WASM host-tool journey, and queued-input capture |
-| 02 — continuity compaction | consumer-owned tool-free summary generation, explicit/pressure/overflow routing, retained-tail installation, failure/cancellation preservation, and quiet private-summary display projections |
-| 03 — history and checkpoints | engine-owned typed history seed, validation and historical-tool suppression, public replay capture, and fresh host-store resume |
-| 04 — packed contract | generated artifacts, package/type checks, 559-test functional suite, local packed tarballs, and the keyless extracted consumer |
-| 05 — documentation | this report and the affected package README; root entrypoint and agent-convention files remain unchanged for the reasons below |
+Summary output is validated as a non-empty generation with no code/tool
+calls. Summary requests are display-suppressed, and no historical or summary
+tool call is dispatched. The replacement preserves the latest real-user-led
+complete tail, including completed tool call/output identities. Provider
+failure, invalid output, resolver failure, or cancellation leaves the prior
+usable history and continuation in place. Explicit compaction may cancel an
+active turn, so embedding hosts should call it from idle maintenance.
 
-## Boundary and non-claims
+Without either host-owned option, the existing provider compaction behavior
+is unchanged. Automatic compaction remains at the engine's safe boundary and
+does not invoke public host operations.
 
-This PR does not implement or verify the DSH AgentFactory/plugin, DSH UI,
-transcript event mapping, live Companion tools, real browser acceptance,
-staging/prod deployment, or npm publication. The dependent adapter must prove
-continuation of existing DSH conversations, one engine across its UIs, real
-DSH tool dispatch, and preservation of the official DSH `0.1.2-rc.1` recovery
-baseline. The engine checkpoint evidence here is a completed-boundary contract;
-it does not claim arbitrary-crash exactly-once execution.
+## Verification
 
-The root `README.md` and root `AGENTS.md` were inspected and intentionally
-unchanged: this work adds no new user/operator entrypoint, deployment command,
-agent ownership rule, or repository-wide verification convention. The
-affected package API README is updated above, and this report records the
-engine/DSH ownership boundary and exact checks.
+The deterministic evidence for this PR uses only an in-process scripted
+Responses service or a local scripted WebSocket peer. It includes:
+
+- native warm continuation, context-overflow, automatic-pressure, and
+  mid-tool recovery fixtures;
+- native proof that a completed tool side effect occurs once and is not
+  replayed by compaction;
+- Node/WASM dynamic instruction selection for repeated manual operations,
+  typed private outcomes, resolver failure, resolver cancellation, summary
+  failure, and provider-generation cancellation;
+- Node/WASM durable checkpoint resume and public history hydration;
+- Rust package checks, generated WASM, JavaScript runtime/type checks, and
+  package validation.
+
+The scripted provider's `cached_tokens` values are fixture data. They are not
+evidence of an actual provider cache hit. Live cached-token observation is a
+separate Owner-authorized verification boundary.
+
+The package-owned browser Worker intentionally does not support the resolver:
+function values cannot cross its structured-clone boundary. Its public
+options omit `resolveCompactionInstruction`, and runtime configuration rejects
+one if supplied. This deliverable does not add a Worker RPC for prompt
+selection.
+
+## Repository inspection and delivery boundary
+
+The root `README.md` was inspected and remains unchanged because this feature
+does not change repository setup, deployment commands, or operator entrypoints.
+The root `AGENTS.md` was inspected and remains unchanged because no agent
+workflow, command convention, or ownership rule changed. The affected public
+embedding documentation is [the JavaScript package README](../js/nanocodex/README.md).
+
+No DSH or sibling repository source, deployment, publication, live provider,
+benchmark, or production state is part of this deliverable. The companion
+adapter may consume the public resolver and `CompactionOutcome` contract after
+Owner acceptance.

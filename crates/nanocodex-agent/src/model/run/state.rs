@@ -148,12 +148,15 @@ impl ConversationState {
         item: ResponseItem,
         request_prefix: &[ResponseItem],
         companion: bool,
-    ) {
+    ) -> Option<nanocodex_oai_api::__private::compaction::CompactionInstallation> {
         if companion {
-            self.managed
-                .install_companion_compaction(item, [], request_prefix);
+            Some(
+                self.managed
+                    .install_companion_compaction(item, [], request_prefix),
+            )
         } else {
             self.managed.install_compaction(item, [], request_prefix);
+            None
         }
     }
 
@@ -164,15 +167,18 @@ impl ConversationState {
         canonical_context: ResponseItem,
         request_prefix: &[ResponseItem],
         companion: bool,
-    ) {
+    ) -> Option<nanocodex_oai_api::__private::compaction::CompactionInstallation> {
         self.canonical_context = Arc::new(canonical_context.clone());
         let initial_context = [canonical_developer_context, canonical_context];
         if companion {
-            self.managed
-                .install_companion_compaction(item, initial_context, request_prefix);
+            Some(
+                self.managed
+                    .install_companion_compaction(item, initial_context, request_prefix),
+            )
         } else {
             self.managed
                 .install_compaction(item, initial_context, request_prefix);
+            None
         }
     }
 

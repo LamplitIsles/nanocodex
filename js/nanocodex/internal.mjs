@@ -13,6 +13,7 @@ const pendingCloudflareAgentSessions = new Map();
 const cloudflareAgentSessions = new WeakSet();
 const hostConnections = new Map();
 const definitionHosts = new Map();
+const pendingCompactionInstructions = new Set();
 let nextHostConnection = 1;
 let nextDefinitionHost = 1;
 let nextAgentUid = 1;
@@ -223,7 +224,19 @@ export function setFastMode(agent, enabled) {
 }
 
 export function compact(agent) {
-  return agentState(agent).raw.compact();
+  const raw = agentState(agent).raw;
+  if (typeof raw.compactOutcome === "function") {
+    return raw.compactOutcome().then((encoded) => JSON.parse(encoded));
+  }
+  return raw.compact();
+}
+
+export async function snapshot(agent) {
+  const encoded = await agentState(agent).raw.snapshot();
+  if (typeof encoded !== "string") {
+    throw new TypeError("Nanocodex snapshot must be a JSON string");
+  }
+  return freezeJson(JSON.parse(encoded));
 }
 
 export async function context(agent) {
@@ -320,6 +333,9 @@ export function toWasmConfig(options = {}) {
   copy(config, "instructions", options.instructions);
   copy(config, "additional_instructions", options.additionalInstructions);
   copy(config, "companion_compaction_instruction", options.companionCompactionInstruction);
+  if (options.resolveCompactionInstruction !== undefined) {
+    config.dynamic_compaction_instruction = true;
+  }
   if (options.historySeed !== undefined) {
     const seed = options.historySeed;
     if (!seed || typeof seed !== "object" || Array.isArray(seed)
@@ -451,6 +467,9 @@ export function registerDefinitionHost(host, cloudflareReservation) {
 }
 
 export function releaseDefinitionHost(id) {
+  for (const pending of [...pendingCompactionInstructions]) {
+    if (pending.definitionHostId === id) pending.cancel();
+  }
   definitionHosts.delete(id);
 }
 
@@ -644,6 +663,47 @@ const hostBridge = Object.freeze({
     // before the returned session can be adopted. The private definition host
     // keeps that lookup instance-scoped for roots and Rust-spawned children.
     return requiredDefinitionHost(definitionHostId).toolDefinitions(sessionId);
+  },
+  resolveCompactionInstruction(definitionHostId, contextJson) {
+    const host = requiredDefinitionHost(definitionHostId);
+    const context = JSON.parse(contextJson);
+    const controller = new AbortController();
+    const pending = {
+      definitionHostId,
+      active: true,
+      cancel() {
+        if (!pending.active) return;
+        pending.active = false;
+        pendingCompactionInstructions.delete(pending);
+        controller.abort(new Error("compaction instruction resolution was cancelled"));
+      },
+    };
+    pendingCompactionInstructions.add(pending);
+    let result;
+    try {
+      if (typeof host.resolveCompactionInstruction !== "function") {
+        throw new Error("the Nanocodex host does not provide compaction instruction resolution");
+      }
+      result = Promise.resolve(host.resolveCompactionInstruction(context, controller.signal))
+        .then((instruction) => {
+          if (typeof instruction !== "string" || !instruction.trim()) {
+            throw new TypeError("compaction instruction resolver must return a non-empty string");
+          }
+          return instruction;
+        })
+        .finally(() => {
+          pending.active = false;
+          pendingCompactionInstructions.delete(pending);
+        });
+    } catch (error) {
+      pending.cancel();
+      result = Promise.reject(error);
+    }
+    result.cancel = pending.cancel;
+    // A dropped WASM JsFuture still owns this promise. Keep cancellation
+    // rejections observed when the host's resolver is abort-aware.
+    result.catch(() => {});
+    return result;
   },
   async durabilityAcquire(routeId, stateId, ownerId) {
     return (await loadDurabilityRuntime()).acquire(routeId, stateId, ownerId);

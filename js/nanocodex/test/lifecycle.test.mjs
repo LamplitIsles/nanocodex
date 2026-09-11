@@ -495,7 +495,7 @@ test("manual compaction and historical forks preserve exact committed boundaries
       (await agent.turn.prompt({ input: "remember silver" }).result()).finalMessage,
       "stored silver",
     );
-    await agent.session.compact();
+    assert.equal(await agent.session.compact(), null);
     assert.equal(
       (await agent.turn.prompt({ input: "after compaction" }).result()).finalMessage,
       "COMPACTED",

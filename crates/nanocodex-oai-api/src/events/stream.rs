@@ -176,6 +176,9 @@ pub enum AgentEventKind {
     /// Model-side context compaction completed.
     #[serde(rename = "model.compaction.completed")]
     ModelCompactionCompleted,
+    /// Custom host compaction installed a replacement at a safe boundary.
+    #[serde(rename = "model.compaction.replaced")]
+    ModelCompactionReplaced,
     /// Model-side context compaction failed.
     #[serde(rename = "model.compaction.failed")]
     ModelCompactionFailed,
@@ -367,6 +370,9 @@ impl AgentEvent {
             }
             AgentEventKind::ModelCompactionCompleted => {
                 AgentEventData::Context(ContextEvent::CompactionCompleted(self.decode_payload()?))
+            }
+            AgentEventKind::ModelCompactionReplaced => {
+                AgentEventData::Context(ContextEvent::CompactionReplaced(self.decode_payload()?))
             }
             AgentEventKind::ModelCompactionFailed => {
                 AgentEventData::Context(ContextEvent::CompactionFailed(self.decode_payload()?))

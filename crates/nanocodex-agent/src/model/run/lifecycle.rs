@@ -76,6 +76,7 @@ pub(super) enum CompactionPhase {
 
 pub(super) struct CompactionContext<'a> {
     pub(super) snapshot: Option<&'a ContextSnapshot>,
+    pub(super) workspace: &'a str,
     pub(super) phase: CompactionPhase,
 }
 
@@ -92,7 +93,11 @@ where
         factory: &ResponsesAttemptFactory,
         context: CompactionContext<'_>,
     ) -> Result<bool> {
-        let CompactionContext { snapshot, phase } = context;
+        let CompactionContext {
+            snapshot,
+            workspace,
+            phase,
+        } = context;
         let Some(auto_compact_token_limit) = compaction::auto_compact_token_limit(
             self.model.as_str(),
             self.config.context_window_tokens,
@@ -103,7 +108,8 @@ where
         if !self.force_compaction && active_context_tokens < auto_compact_token_limit {
             return Ok(false);
         }
-        let companion = self.config.companion_compaction_instruction.is_some();
+        let companion = self.config.companion_compaction_instruction.is_some()
+            || self.compaction_instruction_resolver.is_some();
         let previous_response_id = conversation.previous_response_id();
         let (item, _usage, server_reasoning_included) = self
             .perform_compaction(
@@ -114,17 +120,18 @@ where
                 active_context_tokens,
                 auto_compact_token_limit,
                 factory,
+                crate::CompactionTrigger::Automatic,
+                phase,
             )
             .await?;
+        let summary = crate::compaction::summary_text(&item);
         conversation.observe_server_reasoning(server_reasoning_included);
-        match phase {
-            CompactionPhase::PreTurn => {
-                conversation.install_pre_turn_compaction(
-                    item,
-                    factory.profile().prefix(),
-                    companion,
-                );
-            }
+        let installation = match phase {
+            CompactionPhase::PreTurn => conversation.install_pre_turn_compaction(
+                item,
+                factory.profile().prefix(),
+                companion,
+            ),
             CompactionPhase::MidTurn => {
                 let snapshot = snapshot.ok_or(NanocodexError::InvalidAttemptState {
                     detail: "mid-turn compaction is missing its context snapshot",
@@ -136,11 +143,41 @@ where
                     canonical_context,
                     factory.profile().prefix(),
                     companion,
-                );
+                )
             }
+        };
+        if let Some(installation) = installation {
+            let outcome = crate::compaction::outcome_from_installation(
+                installation,
+                conversation.history_revision(),
+                crate::CompactionTrigger::Automatic,
+                summary,
+            )
+            .with_context(crate::AgentSessionContext::from_backend(
+                workspace.to_owned(),
+                conversation.flattened_history(),
+            ));
+            self.emit_compaction_replaced(after_model_call_index, phase, &outcome)?;
         }
         self.force_compaction = false;
         Ok(true)
+    }
+
+    pub(super) fn emit_compaction_replaced(
+        &self,
+        after_model_call_index: u32,
+        phase: CompactionPhase,
+        outcome: &crate::CompactionOutcome,
+    ) -> Result<()> {
+        let phase = match phase {
+            CompactionPhase::PreTurn => crate::CompactionPhase::PreTurn,
+            CompactionPhase::MidTurn => crate::CompactionPhase::MidTurn,
+        };
+        self.events.emit(
+            AgentEventKind::ModelCompactionReplaced,
+            outcome.event(after_model_call_index, phase),
+        )?;
+        Ok(())
     }
 
     pub(super) async fn perform_warmup(
@@ -361,6 +398,8 @@ where
         active_context_tokens: u64,
         auto_compact_token_limit: u64,
         factory: &ResponsesAttemptFactory,
+        trigger_kind: crate::CompactionTrigger,
+        phase: CompactionPhase,
     ) -> Result<(ResponseItem, Option<Usage>, bool)> {
         let step_id = format!("compaction-{after_model_call_index}");
         let retained_input = if let Some(steps) = &self.execution_steps {
@@ -398,14 +437,34 @@ where
             }
             None => history,
         };
-        if retained_request.is_none() && self.config.companion_compaction_instruction.is_none() {
+        if retained_request.is_none()
+            && self.config.companion_compaction_instruction.is_none()
+            && self.compaction_instruction_resolver.is_none()
+        {
             compaction::trim_tool_outputs_to_fit_context_window(
                 &mut history,
                 factory.profile().prefix(),
                 self.config.context_window_tokens,
             );
         }
-        if let Some(instruction) = self.config.companion_compaction_instruction.clone() {
+        let instruction = if let Some(resolver) = &self.compaction_instruction_resolver {
+            let context = crate::CompactionInstructionContext {
+                after_model_call_index,
+                phase: match phase {
+                    CompactionPhase::PreTurn => crate::CompactionPhase::PreTurn,
+                    CompactionPhase::MidTurn => crate::CompactionPhase::MidTurn,
+                },
+                trigger: trigger_kind,
+                active_context_tokens,
+                auto_compact_token_limit,
+            };
+            Some(crate::compaction::validate_instruction(
+                resolver.resolve(context).await?,
+            )?)
+        } else {
+            self.config.companion_compaction_instruction.clone()
+        };
+        if let Some(instruction) = instruction {
             return self
                 .perform_companion_compaction(
                     after_model_call_index,
@@ -418,6 +477,7 @@ where
                     thinking,
                     fast_mode,
                     instruction,
+                    incremental_start,
                 )
                 .await;
         }
@@ -583,8 +643,8 @@ where
 
     /// Executes consumer-owned continuity summarization as a normal generation.
     ///
-    /// The request is replayed without a provider continuation and uses a
-    /// profile with no model-visible tools. The returned text is wrapped as a
+    /// The request uses the live profile and native continuation/full-replay
+    /// policy. The returned text is wrapped as a
     /// private developer context item; it is installed by the caller only
     /// after this method has validated the response completely.
     #[allow(clippy::too_many_arguments)]
@@ -600,6 +660,7 @@ where
         thinking: Thinking,
         fast_mode: bool,
         instruction: Arc<str>,
+        incremental_start: usize,
     ) -> Result<(ResponseItem, Option<Usage>, bool)> {
         let started_at = Instant::now();
         self.stats.compactions += 1;
@@ -616,14 +677,13 @@ where
             MessageRole::Developer,
             [ContentItem::input_text(instruction.as_ref())],
         ));
-        let factory = factory.without_tools();
         let request = factory
             .generation(
                 after_model_call_index,
                 history.clone(),
                 history,
-                0,
-                None,
+                incremental_start,
+                previous_response_id,
                 model,
                 thinking,
                 fast_mode,

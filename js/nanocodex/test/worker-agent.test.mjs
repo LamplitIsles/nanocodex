@@ -16,6 +16,16 @@ import { agentActions } from "../actions/index.mjs";
 import { createAgentClient, createBrowserVoice, defineRuntime } from "../internal.mjs";
 import * as Transport from "../browser/Transport.mjs";
 
+test("the package Worker rejects function-valued compaction resolvers", async () => {
+  await assert.rejects(
+    createWorkerAgent({
+      harness: false,
+      resolveCompactionInstruction: () => "keep the selected facts",
+    }),
+    /supported in Node and current-isolate WASM hosts/,
+  );
+});
+
 test("Worker Agent preserves synchronous prompt handles, independent results, and ordered events", async () => {
   const fixture = createFixture();
   const worker = new LoopbackWorker(fixture.createAgent);

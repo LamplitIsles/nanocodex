@@ -54,6 +54,8 @@ where
                 active_context_tokens,
                 auto_compact_token_limit,
                 &session.factory,
+                crate::CompactionTrigger::Manual,
+                CompactionPhase::PreTurn,
             );
             tokio::pin!(compaction);
             tokio::select! {
@@ -80,14 +82,35 @@ where
                 return Ok(ModelCompactOutcome::Failed { error, checkpoint });
             }
         };
+        let summary = crate::compaction::summary_text(&item);
         session
             .conversation
             .observe_server_reasoning(server_reasoning_included);
-        session.conversation.install_pre_turn_compaction(
+        let installation = session.conversation.install_pre_turn_compaction(
             item,
             session.factory.profile().prefix(),
-            self.config.companion_compaction_instruction.is_some(),
+            self.config.companion_compaction_instruction.is_some()
+                || self.compaction_instruction_resolver.is_some(),
         );
+        let compaction_outcome = installation.map(|installation| {
+            crate::compaction::outcome_from_installation(
+                installation,
+                session.conversation.history_revision(),
+                crate::CompactionTrigger::Manual,
+                summary,
+            )
+            .with_context(crate::AgentSessionContext::from_backend(
+                session.workspace.clone(),
+                session.conversation.flattened_history(),
+            ))
+        });
+        if let Some(outcome) = &compaction_outcome {
+            self.emit_compaction_replaced(
+                self.stats.model_calls,
+                CompactionPhase::PreTurn,
+                outcome,
+            )?;
+        }
         session.conversation.commit_tail();
         session.context.require_full_reinjection();
         session.preserve_inherited_delta = false;
@@ -95,7 +118,10 @@ where
         let checkpoint =
             Self::checkpoint_from_session(&session, false, self.global_instructions.clone());
         self.session = Some(session);
-        Ok(ModelCompactOutcome::Completed(checkpoint))
+        Ok(ModelCompactOutcome::Completed {
+            checkpoint,
+            outcome: compaction_outcome,
+        })
     }
 
     pub(crate) fn emit_cancelled_before_start(
@@ -353,6 +379,7 @@ where
                 &session.factory,
                 CompactionContext {
                     snapshot: session.context.snapshot(),
+                    workspace: &session.workspace,
                     phase: CompactionPhase::PreTurn,
                 },
             );
@@ -763,6 +790,7 @@ where
                             &session.factory,
                             CompactionContext {
                                 snapshot: session.context.snapshot(),
+                                workspace: &session.workspace,
                                 phase: CompactionPhase::MidTurn,
                             },
                         )
@@ -782,6 +810,7 @@ where
                         &session.factory,
                         CompactionContext {
                             snapshot: session.context.snapshot(),
+                            workspace: &session.workspace,
                             phase: CompactionPhase::MidTurn,
                         },
                     )
@@ -820,6 +849,7 @@ where
                     &session.factory,
                     CompactionContext {
                         snapshot: session.context.snapshot(),
+                        workspace: &session.workspace,
                         phase: CompactionPhase::MidTurn,
                     },
                 )

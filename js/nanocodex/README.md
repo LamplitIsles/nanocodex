@@ -29,7 +29,8 @@ console.log(usage.cost_status);
 
 await agent.session.setThinking("high");
 await agent.session.setFastMode(true);
-await agent.session.compact();
+const compaction = await agent.session.compact();
+if (compaction) console.log(compaction.summary, compaction.retained_tail);
 
 const branch = await agent.session.fork({ at: result });
 const branchTurn = branch.turn.prompt({ input: "Try another approach." });
@@ -48,19 +49,18 @@ await branch.session.shutdown();
 await agent.session.shutdown();
 ```
 
-### Companion continuity seams
+### Host-owned compaction
 
-The Node and Web API WASM hosts can embed a Companion persona while Nanocodex
-continues to own the model loop, Code Mode, active context, compaction, and
-engine checkpoints. The existing `instructions` option replaces the selected
-coding persona; `companionCompactionInstruction` opts into the same
-consumer-owned continuity policy for explicit compaction, automatic pressure,
-and provider context-overflow recovery:
+The Node and current-isolate Web API WASM hosts can supply a host-owned compaction instruction
+while Nanocodex continues to own the model loop, tools, active context,
+compaction, and engine checkpoints. The existing `instructions` option sets
+the model persona; `companionCompactionInstruction` remains the fixed
+host-supplied instruction for client-owned compaction:
 
 ```js
 const agent = await Agent.create({
   transport: Transport.openAi({ apiKey: process.env.OPENAI_API_KEY }),
-  instructions: companionPersona,
+  instructions: hostPersona,
   companionCompactionInstruction: "Preserve relationship facts and recent work.",
   historySeed: {
     history: [
@@ -105,13 +105,63 @@ never executed. The engine creates the lineage, cache key, and snapshot
 metadata; callers do not fabricate provider continuation IDs.
 
 When `companionCompactionInstruction` is configured, summaries are normal
-tool-free generations using the active context and persona. A successful
-summary replaces the active context with the summary and a coherent retained
-tail, then the next request performs a fresh replay. A failed or canceled
-summary leaves the previously committed context and continuation usable. The
-same policy covers explicit compaction, token pressure (including after a tool
-turn), and context-window overflow. Without the option, existing provider
-compaction behavior is unchanged.
+generations using the complete active request prefix: instructions, tools,
+model settings, prompt-cache key, and the current typed history are retained.
+The final instruction is appended at the end of that request. Eligible
+Responses Lite continuation and the normal full-replay fallback remain in use;
+the next request after installation intentionally performs a fresh replay, so
+these client-side tests do not claim a provider cache hit.
+
+For per-operation policy, provide `resolveCompactionInstruction` instead. It
+is awaited before every manual, pressure, mid-tool, or context-overflow
+summary request and receives a small context plus an `AbortSignal`:
+
+```js
+const agent = await Agent.create({
+  transport: Transport.openAi({ apiKey: process.env.OPENAI_API_KEY }),
+  resolveCompactionInstruction: async (context, signal) => {
+    const policy = context.trigger === "manual"
+      ? "Keep the user's selected facts and the latest work."
+      : "Keep the facts required to resume the active operation.";
+    signal.throwIfAborted?.();
+    return policy;
+  },
+});
+```
+
+The resolver result must be a non-empty string. Resolver failure or
+cancellation does not fall back to `companionCompactionInstruction` and does
+not start a provider request. Shutting down an Agent aborts a pending resolver;
+an active summary is also canceled without installing a partial result.
+
+A successful summary replaces the superseded history with private summary
+context and the latest complete real-user-led tail. It never emits the
+summary as assistant output, and historical or summary tool calls are never
+dispatched. Custom host compaction returns a `CompactionOutcome` with the
+ordered `revision`, `trigger`, private `summary`, `replaced_history` range,
+`retained_tail` item identities, and complete post-replacement `context`.
+Automatic custom replacements additionally emit an ordered
+`model.compaction.replaced` event at the installation boundary; its payload
+has the same outcome fields plus `phase` and `after_model_call_index`. Manual
+custom compaction emits the same event after installation. Call explicit
+compaction from idle maintenance because it may cancel an active turn.
+When neither host-owned option is configured, provider-default compaction is
+unchanged and `agent.session.compact()` returns `null`; no custom replacement
+event is emitted.
+
+After a successful manual replacement, call `agent.session.snapshot()` before
+disposing the Agent when the host needs to persist that exact boundary. The
+returned `SessionSnapshot` is produced by the engine's committed checkpoint,
+so it includes the installed summary and complete retained tool tail, along
+with the lineage and cache metadata required for a cold `resume`. It rejects
+before the first committed boundary and after the Agent has stopped; callers
+must treat its history and tool payloads as sensitive model state.
+
+`resolveCompactionInstruction` is supported in `nanocodex/node` and in the
+current-isolate `nanocodex/host` API. The package-owned `nanocodex/browser`
+module Worker accepts only structured-clone-safe options, so its types omit
+the resolver and runtime rejects a function-valued option. No browser Worker
+RPC resolver is provided.
 
 Host-owned checkpoints use the existing `durability`/`durabilityId` options.
 After a completed boundary is stored, a fresh Agent instance can reopen it and
@@ -435,6 +485,45 @@ const agent = await Agent.create({
 `parameters` is optional and defaults to an open object. TypeScript types are
 erased at runtime, so provide JSON Schema only when the model needs a precise
 argument contract, as `lookup_order` does above.
+
+For provider-native free-form input, set `definition` on the same application
+tool. The router replaces `definition.name` with the containing map key (or
+the `NamedTool.name`), so the host does not need a second tool-registration
+path. A custom definition receives the exact model string in its handler and
+the normal `ToolContext` identity and cancellation signal:
+
+```js
+const applyPatch = {
+  description: "Apply one patch through the host-owned workspace.",
+  definition: {
+    type: "custom",
+    description: "Apply one patch through the host-owned workspace.",
+    format: {
+      type: "grammar",
+      syntax: "lark",
+      definition: 'start: "patch"', // replace with the host's complete grammar
+    },
+  },
+  async handler(input, { callId, sessionId, signal }) {
+    if (typeof input !== "string") throw new TypeError("raw patch input required");
+    return applyPatchInHost(input, { callId, sessionId, signal });
+  },
+};
+
+const agent = await Agent.create({
+  transport: Transport.openAi({ apiKey: process.env.OPENAI_API_KEY }),
+  tools: { apply_patch: applyPatch },
+  subagents: false,
+});
+```
+
+`type: "custom"` is a direct Responses custom tool, so its handler input is a
+string rather than parsed JSON. Completed custom calls and outputs remain
+engine-owned history: snapshots and cold `resume` replay them as model context
+without invoking the handler again. Node agents enable built-in subagents by
+default; `subagents: false` removes those built-in tools while retaining the
+application tools above. Passing `Subagents.create()` together with `false`
+is rejected.
 
 ## Standard web and browser tools
 
@@ -1072,6 +1161,7 @@ an owned client decorated with matching domain actions:
 - `result.usage()` / `Actions.turn.getUsage(result)`
 - `agent.session.fork(...)` / `Actions.session.fork(agent, ...)`
 - `agent.session.compact()` / `Actions.session.compact(agent)`
+- `agent.session.snapshot()` / `Actions.session.snapshot(agent)`
 - `agent.session.setThinking(...)` / `Actions.session.setThinking(agent, ...)`
 - `agent.session.setFastMode(...)` / `Actions.session.setFastMode(agent, ...)`
 - `agent.session.shutdown()` / `Actions.session.shutdown(agent)`

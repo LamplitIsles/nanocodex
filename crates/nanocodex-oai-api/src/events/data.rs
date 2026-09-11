@@ -8,7 +8,7 @@ use serde_json::{Value, value::RawValue};
 use super::stream::AgentEventKind;
 use crate::{
     pricing::{CostStatus, EstimatedUsdCost},
-    responses::{MessagePhase, Usage},
+    responses::{MessagePhase, ResponseItem, Usage},
     tools::ToolOutputBody,
 };
 
@@ -446,6 +446,8 @@ pub enum ContextEvent {
     CompactionStarted(CompactionStarted),
     /// Automatic remote compaction completed.
     CompactionCompleted(CompactionCompleted),
+    /// Custom host compaction installed an ordered replacement.
+    CompactionReplaced(CompactionReplaced),
     /// Automatic remote compaction failed.
     CompactionFailed(CompactionFailed),
 }
@@ -480,6 +482,58 @@ pub struct CompactionCompleted {
     pub time_to_first_output_ns: Option<u64>,
     /// Provider token usage when supplied.
     pub usage: Option<Usage>,
+}
+
+/// Exact custom replacement installed at a safe history boundary.
+#[derive(Clone, Debug, Deserialize)]
+pub struct CompactionReplaced {
+    /// Model-call boundary after which compaction ran.
+    pub after_model_call_index: u32,
+    /// Whether the replacement was before a turn or inside a continuation.
+    pub phase: String,
+    /// Monotonic managed-history replacement revision.
+    pub revision: String,
+    /// Whether the replacement was explicit or automatic.
+    pub trigger: String,
+    /// Generated private summary text.
+    pub summary: Option<String>,
+    /// Half-open pre-compaction range replaced by the summary.
+    pub replaced_history: CompactionRange,
+    /// Retained suffix identities in provider order.
+    pub retained_tail: Vec<CompactionItemIdentity>,
+    /// Complete model-visible context after installation.
+    pub context: CompactionSessionContext,
+}
+
+/// Half-open range in the pre-compaction managed history.
+#[derive(Clone, Debug, Deserialize)]
+pub struct CompactionRange {
+    /// First removed item index.
+    pub start: usize,
+    /// Exclusive end of the removed range.
+    pub end: usize,
+}
+
+/// Stable identity for an item retained after a custom replacement.
+#[derive(Clone, Debug, Deserialize)]
+pub struct CompactionItemIdentity {
+    /// Pre-replacement history index.
+    pub index: usize,
+    /// Responses item kind.
+    pub kind: String,
+    /// Provider or client item ID.
+    pub id: Option<String>,
+    /// Tool call ID.
+    pub call_id: Option<String>,
+}
+
+/// Model-visible context included with a custom replacement event.
+#[derive(Clone, Debug, Deserialize)]
+pub struct CompactionSessionContext {
+    /// Workspace associated with the installed context.
+    pub workspace: String,
+    /// Complete model-visible history after installation.
+    pub history: Vec<ResponseItem>,
 }
 
 /// Failed automatic context compaction.

@@ -15,6 +15,10 @@ const MPP_CLIENT_PROTOCOL_ERROR_CLOSE_CODE = 3008;
 const WEBSOCKET_OPEN = 1;
 
 export function createBrowserHost(options = {}) {
+  if (options.resolveCompactionInstruction !== undefined
+    && typeof options.resolveCompactionInstruction !== "function") {
+    throw new TypeError("resolveCompactionInstruction must be a function");
+  }
   const toolMode = options.toolMode ?? "code";
   if (toolMode !== "code" && toolMode !== "direct") {
     throw new TypeError("toolMode must be code or direct");
@@ -84,6 +88,9 @@ export function createBrowserHost(options = {}) {
         async handler(input, context) {
           if (typeof options.applyPatch !== "function") {
             throw new Error("the Rust browser apply_patch planner is unavailable");
+          }
+          if (typeof input !== "string") {
+            throw new TypeError("browser apply_patch requires a raw string input");
           }
           const summary = await options.applyPatch(input, context.sessionId);
           return toolResult(summary, {});
@@ -524,6 +531,12 @@ export function createBrowserHost(options = {}) {
     },
     toolMode: () => toolMode,
     toolDefinitions: code.toolDefinitions,
+    resolveCompactionInstruction: (context, signal) => {
+      if (typeof options.resolveCompactionInstruction !== "function") {
+        throw new Error("resolveCompactionInstruction is not configured");
+      }
+      return options.resolveCompactionInstruction(context, signal);
+    },
     releaseSession: code.releaseSession,
     emitEvent: onEvent,
     reset: code.reset,

@@ -441,7 +441,10 @@ pub(super) enum Command {
     },
     Compact {
         parent: Option<tracing::Span>,
-        result: oneshot::Sender<Result<()>>,
+        result: oneshot::Sender<Result<Option<CompactionOutcome>>>,
+    },
+    Snapshot {
+        result: oneshot::Sender<Result<SessionSnapshot>>,
     },
     AppendDeveloperMessage {
         text: String,

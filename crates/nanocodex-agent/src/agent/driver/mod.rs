@@ -69,6 +69,10 @@ where
                 prompt_cache.clone(),
                 initial,
                 self.spawner.host_context.as_ref().map(Arc::clone),
+                self.spawner
+                    .compaction_instruction_resolver
+                    .as_ref()
+                    .map(Arc::clone),
             )
         } else {
             ModelRun::new(
@@ -81,6 +85,10 @@ where
                 prompt_cache.clone(),
                 self.spawner.context_source.clone(),
                 self.spawner.host_context.as_ref().map(Arc::clone),
+                self.spawner
+                    .compaction_instruction_resolver
+                    .as_ref()
+                    .map(Arc::clone),
             )
         };
         let mut turn_index = 0_u64;
@@ -421,6 +429,17 @@ where
                     )));
                     continue;
                 }
+                if let Command::Snapshot { result } = command {
+                    drop(
+                        result.send(
+                            latest_fork_checkpoint
+                                .as_deref()
+                                .map(CommittedSession::snapshot)
+                                .ok_or(NanocodexError::ForkBeforeCompletedTurn),
+                        ),
+                    );
+                    continue;
+                }
                 if let Command::Compact { parent, result } = command {
                     logical_turn_index = logical_turn_index.saturating_add(1);
                     let span = agent_compact_span(
@@ -746,6 +765,14 @@ where
                                             &self.spawner.context_source,
                                         )));
                                     }
+                                    Some(Command::Snapshot { result }) => {
+                                        drop(result.send(
+                                            latest_fork_checkpoint
+                                                .as_deref()
+                                                .map(CommittedSession::snapshot)
+                                                .ok_or(NanocodexError::ForkBeforeCompletedTurn),
+                                        ));
+                                    }
                                     Some(Command::Shutdown) => {
                                         if let Some(cancel) = cancel_compaction.take() {
                                             let _ = cancel.send(());
@@ -775,7 +802,10 @@ where
                     drop(execution);
                     let mut compact_checkpoint_committed = false;
                     let outcome = match completed {
-                        Ok(ModelCompactOutcome::Completed(checkpoint)) => {
+                        Ok(ModelCompactOutcome::Completed {
+                            checkpoint,
+                            outcome,
+                        }) => {
                             let checkpoint = Arc::new(CommittedSession::new(
                                 Arc::clone(&self.spawner.lineage_id),
                                 thread_model,
@@ -790,9 +820,19 @@ where
                                 .await;
                             if persisted.is_ok() {
                                 compact_checkpoint_committed = true;
-                                latest_fork_checkpoint = Some(checkpoint);
+                                latest_fork_checkpoint = Some(Arc::clone(&checkpoint));
                             }
-                            persisted
+                            match persisted {
+                                Ok(()) => agent_session_context(
+                                    Some(&checkpoint),
+                                    self.workspace.as_deref(),
+                                    &self.spawner.context_source,
+                                )
+                                .map(|context| {
+                                    outcome.map(|outcome| outcome.with_context(context))
+                                }),
+                                Err(error) => Err(error),
+                            }
                         }
                         Ok(ModelCompactOutcome::Cancelled(checkpoint)) => {
                             let checkpoint = Arc::new(CommittedSession::new(
@@ -1370,6 +1410,25 @@ where
                                     &self.spawner.context_source,
                                 )));
                             }
+                            Some(Command::Snapshot { result }) => {
+                                let checkpoint = fork_snapshot_rx
+                                    .borrow_and_update()
+                                    .clone()
+                                    .map(|checkpoint| {
+                                        Arc::new(CommittedSession::new(
+                                            Arc::clone(&self.spawner.lineage_id),
+                                            thread_model,
+                                            checkpoint,
+                                        ))
+                                    })
+                                    .or_else(|| latest_fork_checkpoint.clone());
+                                drop(result.send(
+                                    checkpoint
+                                        .as_deref()
+                                        .map(CommittedSession::snapshot)
+                                        .ok_or(NanocodexError::ForkBeforeCompletedTurn),
+                                ));
+                            }
                             Some(Command::Compact { parent, result }) => {
                                 pending_compact = Some((parent, result));
                                 if let Some(cancel) = cancel.take() {
@@ -1767,6 +1826,10 @@ where
             prompt_cache.clone(),
             prepared,
             spawner.host_context.as_ref().map(Arc::clone),
+            spawner
+                .compaction_instruction_resolver
+                .as_ref()
+                .map(Arc::clone),
         )
     } else {
         ModelRun::new(
@@ -1779,6 +1842,10 @@ where
             prompt_cache.clone(),
             spawner.context_source.clone(),
             spawner.host_context.as_ref().map(Arc::clone),
+            spawner
+                .compaction_instruction_resolver
+                .as_ref()
+                .map(Arc::clone),
         )
     }
 }

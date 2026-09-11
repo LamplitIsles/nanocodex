@@ -1,19 +1,23 @@
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
+    future::Future,
     path::PathBuf,
+    pin::Pin,
     rc::Rc,
     sync::{Arc, Mutex, Weak},
+    task::{Context, Poll},
     time::Duration,
 };
 
-use js_sys::Promise;
+use js_sys::{Function, Promise, Reflect};
 use nanocodex::{
-    AgentEvents, AgentSessionContext, DurableAgentExt, Model, Nanocodex as RustNanocodex,
-    NanocodexError, OpenAi, PromptRoute, ReasoningMode, Thinking, Tools, Turn, TurnControl,
-    TurnResult,
+    AgentEvents, AgentSessionContext, CompactionOutcome, CompactionTrigger, DurableAgentExt, Model,
+    Nanocodex as RustNanocodex, NanocodexError, OpenAi, PromptRoute, ReasoningMode, Thinking,
+    Tools, Turn, TurnControl, TurnResult,
     agent::{
-        AgentHandle, ExecutionEnvironment, PromptRequest, SpawnOptions,
+        AgentHandle, CompactionInstructionContext, CompactionInstructionFuture,
+        CompactionInstructionResolver, ExecutionEnvironment, PromptRequest, SpawnOptions,
         durability::{
             OwnedState, OwnerId, OwnerToken, StateStore, StoreError, StoreFuture, StoredState,
         },
@@ -140,6 +144,12 @@ extern "C" {
     #[wasm_bindgen(catch, js_namespace = ["globalThis", "nanocodexHost"], js_name = toolDefinitions)]
     fn host_tool_definitions(definition_host_id: u32, session_id: &str) -> Result<String, JsValue>;
 
+    #[wasm_bindgen(catch, js_namespace = ["globalThis", "nanocodexHost"], js_name = resolveCompactionInstruction)]
+    fn host_resolve_compaction_instruction(
+        definition_host_id: u32,
+        context_json: &str,
+    ) -> Result<Promise, JsValue>;
+
     #[wasm_bindgen(catch, js_namespace = ["globalThis", "nanocodexHost"], js_name = durabilityAcquire)]
     fn host_durability_acquire(
         route_id: &str,
@@ -205,6 +215,76 @@ extern "C" {
 
 struct JavaScriptSubscriptionHost {
     subscription_id: String,
+}
+
+struct JavaScriptCompactionInstructionResolver {
+    definition_host_id: u32,
+}
+
+struct JavaScriptCompactionInstructionFuture {
+    future: JsFuture,
+    cancel: Option<Function>,
+}
+
+impl Future for JavaScriptCompactionInstructionFuture {
+    type Output = Result<String, NanocodexError>;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        match Pin::new(&mut self.future).poll(context) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(value)) => Poll::Ready(value.as_string().ok_or_else(|| {
+                NanocodexError::InvalidRequest(
+                    "compaction instruction resolver returned a non-string".to_owned(),
+                )
+            })),
+            Poll::Ready(Err(error)) => Poll::Ready(Err(NanocodexError::InvalidRequest(format!(
+                "compaction instruction resolution failed: {}",
+                host_error_message(&error)
+            )))),
+        }
+    }
+}
+
+impl Drop for JavaScriptCompactionInstructionFuture {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.call0(&JsValue::UNDEFINED);
+        }
+    }
+}
+
+impl CompactionInstructionResolver for JavaScriptCompactionInstructionResolver {
+    fn resolve(&self, context: CompactionInstructionContext) -> CompactionInstructionFuture {
+        let context_json = match serde_json::to_string(&context) {
+            Ok(context_json) => context_json,
+            Err(error) => {
+                return Box::pin(async move {
+                    Err(NanocodexError::InvalidRequest(format!(
+                        "failed to encode compaction instruction context: {error}"
+                    )))
+                });
+            }
+        };
+        let promise =
+            match host_resolve_compaction_instruction(self.definition_host_id, &context_json) {
+                Ok(promise) => promise,
+                Err(error) => {
+                    return Box::pin(async move {
+                        Err(NanocodexError::InvalidRequest(format!(
+                            "failed to start compaction instruction resolution: {}",
+                            host_error_message(&error)
+                        )))
+                    });
+                }
+            };
+        let cancel = Reflect::get(&promise, &JsValue::from_str("cancel"))
+            .ok()
+            .and_then(|value| value.dyn_into::<Function>().ok());
+        Box::pin(JavaScriptCompactionInstructionFuture {
+            future: JsFuture::from(promise),
+            cancel,
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -535,7 +615,11 @@ impl CodeModeHost for JavaScriptCodeModeHost {
             let standard = match definition.name() {
                 name if name == StandardTool::WriteStdin.name() => Some(StandardTool::WriteStdin),
                 name if name == StandardTool::UpdatePlan.name() => Some(StandardTool::UpdatePlan),
-                name if name == StandardTool::ApplyPatch.name() => Some(StandardTool::ApplyPatch),
+                name if name == StandardTool::ApplyPatch.name()
+                    && matches!(definition, ToolDefinition::Function { .. }) =>
+                {
+                    Some(StandardTool::ApplyPatch)
+                }
                 name if name == StandardTool::ViewImage.name() => Some(StandardTool::ViewImage),
                 _ => None,
             };
@@ -570,9 +654,6 @@ impl CodeModeHost for JavaScriptCodeModeHost {
         context: ToolContext<'a>,
     ) -> HostFuture<'a, Result<ToolOutput, CodeModeHostError>> {
         Box::pin(async move {
-            if name == StandardTool::ApplyPatch.name() {
-                return execute_browser_apply_patch(input, context.session_id()).await;
-            }
             let input = match input {
                 ToolInput::Function(input) => input.get().to_owned(),
                 ToolInput::Freeform(input) => serde_json::to_string(&input).map_err(|error| {
@@ -715,17 +796,6 @@ fn decode_code_execution(value: JsValue) -> Result<CodeModeExecution, CodeModeHo
     })
 }
 
-async fn execute_browser_apply_patch(
-    input: ToolInput,
-    session_id: &str,
-) -> Result<ToolOutput, CodeModeHostError> {
-    let patch = input
-        .into_freeform()
-        .map_err(|error| CodeModeHostError::new(format!("invalid apply_patch input: {error}")))?;
-    let summary = apply_browser_patch_plan(&patch, session_id).await?;
-    Ok(ToolOutput::text(summary).with_structured_result(serde_json::json!({})))
-}
-
 async fn apply_browser_patch_plan(
     patch: &str,
     session_id: &str,
@@ -810,6 +880,8 @@ struct WasmConfig {
     additional_instructions: Option<String>,
     #[serde(default)]
     companion_compaction_instruction: Option<String>,
+    #[serde(default)]
+    dynamic_compaction_instruction: bool,
     #[serde(default)]
     session_id: Option<String>,
     #[serde(default)]
@@ -1303,6 +1375,13 @@ impl WasmNanocodex {
         if let Some(instruction) = config.companion_compaction_instruction {
             builder = builder.companion_compaction_instruction(instruction);
         }
+        if config.dynamic_compaction_instruction {
+            builder = builder.compaction_instruction_resolver(Arc::new(
+                JavaScriptCompactionInstructionResolver {
+                    definition_host_id: host_definition_id,
+                },
+            ));
+        }
         if let Some(session_id) = config.session_id {
             builder = builder.session_id(session_id.parse::<SessionId>().map_err(js_error)?);
         }
@@ -1781,6 +1860,33 @@ impl WasmNanocodex {
     /// Throws when compaction or the agent driver fails.
     pub async fn compact(&self) -> Result<(), JsValue> {
         self.inner.compact().await.map_err(js_error)
+    }
+
+    /// Compacts retained history and returns the private replacement mapping.
+    ///
+    /// The serialized result includes the generated summary, the replaced
+    /// pre-compaction range, retained tail identities, and the complete
+    /// post-compaction session context for custom host compaction. It is
+    /// `null` when provider-default compaction is active.
+    #[wasm_bindgen(js_name = compactOutcome)]
+    pub async fn compact_outcome(&self) -> Result<String, JsValue> {
+        let outcome = self.inner.compact_with_outcome().await.map_err(js_error)?;
+        serialize_compaction_outcome(outcome)
+    }
+
+    /// Serializes the latest committed, resumable session snapshot.
+    ///
+    /// This is the engine-owned checkpoint at the latest completed safe
+    /// boundary. After manual compaction, it therefore captures the exact
+    /// post-install history that can be supplied to a fresh Agent instance.
+    ///
+    /// # Errors
+    ///
+    /// Rejects before the first committed boundary, after the driver stops,
+    /// or when serialization fails.
+    pub async fn snapshot(&self) -> Result<String, JsValue> {
+        let snapshot = self.inner.snapshot().await.map_err(js_error)?;
+        serde_json::to_string(&snapshot).map_err(js_error)
     }
 
     /// Appends adapter-owned developer context at the next safe model boundary.
@@ -3106,6 +3212,43 @@ fn serialize_session_context(context: AgentSessionContext) -> Result<String, JsV
         workspace: context.workspace(),
         history: context.history(),
     })
+    .map_err(js_error)
+}
+
+fn serialize_compaction_outcome(outcome: Option<CompactionOutcome>) -> Result<String, JsValue> {
+    let Some(outcome) = outcome else {
+        return Ok("null".to_owned());
+    };
+    let trigger = match outcome.trigger() {
+        CompactionTrigger::Manual => "manual",
+        CompactionTrigger::Automatic => "automatic",
+    };
+    let retained_tail = outcome
+        .retained_tail()
+        .iter()
+        .map(|item| {
+            serde_json::json!({
+                "index": item.index(),
+                "kind": item.kind(),
+                "id": item.id(),
+                "call_id": item.call_id(),
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string(&serde_json::json!({
+        "revision": outcome.revision().to_string(),
+        "trigger": trigger,
+        "summary": outcome.summary(),
+        "replaced_history": {
+            "start": outcome.replaced_history().start(),
+            "end": outcome.replaced_history().end(),
+        },
+        "retained_tail": retained_tail,
+        "context": {
+            "workspace": outcome.context().workspace(),
+            "history": outcome.context().history(),
+        },
+    }))
     .map_err(js_error)
 }
 

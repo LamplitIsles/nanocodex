@@ -39,8 +39,12 @@ use tower::Service;
 use tracing::{Instrument, info, info_span};
 
 #[cfg(feature = "openai")]
+use crate::compaction::CompactionInstructionResolver;
+#[cfg(feature = "openai")]
 use crate::prompt_cache::{ModelPromptCache, SharedPromptCache};
-use crate::{NanocodexError, Result, session::SessionSnapshot, usage::TurnUsage};
+use crate::{
+    CompactionOutcome, NanocodexError, Result, session::SessionSnapshot, usage::TurnUsage,
+};
 #[cfg(feature = "openai")]
 use crate::{
     model::run::{

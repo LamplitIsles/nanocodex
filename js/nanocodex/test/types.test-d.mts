@@ -6,6 +6,7 @@ import {
   ChatGptSubscription,
   type AccountsWallet,
   type CostStatus,
+  type CustomToolFormat,
   type LifecycleTurn,
   type LifecycleTurnResult,
   type McpServer,
@@ -14,6 +15,7 @@ import {
   Subagents,
   type SessionSnapshot,
   type Tool,
+  type ToolDefinition,
   Transport,
   type Turn,
   type TurnResult,
@@ -195,6 +197,8 @@ async function check() {
     onFailure(error) { error.message; },
   };
   await createWorkerAgent(workerResource, workerOptions);
+  // @ts-expect-error function-valued compaction resolvers cannot cross the Worker boundary.
+  await createWorkerAgent({ harness: false, resolveCompactionInstruction: () => "private" });
   // @ts-expect-error non-disabled preparation requires one stable harness identity.
   await prepareWorkerAgent({ origin: "https://example.com" });
   const parallelTool: Tool = {
@@ -202,6 +206,26 @@ async function check() {
     supportsParallelToolCalls: true,
     handler: async (_input, context) => context.model.length > 0 && context.signal.aborted,
   };
+  const rawApplyPatchDefinition: ToolDefinition = {
+    type: "custom",
+    name: "ignored-by-the-router",
+    description: "Apply a raw patch string.",
+    format: {
+      type: "grammar",
+      syntax: "lark",
+      definition: 'start: "patch"',
+    } satisfies CustomToolFormat,
+  };
+  const rawApplyPatchTool: Tool = {
+    description: "Apply a raw patch string.",
+    definition: rawApplyPatchDefinition,
+    handler(input, context) {
+      if (typeof input !== "string") throw new Error("raw input required");
+      context.callId;
+      return input;
+    },
+  };
+  void rawApplyPatchTool;
   const parallelMcp: McpServer = {
     url: "https://mcp.example.com",
     supportsParallelToolCalls: false,
@@ -462,7 +486,7 @@ async function check() {
   void usage;
   void costStatus;
 
-  await Agent.create({ transport: Transport.openAi({ apiKey }), resume: snapshot });
+  await Agent.create({ transport: Transport.openAi({ apiKey }), resume: snapshot, subagents: false });
   const tempoProvider = await createTempoProviderFromAccounts({
     wallet: accountsWallet,
     accessKey: "0x0000000000000000000000000000000000000001",
