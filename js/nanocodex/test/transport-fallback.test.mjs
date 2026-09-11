@@ -122,6 +122,51 @@ test("Node WASM falls back to HTTP/SSE and keeps the session on SSE", async () =
   }
 });
 
+test("Node WASM reports HTTP header timeouts as https_timeout and recovers", async (t) => {
+  const realSetTimeout = globalThis.setTimeout;
+  let headerDeadlines = 0;
+  t.mock.method(globalThis, "setTimeout", (callback, delay, ...args) => {
+    if (delay === 60_000 && ++headerDeadlines === 1) delay = 0;
+    return realSetTimeout(callback, delay, ...args);
+  });
+  const fixture = await startFallbackFixture(async (_request, response) => {
+    await new Promise((resolve) => realSetTimeout(resolve, 20));
+    if (response.destroyed) return;
+    await sendSse(response, completedResponse("timeout-recovered", [{
+      type: "message", role: "assistant",
+      content: [{ type: "output_text", text: "recovered after header timeout" }],
+    }]));
+  });
+  const agent = await Agent.create({
+    transport: Transport.openAi({
+      apiKey: "fake", websocketUrl: fixture.websocketUrl,
+      apiBaseUrl: fixture.apiBaseUrl, websocketWarmup: false,
+    }),
+    model: "gpt-5.6-sol", thinking: "none", toolMode: "direct",
+    sessionId: "018f1f9a-7b3c-7a20-8000-000000000041",
+  });
+  const events = [];
+  const watch = agent.events.watch();
+  watch.onEvent((event) => events.push(event));
+  let turn;
+  try {
+    turn = agent.turn.prompt({ input: "Recover after delayed headers." });
+    const result = await bounded(turn.result(), "header timeout recovery");
+    assert.equal(result.finalMessage, "recovered after header timeout");
+    result.dispose();
+    assert.equal(headerDeadlines, 2);
+    const retry = events.find((event) => event.type === "model.attempt.retrying"
+      && event.payload.error_class === "https_timeout");
+    assert.ok(retry, "the timeout classification must survive JS, WASM, and Rust");
+    assert.doesNotMatch(JSON.stringify(retry.payload), /host\.mjs:\d/);
+  } finally {
+    turn?.dispose();
+    watch.off();
+    await agent.session.shutdown();
+    await fixture.close();
+  }
+});
+
 test("Node WASM does not fall back for authorization or request rejection", async () => {
   for (const [label, status, body, upgradeOptions] of [
     ["unauthorized", 401, "API key is missing", {}],

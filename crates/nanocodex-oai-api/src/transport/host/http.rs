@@ -154,10 +154,11 @@ fn map_host_error(error: HostError) -> ResponsesError {
         HostError::Transport {
             detail,
             reconnectable,
+            timeout,
         } => ResponsesError::HttpRequest {
             detail,
             retryable: reconnectable,
-            timeout: false,
+            timeout,
         },
     }
 }

@@ -173,6 +173,8 @@ enum HostFailureWire {
         detail: String,
         #[serde(default)]
         reconnectable: bool,
+        #[serde(default)]
+        timeout: bool,
     },
     HandshakeRejected {
         status: u16,
@@ -377,7 +379,12 @@ fn decode_host_error(error: &JsValue, reconnectable: bool) -> HostError {
         HostFailureWire::Transport {
             detail,
             reconnectable,
-        } => HostError::new(detail).with_reconnectable(reconnectable),
+            timeout,
+        } => HostError::Transport {
+            detail,
+            reconnectable,
+            timeout,
+        },
         HostFailureWire::HandshakeRejected {
             status,
             body,

@@ -419,6 +419,8 @@ pub enum HostError {
         detail: String,
         /// Whether replacing the connection may safely recover.
         reconnectable: bool,
+        /// Whether the operation exceeded its deadline.
+        timeout: bool,
     },
     /// The provider rejected the WebSocket handshake.
     #[error("WebSocket handshake was rejected with HTTP {status}: {body}")]
@@ -449,6 +451,7 @@ impl HostError {
         Self::Transport {
             detail: detail.into(),
             reconnectable: false,
+            timeout: false,
         }
     }
 
@@ -472,6 +475,7 @@ impl HostError {
         Self::Transport {
             detail: "the Responses host does not support HTTPS streaming".to_owned(),
             reconnectable: false,
+            timeout: false,
         }
     }
 
@@ -479,9 +483,12 @@ impl HostError {
     #[must_use]
     pub fn with_reconnectable(self, reconnectable: bool) -> Self {
         match self {
-            Self::Transport { detail, .. } => Self::Transport {
+            Self::Transport {
+                detail, timeout, ..
+            } => Self::Transport {
                 detail,
                 reconnectable,
+                timeout,
             },
             rejected @ Self::HandshakeRejected { .. } => rejected,
             rejected @ Self::HttpRejected { .. } => rejected,

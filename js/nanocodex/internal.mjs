@@ -1097,8 +1097,9 @@ function httpFailure(error) {
   }
   return {
     kind: "transport",
-    detail: errorDetail(error),
+    detail: error?.message || String(error),
     reconnectable: error?.reconnectable === true,
+    timeout: error?.timeout === true,
   };
 }
 

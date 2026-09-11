@@ -20,6 +20,7 @@ const DEFAULT_MAX_QUEUED_MESSAGES = 4_096;
 const DEFAULT_MAX_QUEUED_BYTES = 32 * 1024 * 1024;
 const DEFAULT_MAX_FRAME_BYTES = 16 * 1024 * 1024;
 const DEFAULT_CONNECT_TIMEOUT_MS = 15_000;
+const HTTP_HEADERS_TIMEOUT_MS = 60_000;
 const MAX_HTTP_ERROR_BYTES = 64 * 1024;
 const MPP_CLIENT_PROTOCOL_ERROR_CLOSE_CODE = 3008;
 
@@ -240,7 +241,8 @@ export function createNodeHost(options = {}) {
       throw new Error("the Node host requires a global fetch implementation for HTTPS Responses");
     }
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), connectTimeoutMs);
+    const timeoutReason = new Error(`HTTPS Responses request headers exceeded ${HTTP_HEADERS_TIMEOUT_MS} milliseconds`);
+    const timer = setTimeout(() => controller.abort(timeoutReason), HTTP_HEADERS_TIMEOUT_MS);
     const threadId = metadata.threadId ?? sessionId;
     const headers = {
       Authorization: `Bearer ${apiKey}`,
@@ -273,6 +275,7 @@ export function createNodeHost(options = {}) {
       response: undefined,
       responsePromise: undefined,
       controller,
+      timer,
       reader: undefined,
       decoder: new TextDecoder("utf-8", { fatal: true }),
       reading: false,
@@ -288,11 +291,11 @@ export function createNodeHost(options = {}) {
       return response;
     }, (error) => {
       clearTimeout(timer);
-      const timedOut = error?.name === "AbortError";
+      const timedOut = controller.signal.reason === timeoutReason;
       const failure = new Error(timedOut
-        ? `HTTPS Responses request headers exceeded ${connectTimeoutMs} milliseconds`
-        : errorMessage(error));
-      failure.reconnectable = true;
+        ? timeoutReason.message
+        : error?.message || String(error), { cause: error });
+      failure.reconnectable = !connection.closed;
       failure.timeout = timedOut;
       throw failure;
     });
@@ -545,6 +548,7 @@ export function createNodeHost(options = {}) {
   function closeHttp(connection, handle, abort = true) {
     if (connection.closed) return;
     connection.closed = true;
+    clearTimeout(connection.timer);
     if (abort) connection.controller.abort();
     if (connection.reader) void connection.reader.cancel().catch(() => {});
     if (!connection.response && connection.responsePromise) {
