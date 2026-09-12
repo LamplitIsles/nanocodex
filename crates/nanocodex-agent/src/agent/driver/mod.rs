@@ -73,6 +73,7 @@ where
                     .compaction_instruction_resolver
                     .as_ref()
                     .map(Arc::clone),
+                self.spawner.compaction_resolver.as_ref().map(Arc::clone),
             )
         } else {
             ModelRun::new(
@@ -89,6 +90,7 @@ where
                     .compaction_instruction_resolver
                     .as_ref()
                     .map(Arc::clone),
+                self.spawner.compaction_resolver.as_ref().map(Arc::clone),
             )
         };
         let mut turn_index = 0_u64;
@@ -390,6 +392,7 @@ where
                                             latest_fork_checkpoint.as_deref(),
                                             self.workspace.as_deref(),
                                             &self.spawner.context_source,
+                                            self.spawner.config.context_window_tokens,
                                         )
                                     }
                                     Err(error) => {
@@ -426,6 +429,7 @@ where
                         latest_fork_checkpoint.as_deref(),
                         self.workspace.as_deref(),
                         &self.spawner.context_source,
+                        self.spawner.config.context_window_tokens,
                     )));
                     continue;
                 }
@@ -763,6 +767,7 @@ where
                                             latest_fork_checkpoint.as_deref(),
                                             self.workspace.as_deref(),
                                             &self.spawner.context_source,
+                                            self.spawner.config.context_window_tokens,
                                         )));
                                     }
                                     Some(Command::Snapshot { result }) => {
@@ -827,6 +832,7 @@ where
                                     Some(&checkpoint),
                                     self.workspace.as_deref(),
                                     &self.spawner.context_source,
+                                    self.spawner.config.context_window_tokens,
                                 )
                                 .map(|context| {
                                     outcome.map(|outcome| outcome.with_context(context))
@@ -955,6 +961,7 @@ where
                                         latest_fork_checkpoint.as_deref(),
                                         self.workspace.as_deref(),
                                         &self.spawner.context_source,
+                                        self.spawner.config.context_window_tokens,
                                     )
                                 }
                                 Err(error) => {
@@ -1408,6 +1415,7 @@ where
                                     checkpoint.as_deref(),
                                     self.workspace.as_deref(),
                                     &self.spawner.context_source,
+                                    self.spawner.config.context_window_tokens,
                                 )));
                             }
                             Some(Command::Snapshot { result }) => {
@@ -1676,6 +1684,7 @@ where
                                 latest_fork_checkpoint.as_deref(),
                                 self.workspace.as_deref(),
                                 &self.spawner.context_source,
+                                self.spawner.config.context_window_tokens,
                             )
                         }
                         Err(error) => {
@@ -1830,6 +1839,7 @@ where
                 .compaction_instruction_resolver
                 .as_ref()
                 .map(Arc::clone),
+            spawner.compaction_resolver.as_ref().map(Arc::clone),
         )
     } else {
         ModelRun::new(
@@ -1846,6 +1856,7 @@ where
                 .compaction_instruction_resolver
                 .as_ref()
                 .map(Arc::clone),
+            spawner.compaction_resolver.as_ref().map(Arc::clone),
         )
     }
 }
@@ -2121,12 +2132,17 @@ pub(super) fn agent_session_context(
     checkpoint: Option<&CommittedSession>,
     configured_workspace: Option<&str>,
     context_source: &ContextSource,
+    context_window_tokens: u64,
 ) -> Result<AgentSessionContext> {
     let workspace = checkpoint
         .map(|checkpoint| checkpoint.model().workspace().to_owned())
         .or_else(|| configured_workspace.map(str::to_owned))
         .map_or_else(|| context_source.resolve_workspace(None), Ok)?;
-    Ok(AgentSessionContext::new(checkpoint, workspace))
+    Ok(AgentSessionContext::new(
+        checkpoint,
+        workspace,
+        context_window_tokens,
+    ))
 }
 
 #[cfg(test)]

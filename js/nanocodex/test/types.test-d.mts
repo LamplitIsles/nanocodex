@@ -197,8 +197,16 @@ async function check() {
     onFailure(error) { error.message; },
   };
   await createWorkerAgent(workerResource, workerOptions);
-  // @ts-expect-error function-valued compaction resolvers cannot cross the Worker boundary.
-  await createWorkerAgent({ harness: false, resolveCompactionInstruction: () => "private" });
+  await createWorkerAgent({
+    harness: false,
+    // @ts-expect-error function-valued replacement resolvers cannot cross the Worker boundary.
+    resolveCompaction: () => ({ operation_id: "test", history: [] }),
+  });
+  await createWorkerAgent({
+    harness: false,
+    // @ts-expect-error function-valued instruction resolvers cannot cross the Worker boundary.
+    resolveCompactionInstruction: () => "custom instruction",
+  });
   // @ts-expect-error non-disabled preparation requires one stable harness identity.
   await prepareWorkerAgent({ origin: "https://example.com" });
   const parallelTool: Tool = {

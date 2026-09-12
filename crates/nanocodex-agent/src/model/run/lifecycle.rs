@@ -1,5 +1,7 @@
 use super::*;
 
+const DEFAULT_COMPACTION_INSTRUCTION: &str = "Create a concise private summary of the conversation for continuity. Preserve the facts, decisions, pending work, and tool state needed to continue. Do not call tools or address the user.";
+
 #[derive(Deserialize, Serialize)]
 pub(super) struct WarmupExecution {
     pub(super) response_id: String,
@@ -108,9 +110,10 @@ where
         if !self.force_compaction && active_context_tokens < auto_compact_token_limit {
             return Ok(false);
         }
-        let companion = self.config.companion_compaction_instruction.is_some()
-            || self.compaction_instruction_resolver.is_some();
+        let host_resolver = self.compaction_resolver.as_ref().map(Arc::clone);
+        let input_history = conversation.flattened_history();
         let previous_response_id = conversation.previous_response_id();
+        let operation_id = crate::compaction::operation_id();
         let (item, _usage, server_reasoning_included) = self
             .perform_compaction(
                 after_model_call_index,
@@ -126,38 +129,71 @@ where
             .await?;
         let summary = crate::compaction::summary_text(&item);
         conversation.observe_server_reasoning(server_reasoning_included);
-        let installation = match phase {
-            CompactionPhase::PreTurn => conversation.install_pre_turn_compaction(
-                item,
-                factory.profile().prefix(),
-                companion,
-            ),
-            CompactionPhase::MidTurn => {
-                let snapshot = snapshot.ok_or(NanocodexError::InvalidAttemptState {
-                    detail: "mid-turn compaction is missing its context snapshot",
-                })?;
-                let canonical_context = snapshot.full_item();
-                conversation.install_mid_turn_compaction(
-                    item,
-                    developer_context(),
-                    canonical_context,
-                    factory.profile().prefix(),
-                    companion,
-                )
+        if let Some(resolver) = host_resolver {
+            let summary = summary.ok_or(NanocodexError::InvalidAttemptState {
+                detail: "host compaction did not produce a private summary",
+            })?;
+            // The summary request used the provider continuation. Before the
+            // host can decide, force a replay baseline so a rejected or
+            // cancelled decision cannot leave that continuation half-owned.
+            conversation.reset_for_full_request();
+            let context = crate::CompactionContext {
+                after_model_call_index,
+                phase: match phase {
+                    CompactionPhase::PreTurn => crate::CompactionPhase::PreTurn,
+                    CompactionPhase::MidTurn => crate::CompactionPhase::MidTurn,
+                },
+                trigger: crate::CompactionTrigger::Automatic,
+                active_context_tokens,
+                context_window_tokens: self.config.context_window_tokens,
+                auto_compact_token_limit,
+                history_revision: conversation.history_revision(),
+                operation_id,
+                history: crate::compaction::context_history(&input_history),
+                summary: summary.clone(),
+            };
+            let decision = resolver.resolve(context.clone()).await?;
+            let (history, provenance) =
+                crate::compaction::materialize_decision(&context, decision)?;
+            if let (CompactionPhase::MidTurn, Some(snapshot)) = (phase, snapshot) {
+                conversation.set_canonical_context(snapshot.full_item());
             }
-        };
-        if let Some(installation) = installation {
+            let installation = conversation.install_host_compaction(
+                history,
+                provenance,
+                factory.profile().prefix(),
+            )?;
             let outcome = crate::compaction::outcome_from_installation(
                 installation,
+                &input_history,
                 conversation.history_revision(),
                 crate::CompactionTrigger::Automatic,
-                summary,
+                Some(summary),
             )
             .with_context(crate::AgentSessionContext::from_backend(
                 workspace.to_owned(),
                 conversation.flattened_history(),
+                self.config.context_window_tokens,
+                conversation.active_context_tokens(),
             ));
             self.emit_compaction_replaced(after_model_call_index, phase, &outcome)?;
+        } else {
+            match phase {
+                CompactionPhase::PreTurn => {
+                    conversation.install_pre_turn_compaction(item, factory.profile().prefix())
+                }
+                CompactionPhase::MidTurn => {
+                    let snapshot = snapshot.ok_or(NanocodexError::InvalidAttemptState {
+                        detail: "mid-turn compaction is missing its context snapshot",
+                    })?;
+                    conversation.install_mid_turn_compaction(
+                        item,
+                        developer_context(),
+                        snapshot.full_item(),
+                        factory.profile().prefix(),
+                    );
+                }
+            }
         }
         self.force_compaction = false;
         Ok(true)
@@ -437,16 +473,6 @@ where
             }
             None => history,
         };
-        if retained_request.is_none()
-            && self.config.companion_compaction_instruction.is_none()
-            && self.compaction_instruction_resolver.is_none()
-        {
-            compaction::trim_tool_outputs_to_fit_context_window(
-                &mut history,
-                factory.profile().prefix(),
-                self.config.context_window_tokens,
-            );
-        }
         let instruction = if let Some(resolver) = &self.compaction_instruction_resolver {
             let context = crate::CompactionInstructionContext {
                 after_model_call_index,
@@ -462,11 +488,20 @@ where
                 resolver.resolve(context).await?,
             )?)
         } else {
-            self.config.companion_compaction_instruction.clone()
+            None
         };
-        if let Some(instruction) = instruction {
+        let host_owned = self.compaction_resolver.is_some();
+        let host_owned = host_owned || instruction.is_some();
+        if retained_request.is_none() && !host_owned {
+            compaction::trim_tool_outputs_to_fit_context_window(
+                &mut history,
+                factory.profile().prefix(),
+                self.config.context_window_tokens,
+            );
+        }
+        if host_owned {
             return self
-                .perform_companion_compaction(
+                .perform_host_compaction(
                     after_model_call_index,
                     history,
                     previous_response_id,
@@ -476,8 +511,8 @@ where
                     model,
                     thinking,
                     fast_mode,
-                    instruction,
                     incremental_start,
+                    instruction,
                 )
                 .await;
         }
@@ -641,14 +676,15 @@ where
         Ok((item, usage, server_reasoning_included))
     }
 
-    /// Executes consumer-owned continuity summarization as a normal generation.
+    /// Executes engine-owned summary generation before a host chooses the
+    /// replacement history.
     ///
     /// The request uses the live profile and native continuation/full-replay
     /// policy. The returned text is wrapped as a
     /// private developer context item; it is installed by the caller only
     /// after this method has validated the response completely.
     #[allow(clippy::too_many_arguments)]
-    async fn perform_companion_compaction(
+    async fn perform_host_compaction(
         &mut self,
         after_model_call_index: u32,
         mut history: nanocodex_oai_api::responses::ResponseHistory,
@@ -659,8 +695,8 @@ where
         model: Model,
         thinking: Thinking,
         fast_mode: bool,
-        instruction: Arc<str>,
         incremental_start: usize,
+        instruction: Option<Arc<str>>,
     ) -> Result<(ResponseItem, Option<Usage>, bool)> {
         let started_at = Instant::now();
         self.stats.compactions += 1;
@@ -675,7 +711,11 @@ where
         )?;
         history.push(ResponseItem::message(
             MessageRole::Developer,
-            [ContentItem::input_text(instruction.as_ref())],
+            [ContentItem::input_text(
+                instruction
+                    .as_deref()
+                    .unwrap_or(DEFAULT_COMPACTION_INSTRUCTION),
+            )],
         ));
         let request = factory
             .generation(
@@ -712,7 +752,7 @@ where
         let server_reasoning_included = success.server_reasoning_included();
         let ResponsesOutput::Generation(response) = success.into_output() else {
             let error = NanocodexError::InvalidAttemptState {
-                detail: "Companion compaction returned a non-generation response",
+                detail: "host compaction returned a non-generation response",
             };
             span.record("status", "failed");
             span.record("otel.status_code", "ERROR");
@@ -722,7 +762,7 @@ where
         validate_provider_response_id(&response.id)?;
         if !response.code_calls.is_empty() {
             let error = NanocodexError::InvalidAttemptState {
-                detail: "Companion compaction attempted to execute a tool",
+                detail: "host compaction attempted to execute a tool",
             };
             span.record("status", "failed");
             span.record("otel.status_code", "ERROR");
@@ -734,7 +774,7 @@ where
             .filter(|message| !message.trim().is_empty())
         else {
             let error = NanocodexError::InvalidAttemptState {
-                detail: "Companion compaction returned no summary text",
+                detail: "host compaction returned no summary text",
             };
             span.record("status", "failed");
             span.record("otel.status_code", "ERROR");

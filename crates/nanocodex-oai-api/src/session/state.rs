@@ -338,26 +338,62 @@ impl ManagedSessionState {
         self.history_revision = self.history_revision.saturating_add(1);
     }
 
-    /// Installs a consumer-owned summary and the newest complete conversation
-    /// tail, then forces the next request to replay the replacement history.
-    #[doc(hidden)]
-    pub fn install_companion_compaction(
+    /// Installs a host-validated replacement history atomically and forces the
+    /// next request to replay it in full.
+    ///
+    /// All structural validation happens before the context manager is
+    /// mutated. The provenance vector is kept beside the installed history so
+    /// callers cannot reconstruct a contiguous-tail assumption after the
+    /// replacement.
+    pub fn install_host_compaction(
         &mut self,
-        summary: ResponseItem,
-        initial_context: impl IntoIterator<Item = ResponseItem>,
+        mut history: Vec<ResponseItem>,
+        provenance: Vec<Option<usize>>,
         request_prefix: &[ResponseItem],
-    ) -> compaction::CompactionInstallation {
-        let initial_context = initial_context.into_iter().collect::<Vec<_>>();
-        let installation = compaction::install_companion_history(
-            &self.context.flattened_items(),
-            &initial_context,
-            summary,
-        );
+    ) -> Result<compaction::CompactionInstallation, ManagedSessionStateError> {
+        if history.len() != provenance.len() {
+            return Err(ManagedSessionStateError::UnsupportedHistoryItem);
+        }
+        if history.iter().any(|item| {
+            matches!(
+                item,
+                ResponseItem::AdditionalTools { .. }
+                    | ResponseItem::ConfigurationUpdate { .. }
+                    | ResponseItem::CompactionTrigger {}
+                    | ResponseItem::Other(_)
+            )
+        }) {
+            return Err(ManagedSessionStateError::UnsupportedHistoryItem);
+        }
+        let prefix_values = request_prefix
+            .iter()
+            .filter_map(|item| serde_json::to_value(item).ok())
+            .collect::<Vec<_>>();
+        if history.iter().any(|item| {
+            serde_json::to_value(item).ok().is_some_and(|value| {
+                prefix_values
+                    .iter()
+                    .any(|prefix| equivalent_without_id(prefix, &value))
+            })
+        }) {
+            return Err(ManagedSessionStateError::UnsupportedHistoryItem);
+        }
+        assign_missing_response_item_ids(&mut history);
+        if !has_well_formed_tool_calls(&history) {
+            return Err(ManagedSessionStateError::MalformedToolCalls);
+        }
+        let accepted = ContextManager::new(history.clone());
+        if accepted.len() != history.len() {
+            return Err(ManagedSessionStateError::UnsupportedHistoryItem);
+        }
         self.context
-            .replace_and_recompute(installation.history.clone(), request_prefix);
+            .replace_and_recompute(history.clone(), request_prefix);
         self.reset_for_full_request();
         self.history_revision = self.history_revision.saturating_add(1);
-        installation
+        Ok(compaction::CompactionInstallation {
+            history,
+            provenance,
+        })
     }
 
     /// Returns the monotonic number of installed history replacements.
@@ -383,6 +419,18 @@ pub enum ManagedSessionStateError {
     /// A completed response was missing its provider continuation identity.
     #[error("completed response did not have a response ID")]
     MissingResponseId,
+}
+
+fn equivalent_without_id(left: &serde_json::Value, right: &serde_json::Value) -> bool {
+    let mut left = left.clone();
+    let mut right = right.clone();
+    if let Some(object) = left.as_object_mut() {
+        object.remove("id");
+    }
+    if let Some(object) = right.as_object_mut() {
+        object.remove("id");
+    }
+    left == right
 }
 
 #[cfg(test)]

@@ -29,6 +29,10 @@ export function createNodeHost(options = {}) {
     && typeof options.resolveCompactionInstruction !== "function") {
     throw new TypeError("resolveCompactionInstruction must be a function");
   }
+  if (options.resolveCompaction !== undefined
+    && typeof options.resolveCompaction !== "function") {
+    throw new TypeError("resolveCompaction must be a function");
+  }
   const toolMode = options.toolMode ?? "code";
   if (toolMode !== "code" && toolMode !== "direct") {
     throw new TypeError("toolMode must be code or direct");
@@ -622,6 +626,12 @@ export function createNodeHost(options = {}) {
     cancelCode: code.cancel,
     toolMode: () => toolMode,
     toolDefinitions: code.toolDefinitions,
+    resolveCompaction: (context, signal) => {
+      if (typeof options.resolveCompaction !== "function") {
+        throw new Error("resolveCompaction is not configured");
+      }
+      return options.resolveCompaction(context, signal);
+    },
     resolveCompactionInstruction: (context, signal) => {
       if (typeof options.resolveCompactionInstruction !== "function") {
         throw new Error("resolveCompactionInstruction is not configured");

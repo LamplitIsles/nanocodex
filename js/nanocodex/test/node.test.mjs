@@ -30,6 +30,8 @@ const SESSION_IDS = Object.freeze({
   dynamicCompaction: "018f1f9a-7b3c-7a0e-8000-00000000000e",
   failedResolverCompaction: "018f1f9a-7b3c-7a0f-8000-00000000000f",
   cancelledResolverCompaction: "018f1f9a-7b3c-7a10-8000-000000000010",
+  staleResolverCompaction: "018f1f9a-7b3c-7a16-8000-000000000016",
+  cancelledReplacementCompaction: "018f1f9a-7b3c-7a17-8000-000000000017",
   snapshotBoundary: "018f1f9a-7b3c-7a11-8000-000000000011",
   snapshotCompaction: "018f1f9a-7b3c-7a12-8000-000000000012",
   snapshotResumed: "018f1f9a-7b3c-7a13-8000-000000000013",
@@ -44,6 +46,16 @@ const createWarmAgent = ({ apiKey, websocketUrl, ...options }) => Agent.create({
   ...options,
   transport: Transport.openAi({ apiKey, websocketUrl, websocketWarmup: true }),
 });
+const hostReplacement = (context, keep = () => true) => ({
+  operation_id: context.operation_id,
+  history: [
+    { kind: "summary", text: context.summary },
+    ...context.history
+      .filter((entry) => keep(entry.item))
+      .map((entry) => ({ kind: "original", origin: entry.origin })),
+  ],
+});
+const CUSTOM_SUMMARY_INSTRUCTION = "Host-selected summary instruction";
 const PACKAGE_VERSION = JSON.parse(
   await readFile(new URL("../package.json", import.meta.url), "utf8"),
 ).version;
@@ -1350,7 +1362,10 @@ test("Node WASM snapshots the committed post-compaction boundary for cold resume
     thinking: "none",
     sessionId: SESSION_IDS.snapshotCompaction,
     historySeed,
-    companionCompactionInstruction: "Keep the selected facts and complete tool tail.",
+    resolveCompaction: async (context) => hostReplacement(context, (item) => {
+      const encoded = JSON.stringify(item);
+      return !encoded.includes("OLD_REMOVED_MARKER");
+    }),
     tools,
   });
   try {
@@ -1369,11 +1384,16 @@ test("Node WASM snapshots the committed post-compaction boundary for cold resume
     const snapshot = await agent.session.snapshot();
     assert.equal(outcome.trigger, "manual");
     assert.equal(outcome.summary, "COMPACTED_SNAPSHOT_SUMMARY");
+    assert.equal(outcome.context.context_window_tokens, 272000);
+    assert.ok(outcome.context.active_context_tokens > 0);
     assert.deepEqual(snapshot.history, outcome.context.history);
     assert.match(JSON.stringify(snapshot.history), /COMPACTED_SNAPSHOT_SUMMARY/);
     assert.match(JSON.stringify(snapshot.history), /RETAINED_USER_MARKER/);
     assert.match(JSON.stringify(snapshot.history), /RETAINED_TOOL_MARKER/);
+    assert.match(JSON.stringify(snapshot.history), /old answer/);
     assert.doesNotMatch(JSON.stringify(snapshot.history), /OLD_REMOVED_MARKER/);
+    assert.ok(outcome.installed_history.some(({ origin }) => origin === null));
+    assert.ok(outcome.installed_history.some(({ origin }) => origin?.index === 1));
     assert.ok(Object.isFrozen(snapshot));
     assert.ok(Object.isFrozen(snapshot.history));
     assert.equal(historicalToolCalls, 0);
@@ -1420,7 +1440,7 @@ test("Node WASM snapshots the committed post-compaction boundary for cold resume
   }
 });
 
-test("Node WASM uses Companion compaction for success and preserves context on failure", async () => {
+test("Node WASM uses host-selected compaction and preserves context on failure", async () => {
   const server = await startServer();
   const events = [];
   const agent = await createWarmAgent({
@@ -1428,7 +1448,8 @@ test("Node WASM uses Companion compaction for success and preserves context on f
     websocketUrl: server.url,
     thinking: "none",
     sessionId: SESSION_IDS.right,
-    companionCompactionInstruction: "Keep durable facts and recent work.",
+    resolveCompactionInstruction: () => CUSTOM_SUMMARY_INSTRUCTION,
+    resolveCompaction: (context) => hostReplacement(context),
   });
   const watch = agent.events.watch();
   watch.onEvent((event) => events.push(event));
@@ -1444,7 +1465,7 @@ test("Node WASM uses Companion compaction for success and preserves context on f
       const compact = await reader.next();
       readerState.compact = compact;
       assert.equal(compact.previous_response_id, "resp-companion-first");
-      assert.match(JSON.stringify(compact.input), /Keep durable facts and recent work/);
+      assert.match(JSON.stringify(compact.input), new RegExp(CUSTOM_SUMMARY_INSTRUCTION));
       sendStreamedFinal(socket, "resp-companion-summary", "PRIVATE_SUMMARY_MARKER");
       const followOn = await reader.next();
       readerState.followOn = followOn;
@@ -1504,10 +1525,10 @@ test("Node WASM resolves every manual compaction and returns ordered private out
     websocketUrl: server.url,
     thinking: "none",
     sessionId: SESSION_IDS.dynamicCompaction,
-    resolveCompactionInstruction: async (context, signal) => {
+    resolveCompaction: async (context, signal) => {
       assert.equal(signal.aborted, false);
       resolverCalls.push(context);
-      return `Keep the dynamic facts for compaction ${resolverCalls.length}.`;
+      return hostReplacement(context);
     },
   });
   const watch = agent.events.watch();
@@ -1524,7 +1545,7 @@ test("Node WASM resolves every manual compaction and returns ordered private out
 
       const firstSummary = await reader.next();
       assert.equal(firstSummary.previous_response_id, "resp-dynamic-first");
-      assert.match(JSON.stringify(firstSummary.input), /Keep the dynamic facts for compaction 1/);
+      assert.match(JSON.stringify(firstSummary.input), /Create a concise private summary/);
       sendFinal(socket, "resp-dynamic-summary-1", "DYNAMIC_SUMMARY_ONE");
 
       const followOn = await reader.next();
@@ -1534,7 +1555,7 @@ test("Node WASM resolves every manual compaction and returns ordered private out
 
       const secondSummary = await reader.next();
       assert.equal(secondSummary.previous_response_id, "resp-dynamic-follow-on");
-      assert.match(JSON.stringify(secondSummary.input), /Keep the dynamic facts for compaction 2/);
+      assert.match(JSON.stringify(secondSummary.input), /Create a concise private summary/);
       sendFinal(socket, "resp-dynamic-summary-2", "DYNAMIC_SUMMARY_TWO");
     })();
 
@@ -1546,19 +1567,23 @@ test("Node WASM resolves every manual compaction and returns ordered private out
     assert.equal(firstOutcome.revision, "1");
     assert.equal(firstOutcome.trigger, "manual");
     assert.equal(firstOutcome.summary, "DYNAMIC_SUMMARY_ONE");
-    assert.equal(firstOutcome.replaced_history.start, 0);
-    assert.ok(firstOutcome.replaced_history.end > 0);
-    assert.ok(firstOutcome.retained_tail.some((item) => item.kind === "message"));
+    assert.ok(firstOutcome.installed_history.some(({ origin }) => origin !== null));
     assert.match(JSON.stringify(firstOutcome.context.history), /DYNAMIC_SUMMARY_ONE/);
 
     assert.equal(
       (await agent.turn.prompt({ input: "after dynamic compaction" }).result()).finalMessage,
       "second dynamic answer",
     );
+    const afterTurnContext = await agent.session.context();
+    assert.equal(afterTurnContext.context_window_tokens, 272000);
+    assert.ok(
+      afterTurnContext.active_context_tokens >= 12,
+      "a completed model response updates active context accounting from provider usage",
+    );
     const secondOutcome = await agent.session.compact();
     assert.equal(secondOutcome.revision, "2");
     assert.equal(secondOutcome.summary, "DYNAMIC_SUMMARY_TWO");
-    assert.ok(secondOutcome.replaced_history.end > firstOutcome.replaced_history.end);
+    assert.equal(secondOutcome.installed_history[0].origin, null);
     assert.match(JSON.stringify(secondOutcome.context.history), /DYNAMIC_SUMMARY_TWO/);
     await scenario;
     const replacements = events.filter((event) => event.type === "model.compaction.replaced");
@@ -1591,7 +1616,7 @@ test("Node WASM resolves every manual compaction and returns ordered private out
   );
 });
 
-test("Node WASM resolver failure preserves the warm history without a summary request", async () => {
+test("Node WASM custom instruction failure preserves warm history before summary dispatch", async () => {
   const server = await startServer();
   let resolverCalls = 0;
   const agent = await createWarmAgent({
@@ -1607,11 +1632,15 @@ test("Node WASM resolver failure preserves the warm history without a summary re
   try {
     const scenario = (async () => {
       const socket = await server.connection;
+      const requests = [];
+      socket.on("message", (data) => requests.push(JSON.parse(data.toString("utf8"))));
       const reader = messageReader(socket);
       await reader.next();
       sendWarmup(socket, "resp-resolver-failure-warmup");
       const first = await reader.next();
       sendFinal(socket, "resp-resolver-failure-first", "before resolver failure");
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(requests.length, 2, "failed custom instruction must not dispatch a summary");
       const recovered = await reader.next();
       assert.equal(recovered.previous_response_id, "resp-resolver-failure-first");
       const encoded = JSON.stringify(recovered.input);
@@ -1638,16 +1667,104 @@ test("Node WASM resolver failure preserves the warm history without a summary re
   }
 });
 
-test("Node WASM cancels a pending host compaction resolver on shutdown", async () => {
+test("Node WASM rejects an empty custom instruction before summary dispatch", async () => {
+  const server = await startServer();
+  const agent = await createWarmAgent({
+    apiKey: "test-key",
+    websocketUrl: server.url,
+    thinking: "none",
+    sessionId: SESSION_IDS.cancelledResolverCompaction,
+    resolveCompactionInstruction: () => "   ",
+  });
+  try {
+    const scenario = (async () => {
+      const socket = await server.connection;
+      const requests = [];
+      socket.on("message", (data) => requests.push(JSON.parse(data.toString("utf8"))));
+      const reader = messageReader(socket);
+      await reader.next();
+      sendWarmup(socket, "resp-empty-instruction-warmup");
+      await reader.next();
+      sendFinal(socket, "resp-empty-instruction-first", "before empty instruction");
+      return requests;
+    })();
+    assert.equal(
+      (await agent.turn.prompt({ input: "before empty instruction" }).result()).finalMessage,
+      "before empty instruction",
+    );
+    const snapshotBeforeFailure = await agent.session.snapshot();
+    await assert.rejects(agent.session.compact(), /non-empty string/);
+    assert.deepEqual(await agent.session.snapshot(), snapshotBeforeFailure);
+    const requests = await scenario;
+    assert.equal(requests.length, 2, "empty custom instruction must not dispatch a summary");
+  } finally {
+    await agent.session.shutdown().catch(() => {});
+    await server.close();
+  }
+});
+
+test("Node WASM rejects a stale replacement decision on a failed-operation retry", async () => {
+  const server = await startServer();
+  let resolverCalls = 0;
+  let staleDecision;
+  const agent = await createWarmAgent({
+    apiKey: "test-key",
+    websocketUrl: server.url,
+    thinking: "none",
+    sessionId: SESSION_IDS.staleResolverCompaction,
+    resolveCompaction: (context) => {
+      resolverCalls += 1;
+      if (resolverCalls === 1) {
+        staleDecision = hostReplacement(context);
+        throw new Error("first replacement failed");
+      }
+      return staleDecision;
+    },
+  });
+  try {
+    const scenario = (async () => {
+      const socket = await server.connection;
+      const reader = messageReader(socket);
+      await reader.next();
+      sendWarmup(socket, "resp-stale-retry-warmup");
+      await reader.next();
+      sendFinal(socket, "resp-stale-retry-first", "before stale retry");
+      const firstSummary = await reader.next();
+      assert.match(JSON.stringify(firstSummary.input), /Create a concise private summary/);
+      sendFinal(socket, "resp-stale-retry-summary-1", "first summary");
+      const secondSummary = await reader.next();
+      assert.match(JSON.stringify(secondSummary.input), /Create a concise private summary/);
+      sendFinal(socket, "resp-stale-retry-summary-2", "second summary");
+    })();
+    assert.equal(
+      (await agent.turn.prompt({ input: "before stale retry" }).result()).finalMessage,
+      "before stale retry",
+    );
+    const snapshotBeforeFailure = await agent.session.snapshot();
+    await assert.rejects(agent.session.compact(), /first replacement failed/);
+    await assert.rejects(agent.session.compact(), /different operation/);
+    assert.equal(resolverCalls, 2);
+    assert.deepEqual(await agent.session.snapshot(), snapshotBeforeFailure);
+    await scenario;
+  } finally {
+    await agent.session.shutdown().catch(() => {});
+    await server.close();
+  }
+});
+
+test("Node WASM cancels a pending custom instruction resolver on shutdown", async () => {
   const server = await startServer();
   let resolveAborted;
   const aborted = new Promise((resolve) => { resolveAborted = resolve; });
+  let resolveStarted;
+  const started = new Promise((resolve) => { resolveStarted = resolve; });
   const agent = await createWarmAgent({
     apiKey: "test-key",
     websocketUrl: server.url,
     thinking: "none",
     sessionId: SESSION_IDS.cancelledResolverCompaction,
     resolveCompactionInstruction: (_context, signal) => new Promise((_resolve, reject) => {
+      resolveStarted();
       signal.addEventListener("abort", () => {
         resolveAborted();
         reject(signal.reason ?? new Error("resolver cancelled"));
@@ -1668,6 +1785,7 @@ test("Node WASM cancels a pending host compaction resolver on shutdown", async (
       "before resolver cancellation",
     );
     const compacting = agent.session.compact();
+    await bounded(started, "host resolver start");
     const shuttingDown = agent.session.shutdown();
     await bounded(aborted, "host resolver cancellation");
     await assert.rejects(compacting);
@@ -1689,7 +1807,7 @@ test("Node WASM cancels an in-flight Companion summary without publishing it", a
     sessionId: SESSION_IDS.cancelledCompanion,
     durability,
     durabilityId,
-    companionCompactionInstruction: "Keep the durable cancellation facts.",
+    resolveCompaction: (context) => hostReplacement(context),
   };
   const server = await startServer();
   let resolveSummarySeen;
@@ -1711,7 +1829,7 @@ test("Node WASM cancels an in-flight Companion summary without publishing it", a
       sendFinal(socket, "resp-cancelled-companion-first", "before cancellation");
       const summary = await reader.next();
       assert.equal(summary.previous_response_id, "resp-cancelled-companion-first");
-      assert.match(JSON.stringify(summary.input), /Keep the durable cancellation facts/);
+      assert.match(JSON.stringify(summary.input), /Create a concise private summary/);
       resolveSummarySeen(summary);
     })();
     assert.equal(
@@ -1761,6 +1879,65 @@ test("Node WASM cancels an in-flight Companion summary without publishing it", a
   }
 });
 
+test("Node WASM cancels a pending replacement resolver without publishing it", async () => {
+  let cachedDecision;
+  let resolveStarted;
+  const started = new Promise((resolve) => { resolveStarted = resolve; });
+  let resolveAborted;
+  const aborted = new Promise((resolve) => { resolveAborted = resolve; });
+  const options = {
+    apiKey: "test-key",
+    thinking: "none",
+    sessionId: SESSION_IDS.cancelledReplacementCompaction,
+    resolveCompaction: (context, signal) => {
+      cachedDecision = hostReplacement(context);
+      return new Promise((_resolve, reject) => {
+        resolveStarted();
+        signal.addEventListener("abort", () => {
+          resolveAborted();
+          reject(signal.reason ?? new Error("replacement resolver cancelled"));
+        }, { once: true });
+      });
+    },
+  };
+  const firstServer = await startServer();
+  let firstAgent;
+  try {
+    firstAgent = await createWarmAgent({ ...options, websocketUrl: firstServer.url });
+    const scenario = (async () => {
+      const socket = await firstServer.connection;
+      const reader = messageReader(socket);
+      await reader.next();
+      sendWarmup(socket, "resp-cancelled-replacement-warmup");
+      await reader.next();
+      sendFinal(socket, "resp-cancelled-replacement-first", "before replacement cancellation");
+      const summary = await reader.next();
+      assert.match(JSON.stringify(summary.input), /Create a concise private summary/);
+      sendStreamedFinal(
+        socket,
+        "resp-cancelled-replacement-summary",
+        "cancelled replacement summary",
+      );
+    })();
+    assert.equal(
+      (await firstAgent.turn.prompt({ input: "before replacement cancellation" }).result())
+        .finalMessage,
+      "before replacement cancellation",
+    );
+    const compacting = firstAgent.session.compact();
+    await bounded(started, "replacement resolver start");
+    await firstAgent.session.shutdown();
+    firstAgent = undefined;
+    await bounded(aborted, "replacement resolver cancellation");
+    await assert.rejects(compacting);
+    await bounded(scenario, "cancelled replacement summary");
+    assert.ok(cachedDecision, "the cancelled resolver must have received a decision snapshot");
+  } finally {
+    if (firstAgent) await firstAgent.session.shutdown().catch(() => {});
+    await firstServer.close();
+  }
+});
+
 test("a fresh Node WASM agent resumes a host-owned Companion checkpoint", async () => {
   const durabilityId = "node-companion-checkpoint";
   const durability = createMemoryDurabilityStore(durabilityId);
@@ -1770,7 +1947,7 @@ test("a fresh Node WASM agent resumes a host-owned Companion checkpoint", async 
     sessionId: SESSION_IDS.durableCompanion,
     durability,
     durabilityId,
-    companionCompactionInstruction: "Keep the durable Companion facts.",
+    resolveCompaction: (context) => hostReplacement(context),
   };
   const firstServer = await startServer();
   let firstAgent;
@@ -1788,7 +1965,7 @@ test("a fresh Node WASM agent resumes a host-owned Companion checkpoint", async 
 
       const compact = await reader.next();
       assert.equal(compact.previous_response_id, "resp-durable-companion-first");
-      assert.match(JSON.stringify(compact.input), /Keep the durable Companion facts/);
+      assert.match(JSON.stringify(compact.input), /Create a concise private summary/);
       sendFinal(socket, "resp-durable-companion-summary", "durable Companion summary");
 
       const followOn = await reader.next();

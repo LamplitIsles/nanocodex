@@ -30,7 +30,7 @@ console.log(usage.cost_status);
 await agent.session.setThinking("high");
 await agent.session.setFastMode(true);
 const compaction = await agent.session.compact();
-if (compaction) console.log(compaction.summary, compaction.retained_tail);
+if (compaction) console.log(compaction.summary, compaction.installed_history);
 
 const branch = await agent.session.fork({ at: result });
 const branchTurn = branch.turn.prompt({ input: "Try another approach." });
@@ -49,52 +49,109 @@ await branch.session.shutdown();
 await agent.session.shutdown();
 ```
 
-### Host-owned compaction
+### Host-selected compaction
 
-The Node and current-isolate Web API WASM hosts can supply a host-owned compaction instruction
-while Nanocodex continues to own the model loop, tools, active context,
-compaction, and engine checkpoints. The existing `instructions` option sets
-the model persona; `companionCompactionInstruction` remains the fixed
-host-supplied instruction for client-owned compaction:
+Nanocodex owns the safe boundary, immutable history snapshot, private summary
+generation, structural validation, provider continuation reset, and token
+accounting. The summary instruction and replacement-history selectors are
+independent. Without a custom instruction selector, Nanocodex uses its own
+default compaction instruction. A host may select a custom instruction with
+`resolveCompactionInstruction`; its non-empty result is applied before summary
+dispatch. If that configured callback fails, is cancelled, or returns an empty
+value, compaction stops before summary dispatch and does not silently use the
+default. A host may separately select the complete replacement history with
+`resolveCompaction`. The callback runs after the engine generated its private
+summary and receives the exact history being replaced, origin identities, the
+operation metadata, and both context accounting values:
 
 ```js
 const agent = await Agent.create({
   transport: Transport.openAi({ apiKey: process.env.OPENAI_API_KEY }),
-  instructions: hostPersona,
-  companionCompactionInstruction: "Preserve relationship facts and recent work.",
-  historySeed: {
-    history: [
-      {
-        type: "message",
-        role: "user",
-        content: [{ type: "input_text", text: "Remember the blue room." }],
-      },
-      {
-        type: "message",
-        role: "assistant",
-        content: [{ type: "output_text", text: "I will remember it." }],
-        status: "completed",
-      },
-    ],
-    continuitySummary: "The conversation concerns the blue room.",
+  resolveCompactionInstruction: async (context, signal) => {
+    signal.throwIfAborted?.();
+    return `Summarize the active context for the host's continuity surface at ${context.phase}.`;
+  },
+  resolveCompaction: async (context, signal) => {
+    signal.throwIfAborted?.();
+    const retained = context.history
+      // This predicate is application policy. Nanocodex does not impose a
+      // number of rounds or a contiguous-tail rule.
+      .filter(({ item }) => !JSON.stringify(item).includes("discard-me"))
+      .map(({ origin }) => ({ kind: "original", origin }));
+    return {
+      operation_id: context.operation_id,
+      history: [
+        { kind: "summary", text: context.summary },
+        ...retained,
+      ],
+    };
   },
 });
-
-const turn = agent.turn.prompt({
-  input: "What room did I ask you to remember?",
-  supplementaryContext: "<recall>Selected host-owned evidence.</recall>",
-});
-const result = await turn.result();
 ```
 
+`resolveCompactionInstruction` is called for manual, automatic-pressure,
+context-overflow, and mid-turn compaction. Its context is product-neutral; a
+host that integrates a product-specific prompt must explicitly return that
+prompt from this callback. The callback is optional and does not change the
+independent `resolveCompaction` replacement contract.
+For DSH integration, DSH explicitly returns its existing Companion prompt from
+this selector; Nanocodex does not infer or inject product prompts.
+
+The decision must echo `context.operation_id`. Each `original` entry must copy
+an origin identity from the supplied snapshot. `item` entries may add typed
+history items, and `summary` entries insert host-selected private summary text.
+The engine rejects unknown origins, duplicate origins, unsupported item shapes,
+duplicate engine-owned request-prefix items, and unbalanced tool calls before
+mutating the active session. A resolver error, cancellation, stale decision,
+or invalid decision leaves the prior history intact and forces a safe replay
+baseline after any completed summary request.
+
+The host chooses the complete replacement. It may remove items, select
+non-contiguous original items, retain zero original items, and place more than
+one host-created summary or history item. There is no five-round, text-only,
+latest-user-tail, or other Companion retention policy in Nanocodex.
+
+`agent.session.compact()` returns `null` for provider-default compaction. With
+`resolveCompaction` it returns a `CompactionOutcome`:
+
+```ts
+type CompactionOutcome = Readonly<{
+  revision: string;
+  trigger: "manual" | "automatic";
+  summary: string | null;
+  installed_history: readonly Readonly<{
+    origin: CompactionItemIdentity | null;
+    item: Record<string, unknown>;
+  }>[];
+  context: Readonly<{
+    workspace: string;
+    history: readonly Record<string, unknown>[];
+    context_window_tokens: number;
+    active_context_tokens: number;
+  }>;
+}>;
+```
+
+`installed_history` is the authoritative post-install provenance mapping; it
+does not assume one contiguous removed range. The same capacity and active
+occupancy values are available from `agent.session.context()`. They are
+estimates for the current configured context and provider usage anchors, not a
+replacement for cumulative billed usage returned by a completed turn.
+
+Compaction replacements emit the ordered `model.compaction.replaced` event
+with the installed history, provenance, phase, operation boundary, and the
+same post-install context accounting. The private summary never becomes an
+assistant display event, and historical tool calls are never executed while
+installing or resuming a snapshot.
+
 `supplementaryContext` is host-resolved evidence appended to the same final
-user message as `input`. It neither replaces persona instructions nor starts a
-turn by itself, and it remains associated with its prompt while independently
+user message as `input`. It neither replaces persona instructions nor starts
+a turn by itself, and it remains associated with its prompt while independently
 queued inputs wait behind an active turn. The host owns recall, timeouts, and
 its application transcript; Nanocodex only validates and carries the supplied
 string.
 
-`historySeed` is a validated active-history entry point, not a DSH event-log
+`historySeed` is a validated engine-history entry point, not a DSH event-log
 schema. Its public `HistoryItem` union accepts message text and supported
 image/audio content, function and Code Mode tool call/result pairs, and
 provider compaction items. `continuitySummary` is inserted as private model
@@ -104,73 +161,22 @@ before provider work. Historical tool calls are replayed as history and are
 never executed. The engine creates the lineage, cache key, and snapshot
 metadata; callers do not fabricate provider continuation IDs.
 
-When `companionCompactionInstruction` is configured, summaries are normal
-generations using the complete active request prefix: instructions, tools,
-model settings, prompt-cache key, and the current typed history are retained.
-The final instruction is appended at the end of that request. Eligible
-Responses Lite continuation and the normal full-replay fallback remain in use;
-the next request after installation intentionally performs a fresh replay, so
-these client-side tests do not claim a provider cache hit.
+`agent.session.snapshot()` returns the committed post-install history for cold
+resume. Host-owned checkpoints use the existing `durability`/`durabilityId`
+options; a fresh Agent can reopen a completed boundary and replay the installed
+summary, selected history, and completed tool pairs before accepting the next
+prompt. Treat snapshots, callback history, and tool payloads as sensitive model
+state.
 
-For per-operation policy, provide `resolveCompactionInstruction` instead. It
-is awaited before every manual, pressure, mid-tool, or context-overflow
-summary request and receives a small context plus an `AbortSignal`:
+Both resolvers are available in `nanocodex/node` and the current-isolate
+browser host. The package-owned browser Worker intentionally omits them because
+function callbacks cannot cross its structured-clone boundary; the Worker
+runtime rejects function-valued `resolveCompactionInstruction` and
+`resolveCompaction` options.
 
-```js
-const agent = await Agent.create({
-  transport: Transport.openAi({ apiKey: process.env.OPENAI_API_KEY }),
-  resolveCompactionInstruction: async (context, signal) => {
-    const policy = context.trigger === "manual"
-      ? "Keep the user's selected facts and the latest work."
-      : "Keep the facts required to resume the active operation.";
-    signal.throwIfAborted?.();
-    return policy;
-  },
-});
-```
-
-The resolver result must be a non-empty string. Resolver failure or
-cancellation does not fall back to `companionCompactionInstruction` and does
-not start a provider request. Shutting down an Agent aborts a pending resolver;
-an active summary is also canceled without installing a partial result.
-
-A successful summary replaces the superseded history with private summary
-context and the latest complete real-user-led tail. It never emits the
-summary as assistant output, and historical or summary tool calls are never
-dispatched. Custom host compaction returns a `CompactionOutcome` with the
-ordered `revision`, `trigger`, private `summary`, `replaced_history` range,
-`retained_tail` item identities, and complete post-replacement `context`.
-Automatic custom replacements additionally emit an ordered
-`model.compaction.replaced` event at the installation boundary; its payload
-has the same outcome fields plus `phase` and `after_model_call_index`. Manual
-custom compaction emits the same event after installation. Call explicit
-compaction from idle maintenance because it may cancel an active turn.
-When neither host-owned option is configured, provider-default compaction is
-unchanged and `agent.session.compact()` returns `null`; no custom replacement
-event is emitted.
-
-After a successful manual replacement, call `agent.session.snapshot()` before
-disposing the Agent when the host needs to persist that exact boundary. The
-returned `SessionSnapshot` is produced by the engine's committed checkpoint,
-so it includes the installed summary and complete retained tool tail, along
-with the lineage and cache metadata required for a cold `resume`. It rejects
-before the first committed boundary and after the Agent has stopped; callers
-must treat its history and tool payloads as sensitive model state.
-
-`resolveCompactionInstruction` is supported in `nanocodex/node` and in the
-current-isolate `nanocodex/host` API. The package-owned `nanocodex/browser`
-module Worker accepts only structured-clone-safe options, so its types omit
-the resolver and runtime rejects a function-valued option. No browser Worker
-RPC resolver is provided.
-
-Host-owned checkpoints use the existing `durability`/`durabilityId` options.
-After a completed boundary is stored, a fresh Agent instance can reopen it and
-replay the summary, retained history, and completed tool pairs before accepting
-the next prompt. This is a checkpoint contract, not a claim of arbitrary-crash
-exactly-once semantics. DSH-specific translation, UI lifecycle mapping,
-recall policy, transcript persistence, and the official DSH 0.1.2-rc.1
-recovery-baseline verification remain the responsibility of the dependent DSH
-adapter.
+DSH owns any product retention policy, including its planned five-round
+policy. Legacy native DSH conversation-message breakdown drift is outside this
+engine contract and is deferred to the planned official DSH upgrade.
 
 Transports are explicit, immutable configurations, like viem v3 transports:
 

@@ -531,7 +531,10 @@ test("HTTP fallback preserves a history seed through manual compaction", async (
     model: "gpt-5.6-sol",
     thinking: "none",
     sessionId: "018f1f9a-7b3c-7a20-8000-000000000029",
-    companionCompactionInstruction: "Summarize the private conversation for continuation.",
+    resolveCompaction: (context) => ({
+      operation_id: context.operation_id,
+      history: [{ kind: "summary", text: context.summary }],
+    }),
     historySeed: {
       history: [
         {
@@ -593,7 +596,7 @@ test("HTTP fallback preserves a history seed through manual compaction", async (
     );
     assert.match(requests[0].body, /violet room/);
     assert.match(requests[0].body, /Continue the seeded conversation/);
-    assert.match(requests[1].body, /Summarize the private conversation/);
+    assert.match(requests[1].body, /Create a concise private summary/);
     assert.match(requests[2].body, /PRIVATE_SSE_SUMMARY/);
     assert.match(requests[2].body, /Continue after SSE compaction/);
     assert.ok(events.some((event) => event.type === "model.compaction.completed"));

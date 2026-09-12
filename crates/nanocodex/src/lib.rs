@@ -6,11 +6,13 @@
 #[cfg_attr(docsrs, doc(cfg(feature = "openai")))]
 pub use nanocodex_agent::NanocodexBuilder;
 pub use nanocodex_agent::{
-    AgentEvents, AgentSessionContext, CompactionInstructionContext, CompactionInstructionFuture,
-    CompactionInstructionResolver, CompactionItemIdentity, CompactionOutcome, CompactionPhase,
-    CompactionRange, CompactionTrigger, CostStatus, EstimatedUsdCost, ExecutionPolicyDisposition,
-    Nanocodex, NanocodexError, PromptRequest, PromptRoute, ReportedTurnUsage, ServiceTier,
-    SessionSnapshot, Turn, TurnControl, TurnResult, TurnUsage, UsdAmount,
+    AgentEvents, AgentSessionContext, CompactionContext, CompactionDecision, CompactionFuture,
+    CompactionHistoryItem, CompactionInstalledItem, CompactionInstructionContext,
+    CompactionInstructionFuture, CompactionInstructionResolver, CompactionItemIdentity,
+    CompactionOutcome, CompactionPhase, CompactionReplacementItem, CompactionResolver,
+    CompactionTrigger, CostStatus, EstimatedUsdCost, ExecutionPolicyDisposition, Nanocodex,
+    NanocodexError, PromptRequest, PromptRoute, ReportedTurnUsage, ServiceTier, SessionSnapshot,
+    Turn, TurnControl, TurnResult, TurnUsage, UsdAmount,
 };
 #[cfg(feature = "durability")]
 #[cfg_attr(docsrs, doc(cfg(feature = "durability")))]
@@ -58,9 +60,10 @@ pub mod agent {
     #[cfg(feature = "openai")]
     #[cfg_attr(docsrs, doc(cfg(feature = "openai")))]
     pub use nanocodex_agent::{
-        CompactionInstructionContext, CompactionInstructionFuture, CompactionInstructionResolver,
-        CompactionItemIdentity, CompactionOutcome, CompactionPhase, CompactionRange,
-        CompactionTrigger,
+        CompactionContext, CompactionDecision, CompactionFuture, CompactionHistoryItem,
+        CompactionInstalledItem, CompactionInstructionContext, CompactionInstructionFuture,
+        CompactionInstructionResolver, CompactionItemIdentity, CompactionOutcome, CompactionPhase,
+        CompactionReplacementItem, CompactionResolver, CompactionTrigger,
     };
 }
 

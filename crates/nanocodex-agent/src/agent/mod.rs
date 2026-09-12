@@ -39,7 +39,7 @@ use tower::Service;
 use tracing::{Instrument, info, info_span};
 
 #[cfg(feature = "openai")]
-use crate::compaction::CompactionInstructionResolver;
+use crate::compaction::{CompactionInstructionResolver, CompactionResolver};
 #[cfg(feature = "openai")]
 use crate::prompt_cache::{ModelPromptCache, SharedPromptCache};
 use crate::{

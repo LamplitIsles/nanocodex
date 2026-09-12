@@ -14,6 +14,7 @@ pub(in crate::agent) struct BranchSpawner<S> {
     pub(in crate::agent) host_context: Option<Arc<str>>,
     pub(in crate::agent) compaction_instruction_resolver:
         Option<Arc<dyn CompactionInstructionResolver + Send + Sync>>,
+    pub(in crate::agent) compaction_resolver: Option<Arc<dyn CompactionResolver + Send + Sync>>,
     pub(in crate::agent) service_factory: ServiceFactory<S>,
 }
 
@@ -42,6 +43,7 @@ impl<S> BranchSpawner<S> {
                 .compaction_instruction_resolver
                 .as_ref()
                 .map(Arc::clone),
+            compaction_resolver: self.compaction_resolver.as_ref().map(Arc::clone),
             service_factory: Arc::clone(&self.service_factory),
         })
     }
@@ -124,6 +126,7 @@ where
                 .compaction_instruction_resolver
                 .as_ref()
                 .map(Arc::clone),
+            compaction_resolver: self.compaction_resolver.as_ref().map(Arc::clone),
             service_factory: Arc::clone(&self.service_factory),
         };
         let service = (spawner.service_factory)(Arc::clone(&spawner.config));

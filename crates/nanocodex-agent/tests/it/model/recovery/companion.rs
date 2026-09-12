@@ -8,8 +8,9 @@ use std::{
 };
 
 use nanocodex_agent::{
-    CompactionInstructionContext, CompactionInstructionFuture, CompactionInstructionResolver,
-    CompactionPhase, CompactionTrigger, events::AgentEvents,
+    CompactionContext, CompactionDecision, CompactionInstructionContext,
+    CompactionInstructionFuture, CompactionInstructionResolver, CompactionPhase,
+    CompactionReplacementItem, CompactionResolver, CompactionTrigger, events::AgentEvents,
 };
 use nanocodex_oai_api::{
     events::AgentEventKind,
@@ -23,23 +24,61 @@ use tower::Service;
 
 use super::*;
 
-const COMPANION_INSTRUCTION: &str = "Keep durable facts and recent work in a compact summary.";
+const HOST_SUMMARY_INSTRUCTION: &str = "Host selected summary instruction";
 
 #[derive(Clone)]
-struct TestInstructionResolver {
+struct TestInstructionSelector {
     contexts: Arc<Mutex<Vec<CompactionInstructionContext>>>,
 }
 
-impl CompactionInstructionResolver for TestInstructionResolver {
+impl CompactionInstructionResolver for TestInstructionSelector {
     fn resolve(&self, context: CompactionInstructionContext) -> CompactionInstructionFuture {
         self.contexts.lock().unwrap().push(context);
-        Box::pin(async { Ok(COMPANION_INSTRUCTION.to_owned()) })
+        Box::pin(async { Ok(HOST_SUMMARY_INSTRUCTION.to_owned()) })
+    }
+}
+
+fn test_instruction_selector() -> (
+    Arc<TestInstructionSelector>,
+    Arc<Mutex<Vec<CompactionInstructionContext>>>,
+) {
+    let contexts = Arc::new(Mutex::new(Vec::new()));
+    (
+        Arc::new(TestInstructionSelector {
+            contexts: Arc::clone(&contexts),
+        }),
+        contexts,
+    )
+}
+
+#[derive(Clone)]
+struct TestInstructionResolver {
+    contexts: Arc<Mutex<Vec<CompactionContext>>>,
+}
+
+impl CompactionResolver for TestInstructionResolver {
+    fn resolve(&self, context: CompactionContext) -> nanocodex_agent::CompactionFuture {
+        self.contexts.lock().unwrap().push(context.clone());
+        let mut history = vec![CompactionReplacementItem::Summary {
+            text: context.summary.clone(),
+        }];
+        history.extend(context.history.into_iter().map(|item| {
+            CompactionReplacementItem::Original {
+                origin: item.origin,
+            }
+        }));
+        Box::pin(async move {
+            Ok(CompactionDecision {
+                operation_id: context.operation_id,
+                history,
+            })
+        })
     }
 }
 
 fn test_instruction_resolver() -> (
     Arc<TestInstructionResolver>,
-    Arc<Mutex<Vec<CompactionInstructionContext>>>,
+    Arc<Mutex<Vec<CompactionContext>>>,
 ) {
     let contexts = Arc::new(Mutex::new(Vec::new()));
     (
@@ -51,6 +90,17 @@ fn test_instruction_resolver() -> (
 }
 
 fn assert_resolver_context(
+    contexts: &Arc<Mutex<Vec<CompactionContext>>>,
+    phase: CompactionPhase,
+    trigger: CompactionTrigger,
+) {
+    let contexts = contexts.lock().unwrap();
+    assert_eq!(contexts.len(), 1);
+    assert_eq!(contexts[0].phase, phase);
+    assert_eq!(contexts[0].trigger, trigger);
+}
+
+fn assert_instruction_context(
     contexts: &Arc<Mutex<Vec<CompactionInstructionContext>>>,
     phase: CompactionPhase,
     trigger: CompactionTrigger,
@@ -151,10 +201,12 @@ impl Service<ResponsesAttempt> for CompanionService {
                 )))
             }
             (CompanionFlow::Manual, 1, ResponsesAttemptKind::Generation) => {
-                assert!(contains_text(&input, COMPANION_INSTRUCTION));
+                assert!(contains_text(&input, HOST_SUMMARY_INSTRUCTION));
                 assert!(input.last().is_some_and(|item| {
                     item["role"] == "developer"
-                        && item["content"][0]["text"] == COMPANION_INSTRUCTION
+                        && item["content"][0]["text"]
+                            .as_str()
+                            .is_some_and(|text| text.contains(HOST_SUMMARY_INSTRUCTION))
                 }));
                 Ok(ResponsesServiceResponse::new(generation_output(
                     "resp-manual-summary",
@@ -179,7 +231,7 @@ impl Service<ResponsesAttempt> for CompanionService {
                 )))
             }
             (CompanionFlow::AutomaticPressure, 1, ResponsesAttemptKind::Generation) => {
-                assert!(contains_text(&input, COMPANION_INSTRUCTION));
+                assert!(contains_text(&input, HOST_SUMMARY_INSTRUCTION));
                 assert!(
                     self.observations
                         .lock()
@@ -204,7 +256,7 @@ impl Service<ResponsesAttempt> for CompanionService {
                 assert!(contains_text(&input, "<compacted-summary>"));
                 assert!(contains_text(&input, "CUSTOM_PRESSURE_SUMMARY"));
                 assert!(contains_text(&input, "after pressure"));
-                assert!(!contains_text(&input, COMPANION_INSTRUCTION));
+                assert!(!contains_text(&input, HOST_SUMMARY_INSTRUCTION));
                 Ok(ResponsesServiceResponse::new(generation_output(
                     "resp-pressure-after",
                     "continued after automatic pressure compaction",
@@ -220,7 +272,7 @@ impl Service<ResponsesAttempt> for CompanionService {
                 )),
             ),
             (CompanionFlow::MidToolPressure, 1, ResponsesAttemptKind::Generation) => {
-                assert!(contains_text(&input, COMPANION_INSTRUCTION));
+                assert!(contains_text(&input, HOST_SUMMARY_INSTRUCTION));
                 assert!(contains_text(&input, "call-tool-pressure"));
                 assert!(contains_text(&input, "custom_tool_call_output"));
                 Ok(ResponsesServiceResponse::new(generation_output(
@@ -234,7 +286,7 @@ impl Service<ResponsesAttempt> for CompanionService {
                 assert!(contains_text(&input, "<compacted-summary>"));
                 assert!(contains_text(&input, "CUSTOM_TOOL_PRESSURE_SUMMARY"));
                 assert!(contains_text(&input, "custom_tool_call_output"));
-                assert!(!contains_text(&input, COMPANION_INSTRUCTION));
+                assert!(!contains_text(&input, HOST_SUMMARY_INSTRUCTION));
                 Ok(ResponsesServiceResponse::new(generation_output(
                     "resp-tool-pressure-after",
                     "continued after mid-tool pressure compaction",
@@ -247,7 +299,7 @@ impl Service<ResponsesAttempt> for CompanionService {
                 }))
             }
             (CompanionFlow::ContextOverflow, 1, ResponsesAttemptKind::Generation) => {
-                assert!(contains_text(&input, COMPANION_INSTRUCTION));
+                assert!(contains_text(&input, HOST_SUMMARY_INSTRUCTION));
                 assert!(contains_text(&input, "before overflow"));
                 Ok(ResponsesServiceResponse::new(generation_output(
                     "resp-overflow-summary",
@@ -260,7 +312,7 @@ impl Service<ResponsesAttempt> for CompanionService {
                 assert!(contains_text(&input, "<compacted-summary>"));
                 assert!(contains_text(&input, "CUSTOM_OVERFLOW_SUMMARY"));
                 assert!(contains_text(&input, "after overflow"));
-                assert!(!contains_text(&input, COMPANION_INSTRUCTION));
+                assert!(!contains_text(&input, HOST_SUMMARY_INSTRUCTION));
                 Ok(ResponsesServiceResponse::new(generation_output(
                     "resp-overflow-after",
                     "continued after context overflow compaction",
@@ -316,8 +368,7 @@ fn assert_custom_replacement(events: &mut AgentEvents, trigger: &str, phase: &st
     assert_eq!(payload["phase"], phase);
     assert_eq!(payload["revision"], "1");
     assert_eq!(payload["summary"], summary);
-    assert!(payload["replaced_history"]["end"].as_u64().is_some());
-    assert!(!payload["retained_tail"].as_array().unwrap().is_empty());
+    assert!(!payload["installed_history"].as_array().unwrap().is_empty());
     assert!(payload["context"]["history"].to_string().contains(summary));
 }
 
@@ -389,6 +440,7 @@ async fn automatic_companion_pressure_uses_the_warm_custom_summary_generation() 
     let calls = Arc::new(AtomicU32::new(0));
     let service_observations = Arc::clone(&observations);
     let service_calls = Arc::clone(&calls);
+    let (instruction_selector, instruction_contexts) = test_instruction_selector();
     let (resolver, resolver_contexts) = test_instruction_resolver();
     let openai = OpenAi::builder("test-key")
         .context_window_tokens(100)
@@ -401,7 +453,8 @@ async fn automatic_companion_pressure_uses_the_warm_custom_summary_generation() 
         .build()?;
     let (agent, mut events) = Nanocodex::builder(openai)
         .instructions("Companion persona marker")
-        .compaction_instruction_resolver(resolver)
+        .compaction_instruction_resolver(instruction_selector)
+        .compaction_resolver(resolver)
         .thinking(Thinking::Low)
         .workspace(&workspace)
         .session_id(test_session_id())
@@ -441,12 +494,11 @@ async fn automatic_companion_pressure_uses_the_warm_custom_summary_generation() 
     assert!(observations.attempts[0].full_replay);
     assert!(!observations.attempts[1].full_replay);
     assert!(observations.attempts[2].full_replay);
-    assert!(
-        observations.attempts[1]
-            .input
-            .last()
-            .is_some_and(|item| item["content"][0]["text"] == COMPANION_INSTRUCTION)
-    );
+    assert!(observations.attempts[1].input.last().is_some_and(|item| {
+        item["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains(HOST_SUMMARY_INSTRUCTION))
+    }));
     drop(observations);
     assert_custom_replacement(
         &mut events,
@@ -456,6 +508,11 @@ async fn automatic_companion_pressure_uses_the_warm_custom_summary_generation() 
     );
     assert_resolver_context(
         &resolver_contexts,
+        CompactionPhase::PreTurn,
+        CompactionTrigger::Automatic,
+    );
+    assert_instruction_context(
+        &instruction_contexts,
         CompactionPhase::PreTurn,
         CompactionTrigger::Automatic,
     );
@@ -472,6 +529,7 @@ async fn manual_companion_summary_keeps_the_warm_profile_and_publishes_its_outco
     let calls = Arc::new(AtomicU32::new(0));
     let service_observations = Arc::clone(&observations);
     let service_calls = Arc::clone(&calls);
+    let (instruction_selector, instruction_contexts) = test_instruction_selector();
     let (resolver, resolver_contexts) = test_instruction_resolver();
     let openai = OpenAi::builder("test-key")
         .websocket_warmup(false)
@@ -483,7 +541,8 @@ async fn manual_companion_summary_keeps_the_warm_profile_and_publishes_its_outco
         .build()?;
     let (agent, mut events) = Nanocodex::builder(openai)
         .instructions("Companion persona marker")
-        .compaction_instruction_resolver(resolver)
+        .compaction_instruction_resolver(instruction_selector)
+        .compaction_resolver(resolver)
         .thinking(Thinking::Low)
         .workspace(&workspace)
         .session_id(test_session_id())
@@ -508,9 +567,7 @@ async fn manual_companion_summary_keeps_the_warm_profile_and_publishes_its_outco
         nanocodex_agent::CompactionTrigger::Manual
     );
     assert_eq!(outcome.summary(), Some("CUSTOM_MANUAL_SUMMARY"));
-    assert!(!outcome.retained_tail().is_empty());
-    assert_eq!(outcome.replaced_history().start(), 0);
-    assert!(outcome.replaced_history().end() > 0);
+    assert!(!outcome.installed_history().is_empty());
     assert!(outcome.context().history().iter().any(|item| {
         serde_json::to_string(item).is_ok_and(|item| item.contains("CUSTOM_MANUAL_SUMMARY"))
     }));
@@ -547,6 +604,11 @@ async fn manual_companion_summary_keeps_the_warm_profile_and_publishes_its_outco
         CompactionPhase::PreTurn,
         CompactionTrigger::Manual,
     );
+    assert_instruction_context(
+        &instruction_contexts,
+        CompactionPhase::PreTurn,
+        CompactionTrigger::Manual,
+    );
     agent.shutdown().await?;
     drop((agent, events));
     std::fs::remove_dir_all(workspace)?;
@@ -560,6 +622,7 @@ async fn context_overflow_routes_the_next_prompt_through_custom_compaction() -> 
     let calls = Arc::new(AtomicU32::new(0));
     let service_observations = Arc::clone(&observations);
     let service_calls = Arc::clone(&calls);
+    let (instruction_selector, instruction_contexts) = test_instruction_selector();
     let (resolver, resolver_contexts) = test_instruction_resolver();
     let openai = OpenAi::builder("test-key")
         .websocket_warmup(false)
@@ -571,7 +634,8 @@ async fn context_overflow_routes_the_next_prompt_through_custom_compaction() -> 
         .build()?;
     let (agent, mut events) = Nanocodex::builder(openai)
         .instructions("Companion persona marker")
-        .compaction_instruction_resolver(resolver)
+        .compaction_instruction_resolver(instruction_selector)
+        .compaction_resolver(resolver)
         .thinking(Thinking::Low)
         .workspace(&workspace)
         .session_id(test_session_id())
@@ -622,6 +686,11 @@ async fn context_overflow_routes_the_next_prompt_through_custom_compaction() -> 
         CompactionPhase::PreTurn,
         CompactionTrigger::Automatic,
     );
+    assert_instruction_context(
+        &instruction_contexts,
+        CompactionPhase::PreTurn,
+        CompactionTrigger::Automatic,
+    );
     agent.shutdown().await?;
     drop((agent, events));
     std::fs::remove_dir_all(workspace)?;
@@ -635,6 +704,7 @@ async fn mid_tool_pressure_compacts_after_the_tool_without_rerunning_it() -> Res
     let calls = Arc::new(AtomicU32::new(0));
     let service_observations = Arc::clone(&observations);
     let service_calls = Arc::clone(&calls);
+    let (instruction_selector, instruction_contexts) = test_instruction_selector();
     let (resolver, resolver_contexts) = test_instruction_resolver();
     let openai = OpenAi::builder("test-key")
         .context_window_tokens(100)
@@ -647,7 +717,8 @@ async fn mid_tool_pressure_compacts_after_the_tool_without_rerunning_it() -> Res
         .build()?;
     let (agent, mut events) = Nanocodex::builder(openai)
         .instructions("Companion persona marker")
-        .compaction_instruction_resolver(resolver)
+        .compaction_instruction_resolver(instruction_selector)
+        .compaction_resolver(resolver)
         .thinking(Thinking::Low)
         .workspace(&workspace)
         .session_id(test_session_id())
@@ -691,6 +762,11 @@ async fn mid_tool_pressure_compacts_after_the_tool_without_rerunning_it() -> Res
     );
     assert_resolver_context(
         &resolver_contexts,
+        CompactionPhase::MidTurn,
+        CompactionTrigger::Automatic,
+    );
+    assert_instruction_context(
+        &instruction_contexts,
         CompactionPhase::MidTurn,
         CompactionTrigger::Automatic,
     );

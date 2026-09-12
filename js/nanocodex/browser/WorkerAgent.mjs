@@ -1296,9 +1296,10 @@ function listenForAbort(signal, listener) {
 
 function serializeConfig(options) {
   const config = { ...options };
-  if (typeof config.resolveCompactionInstruction === "function") {
+  if (typeof config.resolveCompaction === "function"
+    || typeof config.resolveCompactionInstruction === "function") {
     throw new TypeError(
-      "resolveCompactionInstruction is supported in Node and current-isolate WASM hosts, not the default browser Worker API",
+      "compaction resolvers are supported in Node and current-isolate WASM hosts, not the default browser Worker API",
     );
   }
   const workerDurability = config.durability !== false;

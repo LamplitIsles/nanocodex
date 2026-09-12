@@ -225,6 +225,12 @@ impl<S> Session<S> {
     pub fn active_context_tokens(&self) -> u64 {
         self.state.active_context_tokens()
     }
+
+    /// Returns the configured model context capacity in tokens.
+    #[must_use]
+    pub const fn context_window_tokens(&self) -> u64 {
+        self.context_window_tokens
+    }
 }
 
 /// Turn-scoped Responses operations borrowing one managed session.
@@ -239,6 +245,12 @@ impl<S> ResponseTurn<'_, S> {
     #[must_use]
     pub fn active_context_tokens(&self) -> u64 {
         self.session.active_context_tokens()
+    }
+
+    /// Returns the configured model context capacity in tokens.
+    #[must_use]
+    pub const fn context_window_tokens(&self) -> u64 {
+        self.session.context_window_tokens()
     }
 }
 

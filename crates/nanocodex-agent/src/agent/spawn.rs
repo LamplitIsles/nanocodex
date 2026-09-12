@@ -10,6 +10,7 @@ pub(super) fn build_agent<S>(
     codex: CodexCompatibility,
     resume: Option<SessionSnapshot>,
     compaction_instruction_resolver: Option<Arc<dyn CompactionInstructionResolver + Send + Sync>>,
+    compaction_resolver: Option<Arc<dyn CompactionResolver + Send + Sync>>,
     service_factory: ServiceFactory<S>,
 ) -> Result<(Nanocodex, AgentEvents)>
 where
@@ -118,6 +119,7 @@ where
             execution: codex.execution,
             host_context: None,
             compaction_instruction_resolver,
+            compaction_resolver,
             service_factory,
         },
         session_id,
@@ -275,15 +277,6 @@ pub(super) fn validate(config: &ModelConfig, prompt_cache_key: Option<&str>) -> 
     if prompt_cache_key.is_some_and(|prompt_cache_key| prompt_cache_key.trim().is_empty()) {
         return Err(NanocodexError::InvalidRequest(
             "prompt_cache_key must not be empty".to_owned(),
-        ));
-    }
-    if config
-        .companion_compaction_instruction
-        .as_deref()
-        .is_some_and(|instruction| instruction.trim().is_empty())
-    {
-        return Err(NanocodexError::InvalidRequest(
-            "companion compaction instruction must not be empty".to_owned(),
         ));
     }
     Ok(())

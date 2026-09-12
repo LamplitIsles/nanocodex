@@ -16,8 +16,9 @@ use nanocodex::{
     Nanocodex as RustNanocodex, NanocodexError, OpenAi, PromptRoute, ReasoningMode, Thinking,
     Tools, Turn, TurnControl, TurnResult,
     agent::{
-        AgentHandle, CompactionInstructionContext, CompactionInstructionFuture,
-        CompactionInstructionResolver, ExecutionEnvironment, PromptRequest, SpawnOptions,
+        AgentHandle, CompactionContext, CompactionDecision, CompactionFuture,
+        CompactionInstructionContext, CompactionInstructionFuture, CompactionInstructionResolver,
+        CompactionResolver, ExecutionEnvironment, PromptRequest, SpawnOptions,
         durability::{
             OwnedState, OwnerId, OwnerToken, StateStore, StoreError, StoreFuture, StoredState,
         },
@@ -143,6 +144,12 @@ extern "C" {
 
     #[wasm_bindgen(catch, js_namespace = ["globalThis", "nanocodexHost"], js_name = toolDefinitions)]
     fn host_tool_definitions(definition_host_id: u32, session_id: &str) -> Result<String, JsValue>;
+
+    #[wasm_bindgen(catch, js_namespace = ["globalThis", "nanocodexHost"], js_name = resolveCompaction)]
+    fn host_resolve_compaction(
+        definition_host_id: u32,
+        context_json: &str,
+    ) -> Result<Promise, JsValue>;
 
     #[wasm_bindgen(catch, js_namespace = ["globalThis", "nanocodexHost"], js_name = resolveCompactionInstruction)]
     fn host_resolve_compaction_instruction(
@@ -287,6 +294,86 @@ impl CompactionInstructionResolver for JavaScriptCompactionInstructionResolver {
     }
 }
 
+struct JavaScriptCompactionResolver {
+    definition_host_id: u32,
+}
+
+struct JavaScriptCompactionFuture {
+    future: JsFuture,
+    cancel: Option<Function>,
+}
+
+impl Future for JavaScriptCompactionFuture {
+    type Output = Result<CompactionDecision, NanocodexError>;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        match Pin::new(&mut self.future).poll(context) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(value)) => Poll::Ready(
+                value
+                    .as_string()
+                    .ok_or_else(|| {
+                        NanocodexError::InvalidRequest(
+                            "compaction resolver returned a non-string".to_owned(),
+                        )
+                    })
+                    .and_then(|encoded| {
+                        serde_json::from_str(&encoded).map_err(|error| {
+                            NanocodexError::InvalidRequest(format!(
+                                "compaction resolver returned an invalid decision: {error}"
+                            ))
+                        })
+                    }),
+            ),
+            Poll::Ready(Err(error)) => Poll::Ready(Err(NanocodexError::InvalidRequest(format!(
+                "compaction resolution failed: {}",
+                host_error_message(&error)
+            )))),
+        }
+    }
+}
+
+impl Drop for JavaScriptCompactionFuture {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.call0(&JsValue::UNDEFINED);
+        }
+    }
+}
+
+impl CompactionResolver for JavaScriptCompactionResolver {
+    fn resolve(&self, context: CompactionContext) -> CompactionFuture {
+        let context_json = match serde_json::to_string(&context) {
+            Ok(context_json) => context_json,
+            Err(error) => {
+                return Box::pin(async move {
+                    Err(NanocodexError::InvalidRequest(format!(
+                        "failed to encode compaction context: {error}"
+                    )))
+                });
+            }
+        };
+        let promise = match host_resolve_compaction(self.definition_host_id, &context_json) {
+            Ok(promise) => promise,
+            Err(error) => {
+                return Box::pin(async move {
+                    Err(NanocodexError::InvalidRequest(format!(
+                        "failed to start compaction resolution: {}",
+                        host_error_message(&error)
+                    )))
+                });
+            }
+        };
+        let cancel = Reflect::get(&promise, &JsValue::from_str("cancel"))
+            .ok()
+            .and_then(|value| value.dyn_into::<Function>().ok());
+        Box::pin(JavaScriptCompactionFuture {
+            future: JsFuture::from(promise),
+            cancel,
+        })
+    }
+}
+
 #[derive(Deserialize)]
 struct JavaScriptSubscriptionValue {
     revision: String,
@@ -310,6 +397,8 @@ struct JavaScriptSubscriptionResponse {
 #[derive(Serialize)]
 struct WasmAgentSessionContext<'a> {
     workspace: &'a str,
+    context_window_tokens: u64,
+    active_context_tokens: u64,
     history: &'a [nanocodex::oai::responses::ResponseItem],
 }
 
@@ -879,9 +968,9 @@ struct WasmConfig {
     #[serde(default)]
     additional_instructions: Option<String>,
     #[serde(default)]
-    companion_compaction_instruction: Option<String>,
-    #[serde(default)]
     dynamic_compaction_instruction: bool,
+    #[serde(default)]
+    dynamic_compaction: bool,
     #[serde(default)]
     session_id: Option<String>,
     #[serde(default)]
@@ -1372,15 +1461,17 @@ impl WasmNanocodex {
         if let Some(instructions) = config.additional_instructions {
             builder = builder.additional_instructions(instructions);
         }
-        if let Some(instruction) = config.companion_compaction_instruction {
-            builder = builder.companion_compaction_instruction(instruction);
-        }
         if config.dynamic_compaction_instruction {
             builder = builder.compaction_instruction_resolver(Arc::new(
                 JavaScriptCompactionInstructionResolver {
                     definition_host_id: host_definition_id,
                 },
             ));
+        }
+        if config.dynamic_compaction {
+            builder = builder.compaction_resolver(Arc::new(JavaScriptCompactionResolver {
+                definition_host_id: host_definition_id,
+            }));
         }
         if let Some(session_id) = config.session_id {
             builder = builder.session_id(session_id.parse::<SessionId>().map_err(js_error)?);
@@ -1864,10 +1955,10 @@ impl WasmNanocodex {
 
     /// Compacts retained history and returns the private replacement mapping.
     ///
-    /// The serialized result includes the generated summary, the replaced
-    /// pre-compaction range, retained tail identities, and the complete
-    /// post-compaction session context for custom host compaction. It is
-    /// `null` when provider-default compaction is active.
+    /// The serialized result includes the generated private summary, the
+    /// complete installed history with original-item provenance, and the
+    /// complete post-compaction session context for custom host compaction. It
+    /// is `null` when provider-default compaction is active.
     #[wasm_bindgen(js_name = compactOutcome)]
     pub async fn compact_outcome(&self) -> Result<String, JsValue> {
         let outcome = self.inner.compact_with_outcome().await.map_err(js_error)?;
@@ -3210,6 +3301,8 @@ async fn append_developer_context(agent: &RustNanocodex, text: &str) -> Result<S
 fn serialize_session_context(context: AgentSessionContext) -> Result<String, JsValue> {
     serde_json::to_string(&WasmAgentSessionContext {
         workspace: context.workspace(),
+        context_window_tokens: context.context_window_tokens(),
+        active_context_tokens: context.active_context_tokens(),
         history: context.history(),
     })
     .map_err(js_error)
@@ -3223,15 +3316,13 @@ fn serialize_compaction_outcome(outcome: Option<CompactionOutcome>) -> Result<St
         CompactionTrigger::Manual => "manual",
         CompactionTrigger::Automatic => "automatic",
     };
-    let retained_tail = outcome
-        .retained_tail()
+    let installed_history = outcome
+        .installed_history()
         .iter()
         .map(|item| {
             serde_json::json!({
-                "index": item.index(),
-                "kind": item.kind(),
-                "id": item.id(),
-                "call_id": item.call_id(),
+                "origin": &item.origin,
+                "item": &item.item,
             })
         })
         .collect::<Vec<_>>();
@@ -3239,13 +3330,11 @@ fn serialize_compaction_outcome(outcome: Option<CompactionOutcome>) -> Result<St
         "revision": outcome.revision().to_string(),
         "trigger": trigger,
         "summary": outcome.summary(),
-        "replaced_history": {
-            "start": outcome.replaced_history().start(),
-            "end": outcome.replaced_history().end(),
-        },
-        "retained_tail": retained_tail,
+        "installed_history": installed_history,
         "context": {
             "workspace": outcome.context().workspace(),
+            "context_window_tokens": outcome.context().context_window_tokens(),
+            "active_context_tokens": outcome.context().active_context_tokens(),
             "history": outcome.context().history(),
         },
     }))

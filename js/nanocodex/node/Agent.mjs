@@ -37,8 +37,8 @@ export function create(options = {}) {
     fastMode,
     instructions,
     additionalInstructions,
-    companionCompactionInstruction,
     resolveCompactionInstruction,
+    resolveCompaction,
     historySeed,
     sessionId,
     workspace,
@@ -90,6 +90,7 @@ export function create(options = {}) {
     workspace: workspace ?? filesystem?.root ?? resume?.workspace,
     codeEvaluator,
     resolveCompactionInstruction,
+    resolveCompaction,
     onDispose: () => releaseDefinitionHost(hostDefinitionId),
   });
   let durabilityOwner;
@@ -173,8 +174,8 @@ export function create(options = {}) {
     fastMode,
     instructions,
     additionalInstructions,
-    companionCompactionInstruction,
     resolveCompactionInstruction,
+    resolveCompaction,
     historySeed,
     sessionId: stableSessionId,
     workspace: workspace ?? filesystem?.root,

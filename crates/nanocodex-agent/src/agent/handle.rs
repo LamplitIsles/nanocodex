@@ -417,12 +417,11 @@ impl Nanocodex {
 
     /// Compacts retained context and returns the exact private replacement mapping.
     ///
-    /// The result contains the generated summary, the pre-compaction range it
-    /// replaced, the complete retained tail identities, and the resulting
+    /// The result contains the generated private summary, the complete
+    /// installed history with original-item provenance, and the resulting
     /// model-visible context for custom host compaction. Provider-default
-    /// compaction returns `None` because its non-contiguous retention policy
-    /// does not have this custom replacement shape. The summary is never
-    /// emitted as assistant text.
+    /// compaction returns `None`. The summary is never emitted as assistant
+    /// text.
     /// Call this from idle maintenance when an active turn must not be
     /// cancelled by the embedding host.
     pub async fn compact_with_outcome(&self) -> Result<Option<CompactionOutcome>> {

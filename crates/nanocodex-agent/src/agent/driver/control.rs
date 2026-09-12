@@ -420,6 +420,7 @@ pub(super) fn handle_idle_command<S>(
                 latest.map(AsRef::as_ref),
                 workspace.as_deref(),
                 &spawner.context_source,
+                spawner.config.context_window_tokens,
             )));
         }
         Command::Snapshot { result } => {

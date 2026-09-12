@@ -36,6 +36,9 @@ where
             .prepare_request_policy(self.continuation_policy());
 
         let active_context_tokens = session.conversation.active_context_tokens();
+        let input_history = session.conversation.flattened_history();
+        let host_resolver = self.compaction_resolver.as_ref().map(Arc::clone);
+        let operation_id = crate::compaction::operation_id();
         let previous_response_id = session
             .conversation
             .previous_response_id()
@@ -86,30 +89,122 @@ where
         session
             .conversation
             .observe_server_reasoning(server_reasoning_included);
-        let installation = session.conversation.install_pre_turn_compaction(
-            item,
-            session.factory.profile().prefix(),
-            self.config.companion_compaction_instruction.is_some()
-                || self.compaction_instruction_resolver.is_some(),
-        );
-        let compaction_outcome = installation.map(|installation| {
-            crate::compaction::outcome_from_installation(
-                installation,
-                session.conversation.history_revision(),
-                crate::CompactionTrigger::Manual,
-                summary,
+        let compaction_outcome = if let Some(resolver) = host_resolver {
+            let summary = match summary {
+                Some(summary) => summary,
+                None => {
+                    let error = NanocodexError::InvalidAttemptState {
+                        detail: "host compaction did not produce a private summary",
+                    };
+                    let checkpoint = Self::checkpoint_from_session(
+                        &session,
+                        false,
+                        self.global_instructions.clone(),
+                    );
+                    self.session = Some(session);
+                    return Ok(ModelCompactOutcome::Failed { error, checkpoint });
+                }
+            };
+            session.conversation.reset_for_full_request();
+            let context = crate::CompactionContext {
+                after_model_call_index: self.stats.model_calls,
+                phase: crate::CompactionPhase::PreTurn,
+                trigger: crate::CompactionTrigger::Manual,
+                active_context_tokens,
+                context_window_tokens: self.config.context_window_tokens,
+                auto_compact_token_limit,
+                history_revision: session.conversation.history_revision(),
+                operation_id,
+                history: crate::compaction::context_history(&input_history),
+                summary: summary.clone(),
+            };
+            let decision = {
+                let resolution = resolver.resolve(context.clone());
+                tokio::pin!(resolution);
+                tokio::select! {
+                    biased;
+                    _ = &mut *cancel => {
+                        let checkpoint = Self::checkpoint_from_session(
+                            &session,
+                            false,
+                            self.global_instructions.clone(),
+                        );
+                        self.session = Some(session);
+                        return Ok(ModelCompactOutcome::Cancelled(checkpoint));
+                    }
+                    decision = &mut resolution => match decision {
+                        Ok(decision) => decision,
+                        Err(error) => {
+                            let checkpoint = Self::checkpoint_from_session(
+                                &session,
+                                false,
+                                self.global_instructions.clone(),
+                            );
+                            self.session = Some(session);
+                            return Ok(ModelCompactOutcome::Failed { error, checkpoint });
+                        }
+                    },
+                }
+            };
+            let (history, provenance) =
+                match crate::compaction::materialize_decision(&context, decision) {
+                    Ok(materialized) => materialized,
+                    Err(error) => {
+                        let checkpoint = Self::checkpoint_from_session(
+                            &session,
+                            false,
+                            self.global_instructions.clone(),
+                        );
+                        self.session = Some(session);
+                        return Ok(ModelCompactOutcome::Failed { error, checkpoint });
+                    }
+                };
+            let installation = match session.conversation.install_host_compaction(
+                history,
+                provenance,
+                session.factory.profile().prefix(),
+            ) {
+                Ok(installation) => installation,
+                Err(error) => {
+                    let checkpoint = Self::checkpoint_from_session(
+                        &session,
+                        false,
+                        self.global_instructions.clone(),
+                    );
+                    self.session = Some(session);
+                    return Ok(ModelCompactOutcome::Failed { error, checkpoint });
+                }
+            };
+            Some(
+                crate::compaction::outcome_from_installation(
+                    installation,
+                    &input_history,
+                    session.conversation.history_revision(),
+                    crate::CompactionTrigger::Manual,
+                    Some(summary),
+                )
+                .with_context(crate::AgentSessionContext::from_backend(
+                    session.workspace.clone(),
+                    session.conversation.flattened_history(),
+                    self.config.context_window_tokens,
+                    session.conversation.active_context_tokens(),
+                )),
             )
-            .with_context(crate::AgentSessionContext::from_backend(
-                session.workspace.clone(),
-                session.conversation.flattened_history(),
-            ))
-        });
+        } else {
+            session
+                .conversation
+                .install_pre_turn_compaction(item, session.factory.profile().prefix());
+            None
+        };
         if let Some(outcome) = &compaction_outcome {
-            self.emit_compaction_replaced(
+            if let Err(error) = self.emit_compaction_replaced(
                 self.stats.model_calls,
                 CompactionPhase::PreTurn,
                 outcome,
-            )?;
+            ) {
+                self.session = Some(session);
+                return Err(error);
+            }
         }
         session.conversation.commit_tail();
         session.context.require_full_reinjection();

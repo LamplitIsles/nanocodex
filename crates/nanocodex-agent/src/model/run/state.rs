@@ -147,17 +147,8 @@ impl ConversationState {
         &mut self,
         item: ResponseItem,
         request_prefix: &[ResponseItem],
-        companion: bool,
-    ) -> Option<nanocodex_oai_api::__private::compaction::CompactionInstallation> {
-        if companion {
-            Some(
-                self.managed
-                    .install_companion_compaction(item, [], request_prefix),
-            )
-        } else {
-            self.managed.install_compaction(item, [], request_prefix);
-            None
-        }
+    ) {
+        self.managed.install_compaction(item, [], request_prefix);
     }
 
     pub(super) fn install_mid_turn_compaction(
@@ -166,20 +157,24 @@ impl ConversationState {
         canonical_developer_context: ResponseItem,
         canonical_context: ResponseItem,
         request_prefix: &[ResponseItem],
-        companion: bool,
-    ) -> Option<nanocodex_oai_api::__private::compaction::CompactionInstallation> {
+    ) {
         self.canonical_context = Arc::new(canonical_context.clone());
-        let initial_context = [canonical_developer_context, canonical_context];
-        if companion {
-            Some(
-                self.managed
-                    .install_companion_compaction(item, initial_context, request_prefix),
-            )
-        } else {
-            self.managed
-                .install_compaction(item, initial_context, request_prefix);
-            None
-        }
+        self.managed.install_compaction(
+            item,
+            [canonical_developer_context, canonical_context],
+            request_prefix,
+        );
+    }
+
+    pub(super) fn install_host_compaction(
+        &mut self,
+        history: Vec<ResponseItem>,
+        provenance: Vec<Option<usize>>,
+        request_prefix: &[ResponseItem],
+    ) -> Result<nanocodex_oai_api::__private::compaction::CompactionInstallation> {
+        self.managed
+            .install_host_compaction(history, provenance, request_prefix)
+            .map_err(|error| NanocodexError::InvalidRequest(error.to_string()))
     }
 
     pub(super) fn append_canonical_context(

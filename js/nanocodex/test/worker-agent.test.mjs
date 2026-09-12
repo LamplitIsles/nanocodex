@@ -20,7 +20,14 @@ test("the package Worker rejects function-valued compaction resolvers", async ()
   await assert.rejects(
     createWorkerAgent({
       harness: false,
-      resolveCompactionInstruction: () => "keep the selected facts",
+      resolveCompaction: () => ({ operation_id: "test", history: [] }),
+    }),
+    /supported in Node and current-isolate WASM hosts/,
+  );
+  await assert.rejects(
+    createWorkerAgent({
+      harness: false,
+      resolveCompactionInstruction: () => "custom instruction",
     }),
     /supported in Node and current-isolate WASM hosts/,
   );

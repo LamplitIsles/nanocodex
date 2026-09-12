@@ -497,24 +497,13 @@ pub struct CompactionReplaced {
     pub trigger: String,
     /// Generated private summary text.
     pub summary: Option<String>,
-    /// Half-open pre-compaction range replaced by the summary.
-    pub replaced_history: CompactionRange,
-    /// Retained suffix identities in provider order.
-    pub retained_tail: Vec<CompactionItemIdentity>,
+    /// Complete installed history with original-item provenance.
+    pub installed_history: Vec<CompactionInstalledItem>,
     /// Complete model-visible context after installation.
     pub context: CompactionSessionContext,
 }
 
-/// Half-open range in the pre-compaction managed history.
-#[derive(Clone, Debug, Deserialize)]
-pub struct CompactionRange {
-    /// First removed item index.
-    pub start: usize,
-    /// Exclusive end of the removed range.
-    pub end: usize,
-}
-
-/// Stable identity for an item retained after a custom replacement.
+/// Stable identity for an item in a custom replacement.
 #[derive(Clone, Debug, Deserialize)]
 pub struct CompactionItemIdentity {
     /// Pre-replacement history index.
@@ -527,11 +516,24 @@ pub struct CompactionItemIdentity {
     pub call_id: Option<String>,
 }
 
+/// Installed item and its original-history provenance, when applicable.
+#[derive(Clone, Debug, Deserialize)]
+pub struct CompactionInstalledItem {
+    /// Original identity for retained items, or `None` for host-created items.
+    pub origin: Option<CompactionItemIdentity>,
+    /// Exact typed item installed into the managed session.
+    pub item: ResponseItem,
+}
+
 /// Model-visible context included with a custom replacement event.
 #[derive(Clone, Debug, Deserialize)]
 pub struct CompactionSessionContext {
     /// Workspace associated with the installed context.
     pub workspace: String,
+    /// Configured model context capacity.
+    pub context_window_tokens: u64,
+    /// Active context estimate after installation.
+    pub active_context_tokens: u64,
     /// Complete model-visible history after installation.
     pub history: Vec<ResponseItem>,
 }

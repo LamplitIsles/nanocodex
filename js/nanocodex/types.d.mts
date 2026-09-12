@@ -86,10 +86,10 @@ export type AgentOptions = {
   instructions?: string | undefined;
   /** Appends host instructions while retaining the selected model's prompt. */
   additionalInstructions?: string | undefined;
-  /** Generates client-owned context summaries instead of provider compaction. */
-  companionCompactionInstruction?: string | undefined;
-  /** Selects the final private compaction instruction for each operation. */
+  /** Selects the instruction used before each custom compaction summary request. */
   resolveCompactionInstruction?: CompactionInstructionResolver | undefined;
+  /** Selects the complete replacement history for each compaction operation. */
+  resolveCompaction?: CompactionResolver | undefined;
   /** Hydrates a validated active history; cannot be combined with resume. */
   historySeed?: HistorySeed | undefined;
   model?: Model | undefined;
@@ -101,6 +101,7 @@ export type AgentOptions = {
   resume?: SessionSnapshot | undefined;
 };
 
+/** Context supplied before summary generation when custom instruction selection is configured. */
 export type CompactionInstructionContext = Readonly<{
   after_model_call_index: number;
   phase: "pre_turn" | "mid_turn";
@@ -113,6 +114,44 @@ export type CompactionInstructionResolver = (
   context: CompactionInstructionContext,
   signal: AbortSignal,
 ) => string | PromiseLike<string>;
+
+export type CompactionContext = Readonly<{
+  after_model_call_index: number;
+  phase: "pre_turn" | "mid_turn";
+  trigger: "manual" | "automatic";
+  active_context_tokens: number;
+  context_window_tokens: number;
+  auto_compact_token_limit: number;
+  history_revision: number;
+  operation_id: string;
+  history: readonly CompactionHistoryItem[];
+  summary: string;
+}>;
+
+export type CompactionHistoryItem = Readonly<{
+  origin: CompactionItemIdentity;
+  item: Readonly<Record<string, unknown>>;
+}>;
+
+export type CompactionReplacementItem =
+  | Readonly<{ kind: "original"; origin: CompactionItemIdentity }>
+  | Readonly<{ kind: "item"; item: Readonly<Record<string, unknown>> }>
+  | Readonly<{ kind: "summary"; text: string }>;
+
+export type CompactionInstalledItem = Readonly<{
+  origin: CompactionItemIdentity | null;
+  item: Record<string, unknown>;
+}>;
+
+export type CompactionDecision = Readonly<{
+  operation_id: string;
+  history: readonly CompactionReplacementItem[];
+}>;
+
+export type CompactionResolver = (
+  context: CompactionContext,
+  signal: AbortSignal,
+) => CompactionDecision | PromiseLike<CompactionDecision>;
 
 /** Model-visible facts for tools executing outside the embedding process. */
 export type ExecutionEnvironment = Readonly<{
@@ -381,6 +420,8 @@ export type WatchEventsOptions = { includeAllSessions?: boolean | undefined };
 export type AgentSessionContext = Readonly<{
   workspace: string;
   history: readonly Record<string, unknown>[];
+  context_window_tokens: number;
+  active_context_tokens: number;
 }>;
 
 export type CompactionItemIdentity = Readonly<{
@@ -395,8 +436,7 @@ export type CompactionOutcome = Readonly<{
   trigger: "manual" | "automatic";
   /** Generated private summary text; never an assistant display event. */
   summary: string | null;
-  replaced_history: Readonly<{ start: number; end: number }>;
-  retained_tail: readonly CompactionItemIdentity[];
+  installed_history: readonly CompactionInstalledItem[];
   context: AgentSessionContext;
 }>;
 

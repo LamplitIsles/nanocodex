@@ -16,6 +16,7 @@ pub struct NanocodexBuilder<F = StandardServiceFactory> {
     pub(super) resume: Option<SessionSnapshot>,
     pub(super) compaction_instruction_resolver:
         Option<Arc<dyn CompactionInstructionResolver + Send + Sync>>,
+    pub(super) compaction_resolver: Option<Arc<dyn CompactionResolver + Send + Sync>>,
     pub(super) factory: F,
 }
 
@@ -36,6 +37,7 @@ where
             codex: CodexCompatibility::default(),
             resume: None,
             compaction_instruction_resolver: None,
+            compaction_resolver: None,
             factory,
         }
     }
@@ -85,29 +87,31 @@ impl<F> NanocodexBuilder<F> {
         self
     }
 
-    /// Uses a consumer-owned instruction for context compaction.
+    /// Resolves the summary instruction before each custom compaction request.
     ///
-    /// When configured, explicit, automatic, and provider-overflow recovery
-    /// compaction requests a normal generation with this instruction and
-    /// installs its validated text as a client-owned checkpoint. Unconfigured
-    /// agents retain the provider compaction behavior.
-    #[must_use]
-    pub fn companion_compaction_instruction(mut self, instruction: impl Into<Arc<str>>) -> Self {
-        self.config.companion_compaction_instruction = Some(instruction.into());
-        self
-    }
-
-    /// Resolves the final instruction for each client-owned compaction.
-    ///
-    /// The resolver is awaited before any summary request. Dropping or
-    /// cancelling the surrounding operation drops the resolver future too;
-    /// failures never fall back to the static instruction.
+    /// The resolver is awaited before any summary request. An error,
+    /// cancellation, or empty instruction aborts compaction without falling
+    /// back to Nanocodex's default instruction.
     #[must_use]
     pub fn compaction_instruction_resolver(
         mut self,
         resolver: Arc<dyn CompactionInstructionResolver + Send + Sync>,
     ) -> Self {
         self.compaction_instruction_resolver = Some(resolver);
+        self
+    }
+
+    /// Resolves the complete replacement history for each host-owned compaction.
+    ///
+    /// The resolver runs after Nanocodex generates its private summary. A
+    /// failed, cancelled, stale, or structurally invalid decision leaves the
+    /// active history untouched.
+    #[must_use]
+    pub fn compaction_resolver(
+        mut self,
+        resolver: Arc<dyn CompactionResolver + Send + Sync>,
+    ) -> Self {
+        self.compaction_resolver = Some(resolver);
         self
     }
 
@@ -404,6 +408,7 @@ where
         builder.codex,
         builder.resume,
         builder.compaction_instruction_resolver,
+        builder.compaction_resolver,
         service_factory,
     )
 }
@@ -582,6 +587,8 @@ mod tests {
             prompt_cache: PromptCacheConfig::default(),
             codex: CodexCompatibility::default(),
             resume: Some(snapshot),
+            compaction_instruction_resolver: None,
+            compaction_resolver: None,
             factory: ObservingFactory {
                 model: Arc::clone(&observed_model),
             },

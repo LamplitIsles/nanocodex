@@ -49,8 +49,10 @@ pub use agent::{
 #[cfg(feature = "openai")]
 #[cfg_attr(docsrs, doc(cfg(feature = "openai")))]
 pub use compaction::{
-    CompactionInstructionContext, CompactionInstructionFuture, CompactionInstructionResolver,
-    CompactionItemIdentity, CompactionOutcome, CompactionPhase, CompactionRange, CompactionTrigger,
+    CompactionContext, CompactionDecision, CompactionFuture, CompactionHistoryItem,
+    CompactionInstalledItem, CompactionInstructionContext, CompactionInstructionFuture,
+    CompactionInstructionResolver, CompactionItemIdentity, CompactionOutcome, CompactionPhase,
+    CompactionReplacementItem, CompactionResolver, CompactionTrigger,
 };
 pub use error::{ExecutionPolicyDisposition, NanocodexError, Result};
 pub use nanocodex_oai_api::{Model, ReasoningMode, Thinking, events::AgentEvents};
@@ -78,7 +80,7 @@ pub mod events {
     };
     pub use nanocodex_oai_api::events::{
         AgentEventData, AssistantDelta, AssistantEvent, AssistantMessage, CompactionCompleted,
-        CompactionFailed, CompactionItemIdentity, CompactionRange, CompactionReplaced,
+        CompactionFailed, CompactionInstalledItem, CompactionItemIdentity, CompactionReplaced,
         CompactionSessionContext, CompactionStarted, ContextEvent, EventUsage, ModelCallCompleted,
         ModelCallFailed, ModelCallStarted, ModelEvent, ModelWarmupCompleted, ModelWarmupFailed,
         ModelWarmupStarted, ReasoningEvent, ReasoningSummaryDelta, RunError, RunEvent, RunMetrics,

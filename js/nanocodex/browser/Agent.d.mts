@@ -9,7 +9,7 @@ import type { Tools } from "../tools/Tools.mjs";
 
 export type Agent = DefaultAgent;
 /** Worker options exclude function-valued resolver callbacks. */
-type WorkerAgentOptions = Omit<AgentOptions, "resolveCompactionInstruction">;
+type WorkerAgentOptions = Omit<AgentOptions, "resolveCompaction" | "resolveCompactionInstruction">;
 
 type WorkerMcpServer = Readonly<{
   url?: string | URL | undefined;

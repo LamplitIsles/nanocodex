@@ -96,6 +96,7 @@ pub(crate) struct ModelRun<S> {
     execution_steps: Option<ExecutionSteps>,
     compaction_instruction_resolver:
         Option<Arc<dyn crate::CompactionInstructionResolver + Send + Sync>>,
+    compaction_resolver: Option<Arc<dyn crate::CompactionResolver + Send + Sync>>,
 }
 
 pub(crate) struct TurnSteering {
@@ -188,6 +189,10 @@ impl ModelCheckpoint {
         self.conversation.flattened_history()
     }
 
+    pub(crate) fn active_context_tokens(&self) -> u64 {
+        self.conversation.active_context_tokens()
+    }
+
     pub(crate) const fn context_baseline(&self) -> &ContextBaseline {
         &self.context_baseline
     }
@@ -239,6 +244,7 @@ impl<S> ModelRun<S> {
         compaction_instruction_resolver: Option<
             Arc<dyn crate::CompactionInstructionResolver + Send + Sync>,
         >,
+        compaction_resolver: Option<Arc<dyn crate::CompactionResolver + Send + Sync>>,
     ) -> Self {
         let model = config.model;
         let thinking = config.thinking;
@@ -269,6 +275,7 @@ impl<S> ModelRun<S> {
             pending_developer_messages: Vec::new(),
             execution_steps: None,
             compaction_instruction_resolver,
+            compaction_resolver,
         }
     }
 
@@ -288,6 +295,7 @@ impl<S> ModelRun<S> {
         compaction_instruction_resolver: Option<
             Arc<dyn crate::CompactionInstructionResolver + Send + Sync>,
         >,
+        compaction_resolver: Option<Arc<dyn crate::CompactionResolver + Send + Sync>>,
     ) -> Self {
         let PreparedCheckpoint {
             checkpoint,
@@ -349,6 +357,7 @@ impl<S> ModelRun<S> {
             pending_developer_messages: Vec::new(),
             execution_steps: None,
             compaction_instruction_resolver,
+            compaction_resolver,
         }
     }
 

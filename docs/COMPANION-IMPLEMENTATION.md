@@ -1,151 +1,145 @@
 # Host-owned compaction contract
 
-This document records the Nanocodex side of the host-compaction boundary. It
-does not implement a Companion or DSH adapter, persist an application
-transcript, or claim a provider cache hit from scripted tests.
+This document records the Nanocodex side of the host replacement boundary. It
+does not implement a Companion or DSH retention policy, persist an application
+transcript, or claim provider cache hits from scripted fixtures.
 
 ## Ownership
 
-Nanocodex owns one Rust model loop, typed Responses history, model/tool
-execution, compaction, cancellation, lifecycle events, and engine checkpoints.
-An embedding host owns persona instructions, the fixed
-`companionCompactionInstruction` value when it uses one, and the optional
-per-operation resolver. Nanocodex invokes the resolver and performs exactly
-one summary generation; the host does not call public `session.compact()`
-reentrantly or create a second agent.
+Nanocodex owns one model loop, typed Responses history, safe-boundary
+admission, private summary generation, cancellation, provider continuation
+reset, lifecycle events, structural validation, and context accounting. The
+embedding host owns the replacement decision and all retention policy. In
+particular, the planned DSH five-round policy does not belong in this crate.
+Legacy native DSH conversation-message breakdown drift is deferred to the
+planned official DSH upgrade and is not a merge-acceptance condition here.
 
-## Public contract
+## Rust contract
 
-The Rust embedding surface exports:
+The public agent surface is:
 
 ```rust
 pub trait CompactionInstructionResolver: 'static {
-    fn resolve(
-        &self,
-        context: CompactionInstructionContext,
-    ) -> CompactionInstructionFuture;
+    fn resolve(&self, context: CompactionInstructionContext) -> CompactionInstructionFuture;
 }
 
 pub struct CompactionInstructionContext {
     pub after_model_call_index: u32,
-    pub phase: CompactionPhase,       // PreTurn | MidTurn
-    pub trigger: CompactionTrigger,   // Manual | Automatic
+    pub phase: CompactionPhase,
+    pub trigger: CompactionTrigger,
     pub active_context_tokens: u64,
     pub auto_compact_token_limit: u64,
 }
 
-pub async fn Nanocodex::compact_with_outcome(
-    &self,
-) -> Result<Option<CompactionOutcome>>;
+pub trait CompactionResolver: 'static {
+    fn resolve(&self, context: CompactionContext) -> CompactionFuture;
+}
+
+pub struct CompactionContext {
+    pub after_model_call_index: u32,
+    pub phase: CompactionPhase,
+    pub trigger: CompactionTrigger,
+    pub active_context_tokens: u64,
+    pub context_window_tokens: u64,
+    pub auto_compact_token_limit: u64,
+    pub history_revision: u64,
+    pub operation_id: String,
+    pub history: Vec<CompactionHistoryItem>,
+    pub summary: String,
+}
+
+pub struct CompactionDecision {
+    pub operation_id: String,
+    pub history: Vec<CompactionReplacementItem>,
+}
 ```
 
-The Node/current-isolate `AgentOptions` equivalent is:
+CompactionInstructionResolver is optional and runs before every custom summary
+request admitted by the manual, automatic-pressure, overflow, or mid-turn
+paths. If it is not configured, Nanocodex uses its default summary
+instruction. Once configured, its non-empty result is authoritative: an
+exception, cancellation, or empty result stops compaction before provider
+summary dispatch and before replacement selection; Nanocodex does not silently
+fall back to its default instruction. Product-specific hosts select their own
+prompt through this neutral hook. For DSH integration, DSH explicitly returns
+its existing Companion prompt; Nanocodex does not infer or inject it.
+
+`CompactionReplacementItem::Original` copies a complete origin identity from
+the context snapshot. `Item` carries a host-created typed Responses item.
+`Summary` carries host-selected private summary text. Nanocodex materializes
+the decision, validates accepted item shapes and message roles, rejects
+engine-owned request-prefix duplication, verifies balanced tool calls/results,
+and installs the result atomically. The operation token and origin identity
+checks reject stale or foreign decisions.
+
+The installation result exposes `installed_history`, where each item contains
+the exact installed typed item and either its original identity or `None` for a
+host-created item. This mapping supports filtered non-contiguous history and
+zero retained original items without a contiguous-tail range abstraction.
+
+## JavaScript contract
+
+Node and current-isolate browser hosts expose the equivalent option:
 
 ```ts
 resolveCompactionInstruction?: (
   context: CompactionInstructionContext,
   signal: AbortSignal,
 ) => string | PromiseLike<string>;
+
+resolveCompaction?: (
+  context: CompactionContext,
+  signal: AbortSignal,
+) => CompactionDecision | PromiseLike<CompactionDecision>;
 ```
 
-The resolver is called before manual, automatic pressure, mid-tool, and
-provider-overflow summary generation. Its result must be a non-empty string.
-When configured, it supplies the instruction for that operation; a failure or
-cancellation is returned to the caller and never falls back to the static
-instruction. `companionCompactionInstruction` remains available for a fixed
-host-owned instruction.
+The runtime serializes callbacks through the existing WASM host bridge and
+deep-freezes callback snapshots. `resolveCompactionInstruction` is independent
+of `resolveCompaction`: the former chooses the summary instruction before the
+provider request, while the latter chooses installed history after the private
+summary. The default browser Worker does not expose function callbacks and
+rejects either resolver at runtime.
 
-`agent.session.compact()` and `Actions.session.compact(agent)` return the
-custom replacement below, or `null` when provider-default compaction is
-active (its retention policy is not the contiguous custom range described
-here):
+`CompactionOutcome` contains the revision, trigger, generated private summary,
+installed history/provenance, and a post-install `AgentSessionContext`. The
+session context and outcome both report the configured `context_window_tokens`
+and the engine's current `active_context_tokens`. Cumulative billed turn usage
+remains a separate accounting surface.
 
-```ts
-type CompactionOutcome = Readonly<{
-  revision: string;
-  trigger: "manual" | "automatic";
-  summary: string | null;
-  replaced_history: Readonly<{ start: number; end: number }>;
-  retained_tail: readonly CompactionItemIdentity[];
-  context: AgentSessionContext;
-}>;
-```
+## Lifecycle behavior
 
-`summary` is private and is never emitted as assistant output. The half-open
-`replaced_history` range refers to the pre-replacement managed history. Each
-`retained_tail` identity includes its pre-replacement index, Responses item
-kind, provider/client item ID when present, and tool `call_id` when present.
-`context.history` is the complete post-replacement model-visible history.
-The monotonic revision and ordered result calls let a host distinguish
-multiple completed replacements; no private snapshot fields or summary-text
-boundary inference are required.
+Nanocodex first resolves a configured custom instruction, then generates one
+display-suppressed private summary with the live request profile. The selected
+instruction is applied on manual, automatic-pressure, overflow, and mid-turn
+paths. It then captures the immutable safe-boundary history, calls an optional
+post-summary replacement resolver, validates the decision, and commits the
+replacement as one history revision. A pre-summary instruction exception,
+abort, or empty result stops before provider dispatch. A post-summary resolver
+exception, abort, invalid origin, stale operation token, unbalanced tool
+history, unsupported item, or summary failure does not partially replace the
+active history. A completed summary request that is not installed resets
+provider continuation to a safe full-replay baseline.
 
-Automatic custom replacements do not return through the manual action. At the
-safe installation boundary they emit `model.compaction.replaced` with the
-same fields plus `phase` and `after_model_call_index`. Manual custom
-compaction emits the event too, after `model.compaction.completed` and after
-the managed history has been replaced. Each event contains the actual
-post-install `context`, so repeated replacements can be projected in event
-order without inspecting a snapshot.
+Every admitted replacement operation receives a fresh opaque operation identity,
+including retries after failure or cancellation. A decision cached from an
+earlier operation cannot be installed on a retry, even when every replacement
+item was created by the host.
 
-## Generation and installation behavior
+Without a custom instruction or post-summary resolver, the existing provider
+compaction path and its automatic engine trigger remain unchanged. No host
+retention policy or five-round fallback is applied by Nanocodex.
 
-For a host-owned summary, the live request factory keeps the complete request
-prefix: instructions, tool declarations and namespace metadata, model/effort
-settings, prompt-cache key, and typed history. The final host instruction is
-appended at the end. Eligible Responses Lite continuation and the existing
-full-replay transport policy remain in use. A successful summary installation
-clears the old provider continuation and makes the next ordinary request a
-full replay; cache preservation is required for summary generation, not for
-the post-installation request.
+## Verification and delivery boundary
 
-Summary output is validated as a non-empty generation with no code/tool
-calls. Summary requests are display-suppressed, and no historical or summary
-tool call is dispatched. The replacement preserves the latest real-user-led
-complete tail, including completed tool call/output identities. Provider
-failure, invalid output, resolver failure, or cancellation leaves the prior
-usable history and continuation in place. Explicit compaction may cancel an
-active turn, so embedding hosts should call it from idle maintenance.
+The implementation includes native and WASM contract checks for explicit and
+automatic replacement, filtered/non-contiguous and zero-original selections,
+operation/origin validation, balanced tool histories, resolver failure and
+cancellation, repeated replacement, context accounting, and normal turn
+completion. The local release build emits Node and browser WASM bindings; the
+implementation report records source revision, artifact paths, and hashes.
 
-Without either host-owned option, the existing provider compaction behavior
-is unchanged. Automatic compaction remains at the engine's safe boundary and
-does not invoke public host operations.
-
-## Verification
-
-The deterministic evidence for this PR uses only an in-process scripted
-Responses service or a local scripted WebSocket peer. It includes:
-
-- native warm continuation, context-overflow, automatic-pressure, and
-  mid-tool recovery fixtures;
-- native proof that a completed tool side effect occurs once and is not
-  replayed by compaction;
-- Node/WASM dynamic instruction selection for repeated manual operations,
-  typed private outcomes, resolver failure, resolver cancellation, summary
-  failure, and provider-generation cancellation;
-- Node/WASM durable checkpoint resume and public history hydration;
-- Rust package checks, generated WASM, JavaScript runtime/type checks, and
-  package validation.
-
-The scripted provider's `cached_tokens` values are fixture data. They are not
-evidence of an actual provider cache hit. Live cached-token observation is a
-separate Owner-authorized verification boundary.
-
-The package-owned browser Worker intentionally does not support the resolver:
-function values cannot cross its structured-clone boundary. Its public
-options omit `resolveCompactionInstruction`, and runtime configuration rejects
-one if supplied. This deliverable does not add a Worker RPC for prompt
-selection.
-
-## Repository inspection and delivery boundary
-
-The root `README.md` was inspected and remains unchanged because this feature
-does not change repository setup, deployment commands, or operator entrypoints.
-The root `AGENTS.md` was inspected and remains unchanged because no agent
-workflow, command convention, or ownership rule changed. The affected public
-embedding documentation is [the JavaScript package README](../js/nanocodex/README.md).
-
-No DSH or sibling repository source, deployment, publication, live provider,
-benchmark, or production state is part of this deliverable. The companion
-adapter may consume the public resolver and `CompactionOutcome` contract after
-Owner acceptance.
+The repository README and AGENTS guidance were inspected. Root setup and
+deployment instructions remain unchanged; this document and the JavaScript
+package README are the affected integration documentation. No DSH or sibling
+repository source, publication, deployment, service, or production state is
+part of this implementation.

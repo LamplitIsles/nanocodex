@@ -322,28 +322,58 @@ test("the headless client exposes matching direct and standalone actions", async
   await Actions.session.compact(agent);
   assert.deepEqual(
     await agent.session.context(),
-    { workspace: "/workspace", history: [{ type: "message", role: "developer" }] },
+    {
+      workspace: "/workspace",
+      context_window_tokens: 272000,
+      active_context_tokens: 1,
+      history: [{ type: "message", role: "developer" }],
+    },
   );
   assert.deepEqual(
     await Actions.session.context(agent),
-    { workspace: "/workspace", history: [{ type: "message", role: "developer" }] },
+    {
+      workspace: "/workspace",
+      context_window_tokens: 272000,
+      active_context_tokens: 1,
+      history: [{ type: "message", role: "developer" }],
+    },
   );
   assert.deepEqual(
     await agent.session.appendDeveloperMessage("voice started"),
-    { workspace: "/workspace", history: [{ type: "message", role: "developer" }] },
+    {
+      workspace: "/workspace",
+      context_window_tokens: 272000,
+      active_context_tokens: 1,
+      history: [{ type: "message", role: "developer" }],
+    },
   );
   assert.deepEqual(
     await Actions.session.appendDeveloperMessage(agent, "voice stopped"),
-    { workspace: "/workspace", history: [{ type: "message", role: "developer" }] },
+    {
+      workspace: "/workspace",
+      context_window_tokens: 272000,
+      active_context_tokens: 1,
+      history: [{ type: "message", role: "developer" }],
+    },
   );
   await assert.rejects(agent.session.appendDeveloperMessage("  "), /non-empty string/);
   assert.deepEqual(
     await agent.session.realtime.start(),
-    { workspace: "/workspace", history: [{ type: "message", role: "developer" }] },
+    {
+      workspace: "/workspace",
+      context_window_tokens: 272000,
+      active_context_tokens: 1,
+      history: [{ type: "message", role: "developer" }],
+    },
   );
   assert.deepEqual(
     await agent.session.realtime.end(),
-    { workspace: "/workspace", history: [{ type: "message", role: "developer" }] },
+    {
+      workspace: "/workspace",
+      context_window_tokens: 272000,
+      active_context_tokens: 1,
+      history: [{ type: "message", role: "developer" }],
+    },
   );
   assert.equal(
     await agent.session.realtime.delegation("ship", [{ role: "user", text: "now" }]),
@@ -535,7 +565,7 @@ test("the WASM config distinguishes prompt replacement from host additions", () 
   });
 });
 
-test("the WASM config carries Companion policy and engine-owned history seeds", () => {
+test("the WASM config enables custom instruction and host replacement independently", () => {
   const history = [{
     type: "message",
     role: "user",
@@ -543,14 +573,16 @@ test("the WASM config carries Companion policy and engine-owned history seeds", 
   }];
   assert.deepEqual(toWasmConfig({
     apiKey: "test-key",
-    companionCompactionInstruction: "Keep the important facts.",
+    resolveCompactionInstruction: () => "custom instruction",
+    resolveCompaction: () => ({ operation_id: "test", history: [] }),
     historySeed: {
       history,
       continuitySummary: "The user supplied one fact.",
     },
   }), {
     api_key: "test-key",
-    companion_compaction_instruction: "Keep the important facts.",
+    dynamic_compaction_instruction: true,
+    dynamic_compaction: true,
     history_seed: {
       history,
       continuity_summary: "The user supplied one fact.",
@@ -1020,12 +1052,16 @@ function rawAgent(sessionId) {
     async context() {
       return JSON.stringify({
         workspace: "/workspace",
+        context_window_tokens: 272000,
+        active_context_tokens: 1,
         history: [{ type: "message", role: "developer" }],
       });
     },
     async appendDeveloperMessage() {
       return JSON.stringify({
         workspace: "/workspace",
+        context_window_tokens: 272000,
+        active_context_tokens: 1,
         history: [{ type: "message", role: "developer" }],
       });
     },

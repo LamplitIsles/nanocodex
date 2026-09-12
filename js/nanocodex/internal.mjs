@@ -14,6 +14,7 @@ const cloudflareAgentSessions = new WeakSet();
 const hostConnections = new Map();
 const definitionHosts = new Map();
 const pendingCompactionInstructions = new Set();
+const pendingCompactions = new Set();
 let nextHostConnection = 1;
 let nextDefinitionHost = 1;
 let nextAgentUid = 1;
@@ -332,9 +333,11 @@ export function toWasmConfig(options = {}) {
   copy(config, "api_base_url", options.apiBaseUrl);
   copy(config, "instructions", options.instructions);
   copy(config, "additional_instructions", options.additionalInstructions);
-  copy(config, "companion_compaction_instruction", options.companionCompactionInstruction);
   if (options.resolveCompactionInstruction !== undefined) {
     config.dynamic_compaction_instruction = true;
+  }
+  if (options.resolveCompaction !== undefined) {
+    config.dynamic_compaction = true;
   }
   if (options.historySeed !== undefined) {
     const seed = options.historySeed;
@@ -468,6 +471,9 @@ export function registerDefinitionHost(host, cloudflareReservation) {
 
 export function releaseDefinitionHost(id) {
   for (const pending of [...pendingCompactionInstructions]) {
+    if (pending.definitionHostId === id) pending.cancel();
+  }
+  for (const pending of [...pendingCompactions]) {
     if (pending.definitionHostId === id) pending.cancel();
   }
   definitionHosts.delete(id);
@@ -666,7 +672,7 @@ const hostBridge = Object.freeze({
   },
   resolveCompactionInstruction(definitionHostId, contextJson) {
     const host = requiredDefinitionHost(definitionHostId);
-    const context = JSON.parse(contextJson);
+    const context = deepFreeze(JSON.parse(contextJson));
     const controller = new AbortController();
     const pending = {
       definitionHostId,
@@ -694,6 +700,51 @@ const hostBridge = Object.freeze({
         .finally(() => {
           pending.active = false;
           pendingCompactionInstructions.delete(pending);
+        });
+    } catch (error) {
+      pending.cancel();
+      result = Promise.reject(error);
+    }
+    result.cancel = pending.cancel;
+    // A dropped WASM JsFuture still owns this promise. Keep cancellation
+    // rejections observed when the host's resolver is abort-aware.
+    result.catch(() => {});
+    return result;
+  },
+  resolveCompaction(definitionHostId, contextJson) {
+    const host = requiredDefinitionHost(definitionHostId);
+    const context = deepFreeze(JSON.parse(contextJson));
+    const controller = new AbortController();
+    const pending = {
+      definitionHostId,
+      active: true,
+      cancel() {
+        if (!pending.active) return;
+        pending.active = false;
+        pendingCompactions.delete(pending);
+        controller.abort(new Error("compaction resolution was cancelled"));
+      },
+    };
+    pendingCompactions.add(pending);
+    let result;
+    try {
+      if (typeof host.resolveCompaction !== "function") {
+        throw new Error("the Nanocodex host does not provide compaction resolution");
+      }
+      result = Promise.resolve(host.resolveCompaction(context, controller.signal))
+        .then((decision) => {
+          if (!decision || typeof decision !== "object" || Array.isArray(decision)) {
+            throw new TypeError("compaction resolver must return a decision object");
+          }
+          const encoded = JSON.stringify(decision);
+          if (typeof encoded !== "string") {
+            throw new TypeError("compaction resolver returned a non-JSON decision");
+          }
+          return encoded;
+        })
+        .finally(() => {
+          pending.active = false;
+          pendingCompactions.delete(pending);
         });
     } catch (error) {
       pending.cancel();
@@ -751,6 +802,13 @@ export function loadSubscriptionRuntime() {
   return import("./runtime/chatgpt-subscription.mjs");
 }
 
+function deepFreeze(value) {
+  if (!value || typeof value !== "object" || Object.isFrozen(value)) return value;
+  Object.freeze(value);
+  for (const child of Object.values(value)) deepFreeze(child);
+  return value;
+}
+
 function createAgent(
   raw,
   runtime,
@@ -785,7 +843,8 @@ function createAgent(
     agentId: typeof raw.agentId === "string" ? raw.agentId : raw.sessionId,
     sessionId: raw.sessionId,
     uid: `agent-${nextAgentUid++}`,
-  };
+};
+
   try {
     runtime.adopt?.(raw);
   } catch (error) {
