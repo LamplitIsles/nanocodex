@@ -1018,6 +1018,34 @@ async fn apply_browser_patch_plan(
     Ok(plan.summary().to_owned())
 }
 
+/// Returns the source files needed by the canonical patch planner.
+#[wasm_bindgen(js_name = requiredPatchFiles)]
+pub fn required_patch_files(patch: &str) -> Result<String, JsValue> {
+    let paths = nanocodex::tools::apply_patch::required_files(patch).map_err(js_error)?;
+    serde_json::to_string(&paths).map_err(js_error)
+}
+
+/// Plans a patch without performing host I/O. Hosts execute the verified operations.
+#[wasm_bindgen(js_name = planWorkspacePatch)]
+pub fn plan_workspace_patch(patch: &str, files_json: &str) -> Result<String, JsValue> {
+    use nanocodex::tools::apply_patch::{PatchOperation, plan};
+    let files: HashMap<PathBuf, String> = serde_json::from_str(files_json).map_err(js_error)?;
+    let plan = plan(patch, &files).map_err(js_error)?;
+    let operations: Vec<_> = plan
+        .operations()
+        .iter()
+        .map(|operation| match operation {
+            PatchOperation::Write { path, contents } => serde_json::json!({
+                "type": "write", "path": path, "contents": contents,
+            }),
+            PatchOperation::Delete { path } => serde_json::json!({
+                "type": "delete", "path": path,
+            }),
+        })
+        .collect();
+    Ok(serde_json::json!({ "summary": plan.summary(), "operations": operations }).to_string())
+}
+
 /// Applies a browser-workspace patch through the canonical Rust planner.
 ///
 /// The browser host uses this internal binding for nested Code Mode calls so

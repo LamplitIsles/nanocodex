@@ -1456,3 +1456,27 @@ cd examples/node
 npm install
 OPENAI_API_KEY=... npm start
 ```
+
+### Node patch editing
+
+Register `applyPatch` from `nanocodex/node` to use the canonical Rust/WASM
+patch planner with a caller-owned workspace:
+
+```js
+import { Agent, Transport, Workspace, applyPatch } from "nanocodex/node";
+
+const workspace = await Workspace.open({ path: "./agent-files" });
+const agent = await Agent.create({
+  transport: Transport.openAi({ apiKey: process.env.OPENAI_API_KEY }),
+  tools: { apply_patch: applyPatch({ workspace }) },
+});
+```
+
+The model can call `apply_patch` directly with a raw patch string or call
+`await tools.apply_patch(patch)` inside Code Mode. The tool supports add,
+update, move, and delete operations. It does not require setting the agent's
+`filesystem` or changing its session workspace. Each tool instance serializes
+its patch calls; parsing and hunk verification finish before writes begin.
+Filesystem access follows the supplied workspace's rules (the Node workspace
+rejects traversal and symlinks). Multi-file writes are not atomic: an I/O
+failure reports which operations completed, and external edits are not locked.

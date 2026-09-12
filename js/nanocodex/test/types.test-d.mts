@@ -1,3 +1,5 @@
+import { applyPatch as nodeApplyPatch } from "../node/index.mjs";
+import type { Workspace as PatchWorkspace, Tool as PatchTool } from "nanocodex-tools";
 import {
   Actions,
   Agent,
@@ -733,3 +735,8 @@ async function check() {
 }
 
 void check;
+
+function checkNodePatch(workspace: PatchWorkspace): PatchTool {
+  return nodeApplyPatch({ workspace });
+}
+void checkNodePatch;

@@ -1,3 +1,4 @@
+export { applyPatch } from "./apply-patch.mjs";
 export * as Actions from "../actions/index.mjs";
 export {
   createMemoryChatGptSubscriptionStore,
