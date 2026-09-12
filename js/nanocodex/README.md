@@ -1110,6 +1110,13 @@ of manually persisting snapshots. The host stores one opaque Rust state value;
 model replay, tool ambiguity, operation deduplication, and checkpoint recovery
 remain in Rust/WASM:
 
+The payload is one versioned opaque string. Small states use direct format-2
+JSON; larger states may use the existing gzip envelope or the lossless
+`nanocodex-durable-state-dedup-v1:` envelope, which stores repeated immutable
+byte segments once before gzip/base64 encoding. Hosts and transfer adapters do
+not inspect these representations, and the store contract remains one atomic
+load/acquire/replace value.
+
 ```js
 import { Agent, Transport } from "nanocodex/host";
 

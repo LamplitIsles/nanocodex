@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { test } from "node:test";
-import { gunzipSync } from "node:zlib";
 import { Agent, Subagents, Transport } from "../host/index.mjs";
 import { initializeBrowserEngine } from "../browser/engine.mjs";
 import { createMemoryDurabilityStore } from "../runtime/durability-store.mjs";
@@ -52,24 +51,43 @@ test("durable subagent messaging survives a WASM heap beyond the Worker subarray
     for (let index = 0; index < 8; index++) {
       const child = children[index % 2];
       const result = await Subagents.send(agent, {
-        agentId: child.agent_id, priority: "urgent", purpose: "question", message: `Checkpoint Ελληνικά 😀 ${index}`,
+        agentId: child.agent_id,
+        priority: "urgent",
+        purpose: index === 7 ? "delegate" : "question",
+        message: `Checkpoint Ελληνικά 😀 ${index}`,
       });
       assert.equal(result.to_agent_id, child.agent_id);
     }
     assert.ok(writes.length >= initialWrites + 8, "each message must reach the durable store");
-    const persisted = writes.slice(initialWrites).map(({ payload }) => payload.startsWith("nanocodex-durable-state-gzip-v1:")
-      ? gunzipSync(Buffer.from(payload.slice("nanocodex-durable-state-gzip-v1:".length), "base64")).toString("utf8")
-      : payload).join("\n");
-    assert.ok(persisted.includes("Checkpoint Ελληνικά 😀 7"));
-    assert.equal((await Subagents.list(agent)).agents.length, 2);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(
+      (await Subagents.list(agent)).agents.map(({ role, task, status }) => ({ role, task, status })),
+      [
+        { role: "one", task: "Wait for directed checkpoint messages", status: { state: "running" } },
+        { role: "two", task: "Checkpoint Ελληνικά 😀 7", status: { state: "running" } },
+      ],
+      "public child state must expose the exact delegated checkpoint message",
+    );
     await agent.session.shutdown();
     agent = await Agent.create(options);
+    assert.deepEqual(
+      await Subagents.list(agent, { includeCompleted: true }),
+      { agents: [] },
+      "reopening a browser Agent starts with no live child execution",
+    );
     const replacement = await Subagents.spawn(agent, {
       role: "after-reopen", task: "Verify checkpointing after reopen", outputSchema: { type: "object" },
     });
+    const reopenedMessage = "Still durable after reopen 😀";
     assert.equal((await Subagents.send(agent, {
-      agentId: replacement.agent_id, priority: "urgent", message: "Still durable after reopen 😀",
+      agentId: replacement.agent_id, priority: "urgent", purpose: "delegate", message: reopenedMessage,
     })).to_agent_id, replacement.agent_id);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(
+      (await Subagents.list(agent)).agents.map(({ role, task, status }) => ({ role, task, status })),
+      [{ role: "after-reopen", task: reopenedMessage, status: { state: "running" } }],
+      "public reopened child state must expose its exact message",
+    );
   } finally {
     Uint8Array.prototype.subarray = nativeSubarray;
     try { await agent?.session.shutdown(); }

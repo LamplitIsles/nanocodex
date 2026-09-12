@@ -310,24 +310,10 @@ impl crate::StateStore for CountingAcquires {
     }
 }
 
-// Fault injection inspects Rust-owned state after decoding its storage envelope.
-fn checkpoint_value(payload: &str) -> serde_json::Value {
-    use base64::Engine as _;
-    if let Some(encoded) = payload.strip_prefix("nanocodex-durable-state-gzip-v1:") {
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(encoded)
-            .unwrap();
-        serde_json::from_reader(flate2::read::GzDecoder::new(bytes.as_slice())).unwrap()
-    } else {
-        serde_json::from_str(payload).unwrap()
-    }
-}
-
 #[derive(Clone)]
 struct FailEntryOnce {
     inner: crate::MemoryStore,
-    entry_tag: &'static str,
-    operation_id: &'static str,
+    fail_at_revision: u64,
     failed: Arc<AtomicBool>,
 }
 
@@ -347,15 +333,7 @@ impl crate::StateStore for FailEntryOnce {
         expected_revision: u64,
         payload: &'a str,
     ) -> crate::StoreFuture<'a, std::result::Result<u64, crate::StoreError>> {
-        let state = checkpoint_value(payload);
-        let operation_status =
-            &state["nanocodex_durable_state"]["operations"][self.operation_id]["status"];
-        let matches_entry = match self.entry_tag {
-            "\"operation_cancelled\"" => operation_status.get("cancelled").is_some(),
-            "\"operation_completed\"" => operation_status.get("completed").is_some(),
-            other => state.to_string().contains(other),
-        };
-        if matches_entry && !self.failed.swap(true, Ordering::SeqCst) {
+        if expected_revision == self.fail_at_revision && !self.failed.swap(true, Ordering::SeqCst) {
             return Box::pin(async {
                 Err(crate::StoreError::NotCommitted(
                     "injected state replacement failure".to_owned(),
@@ -370,6 +348,7 @@ impl crate::StateStore for FailEntryOnce {
 #[derive(Clone)]
 struct GateCompactionAuthorization {
     inner: crate::MemoryStore,
+    compaction_revision: u64,
     started: Arc<tokio::sync::Notify>,
     release: Arc<tokio::sync::Notify>,
 }
@@ -390,10 +369,7 @@ impl crate::StateStore for GateCompactionAuthorization {
         expected_revision: u64,
         payload: &'a str,
     ) -> crate::StoreFuture<'a, std::result::Result<u64, crate::StoreError>> {
-        let state = checkpoint_value(payload).to_string();
-        if state.contains("\"status\":\"effect_pending\"")
-            && state.contains("\"kind\":\"compaction\"")
-        {
+        if expected_revision == self.compaction_revision {
             let started = Arc::clone(&self.started);
             let release = Arc::clone(&self.release);
             return Box::pin(async move {
@@ -2716,8 +2692,7 @@ async fn active_cancel_reclaims_a_definitely_uncommitted_terminal_before_follow_
     let store = MemoryStore::new()?;
     let failing = FailEntryOnce {
         inner: store.clone(),
-        entry_tag: "\"operation_cancelled\"",
-        operation_id: "cancel-not-committed",
+        fail_at_revision: 5,
         failed: Arc::new(AtomicBool::new(false)),
     };
     let generations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2879,8 +2854,7 @@ async fn queued_cancel_reclaims_a_definitely_uncommitted_terminal_before_follow_
     let store = MemoryStore::new()?;
     let failing = FailEntryOnce {
         inner: store,
-        entry_tag: "\"operation_cancelled\"",
-        operation_id: "queued-cancel-not-committed",
+        fail_at_revision: 6,
         failed: Arc::new(AtomicBool::new(false)),
     };
     let generations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2940,8 +2914,7 @@ async fn automatic_compaction_replays_a_after_terminal_not_committed_instead_of_
     let store = MemoryStore::new()?;
     let failing = FailEntryOnce {
         inner: store,
-        entry_tag: "\"operation_completed\"",
-        operation_id: "compaction-terminal-retry",
+        fail_at_revision: 11,
         failed: Arc::new(AtomicBool::new(false)),
     };
     let generations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -3027,6 +3000,7 @@ async fn takeover_during_automatic_compaction_authorization_fences_before_provid
     let authorization_release = Arc::new(tokio::sync::Notify::new());
     let gated = GateCompactionAuthorization {
         inner: store.clone(),
+        compaction_revision: 7,
         started: Arc::clone(&authorization_started),
         release: Arc::clone(&authorization_release),
     };
@@ -3330,8 +3304,7 @@ async fn follow_on_turn_replays_after_cold_reopen() -> Result<()> {
     let store = MemoryStore::new()?;
     let failing_store = FailEntryOnce {
         inner: store.clone(),
-        entry_tag: "\"operation_completed\"",
-        operation_id: "second-turn",
+        fail_at_revision: 9,
         failed: Arc::new(AtomicBool::new(false)),
     };
     let generations = Arc::new(std::sync::atomic::AtomicUsize::new(0));

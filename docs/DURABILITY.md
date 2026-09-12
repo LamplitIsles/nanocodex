@@ -117,12 +117,17 @@ Managed sessions keep 16 inner terminal receipts; their managed inbox and archiv
 continue to own public exact-ID replay beyond that tail.
 
 State format 2 uses the `nanocodex_durable_state` envelope. Small states retain
-that JSON directly. Above 256 KiB, serialization streams into gzip and base64
-with the `nanocodex-durable-state-gzip-v1:` prefix, avoiding a complete
-uncompressed crossover allocation. Recovery accepts both encodings and
-validates the gzip checksum and complete envelope before admitting operations.
-The serialized payload remains opaque to every host and transfer adapter.
-Runtime versions predating this encoding cannot reopen compressed states.
+that JSON directly. Above 256 KiB, serialization streams through the existing
+gzip/base64 representation when no repeated chunks are present. When immutable
+byte segments repeat, the Rust encoder uses the versioned
+`nanocodex-durable-state-dedup-v1:` envelope, which stores repeated chunks once
+in a bounded dictionary and reconstructs the exact JSON through a token stream
+before gzip and base64 encoding. Recovery accepts direct JSON, the existing
+`nanocodex-durable-state-gzip-v1:` representation, and the deduplicated
+representation. It validates gzip checksums, output/token bounds, references,
+and the complete envelope before admitting operations. The serialized payload
+remains opaque to every host and transfer adapter. Runtime versions predating
+the corresponding encoding cannot reopen states written with it.
 Format 1, the former `nanocodex_journal_state` envelope, and individual event
 batches remain rejected.
 

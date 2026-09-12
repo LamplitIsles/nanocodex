@@ -79,8 +79,11 @@ impl StateStore for StepGateStore {
         payload: &'a str,
     ) -> StoreFuture<'a, Result<u64, StoreError>> {
         let matches = match self.moment {
-            StepGateMoment::BeforeStartCommit => payload.contains("\"status\":\"effect_pending\""),
-            StepGateMoment::AfterCompletionCommit => payload.contains("\"status\":{\"completed\":"),
+            // Admission is revision 1; beginning the step is the next
+            // replacement. Completion follows that replacement at revision
+            // 2. The fake gates the protocol boundary, not the opaque bytes.
+            StepGateMoment::BeforeStartCommit => expected_revision == 1,
+            StepGateMoment::AfterCompletionCommit => expected_revision == 2,
         };
         if matches && !self.used.swap(true, Ordering::SeqCst) {
             let entered = Arc::clone(&self.entered);

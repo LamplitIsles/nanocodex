@@ -241,6 +241,11 @@ Unfinished effects are deliberately at-least-once and may be billed or applied
 again after recovery. Live attempts are fenced in-memory capabilities, not a
 second durable state machine.
 
+Large Rust-owned checkpoints use a versioned lossless representation that can
+store repeated immutable byte segments once before gzip encoding. This remains
+one opaque payload to memory, SQLite, Postgres, and caller-provided stores; no
+host parser or schema change is required.
+
 The layer implements the agent's neutral execution-policy seam; the core agent
 does not depend on it. Lower-level consumers can use `DurableSession` directly
 with caller-owned operation, step, checkpoint, and output types. It currently
