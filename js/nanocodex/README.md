@@ -178,6 +178,114 @@ DSH owns any product retention policy, including its planned five-round
 policy. Legacy native DSH conversation-message breakdown drift is outside this
 engine contract and is deferred to the planned official DSH upgrade.
 
+### Current execution context and owned work
+
+`resolveContext` is an optional current-isolate callback. Nanocodex invokes it
+once when an accepted prompt reaches the model boundary, after earlier FIFO
+work and any driver-owned compaction have been handled. It is not evaluated
+when a prompt is merely waiting in the queue. The callback receives the stable
+operation identity, selected model, resolved workspace, exact prompt, and
+submitted supplementary context. It may return any combination of
+`instructions`, `hostContext`, and `supplementaryContext`.
+
+The instruction field has replacement semantics through the existing
+`instructions` seam:
+
+- If the callback omits `instructions`, Nanocodex restores the configured
+  `instructions` value, or the selected naco model defaults when that option
+  was omitted. Configured `additionalInstructions` remains part of that
+  default path.
+- A returned `instructions` string is the complete externally owned product
+  replacement. Nanocodex does not append another product or coding identity.
+- A returned `instructions: ""` explicitly clears the replacement. It does
+  not select the naco defaults or a previous callback result.
+
+Omitted `hostContext` and `supplementaryContext` preserve their configured or
+submitted values; an explicitly empty string clears the corresponding value.
+This omission-versus-empty distinction is retained for every queued turn,
+warm or cold resume, model transition, and subsequent execution boundary. A
+resolver error or cancellation fails before provider dispatch, without falling
+back to stale or default product instructions.
+
+Changing the effective instruction changes the provider request prefix, so the
+engine resets the provider continuation and replays retained history before
+the next request. The request still keeps runtime/tool protocol data separate:
+the `additional_tools` prefix and Nanocodex runtime/context developer items
+remain engine-owned, while the replacement developer item carries the
+complete product instruction selected by the host. A context resolver does not
+replace or duplicate the custom compaction instruction resolver; active
+manual, automatic, and mid-turn compaction retain the current replacement, and
+the next queued turn resolves its context afresh.
+
+A downstream product assembles its own complete prompt and returns it through
+this one seam, without placing product wording in Nanocodex:
+
+```js
+const agent = await Agent.create({
+  transport: Transport.openAi({ apiKey: process.env.OPENAI_API_KEY }),
+  resolveContext: async (context, signal) => {
+    signal.throwIfAborted?.();
+    const productPrompt = await productHost.assemblePrompt(context);
+    return { instructions: productPrompt };
+  },
+});
+```
+
+The execution domain exposes the engine-owned reconciliation view:
+
+```js
+const current = await agent.execution.snapshot();
+// current.operations: pending, active, and retained terminal identities
+await agent.execution.cancel("operation-7");
+// After reconnect, recover retained input without reconstructing it in the Host.
+const resumed = await agent.execution.resume("operation-8");
+const result = await resumed.result();
+```
+
+`execution.resume(id)` reads the retained prompt and submitted supplementary
+context and goes through the same admission/effect guards as the original turn.
+It returns the ordinary `Turn`. Terminal work replays its stored outcome;
+unknown/pruned identities and standalone maintenance operations fail explicitly.
+Resume unfinished prompts in the snapshot's acceptance order. Interrupted
+external effects can still require the existing explicit recovery decision.
+Cancelling an unfinished identity also works after reconnect, before resuming it.
+These operations require a configured execution/durability policy; a plain
+conversation snapshot does not retain an accepted queue.
+
+Node and current-isolate callers can supply `toolProviders`. Each provider
+implements `definitions()` and `resolve(name)` using one caller-owned catalog;
+`resolveContext` may refresh that catalog before returning. The next request
+rebuilds the complete tool profile, including tool-name mappings, and tool
+execution uses the same provider. Removed tools must also disappear from
+`resolve`, not just the displayed definitions. Existing in-flight tool batches
+retain their admitted catalog; refresh at the execution boundary and keep
+session-specific authorization in handlers when sharing providers. Provider
+`close()` participates in host cleanup. The package Worker rejects these
+function-bearing providers; construct them inside the execution isolate.
+
+The snapshot is bounded: every unfinished operation is included, while only
+the newest retained terminal receipts are included. `truncated` marks an older
+terminal reconciliation window. Subscribe to `execution.state` before reading
+the initial snapshot, and use each notification to request a fresh snapshot.
+Serialize these reads before updating the display; do not apply a buffered
+notification's status over a newer snapshot. This closes the subscription/read
+race using the existing event watcher and authoritative query. `revision` is the
+durable storage revision, not an activity sequence. JSON `revision` and
+`accepted_order` are canonical decimal strings so all u64 values survive JavaScript;
+preserve the returned order or compare using `BigInt`, not `Number`. Thus, pending and active can share
+a revision. Reconnect with a new subscription and fresh snapshot. Durable
+acceptance is committed before `turn.accepted()` resolves; a store error is
+reported instead of acknowledging uncommitted work. Unfinished effects after a
+crash remain subject to the durability recovery/ambiguity rules documented by
+the Rust durability layer.
+
+The current implementation preserves existing staging data. It does not
+perform automatic migration or keep long-lived compatibility reads for the new
+execution contract. Durable prompt inputs now retain a prompt/context envelope; existing stored inputs need the separately approved cutover. A separate one-time migration proposal, including backup,
+verification, and rollback steps, must be approved before any deployment that
+needs to transform existing durable state. Migration and deployment are outside
+this SDK implementation boundary.
+
 Transports are explicit, immutable configurations, like viem v3 transports:
 
 ```js

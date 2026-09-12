@@ -571,6 +571,18 @@ impl ResponsesAttemptFactory {
         }
     }
 
+    /// Refreshes tool-name mappings without changing session or thread identity.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_tool_mappings_from(&self, profile: &RequestProfile) -> Self {
+        Self {
+            profile: Arc::new((*self.profile).clone().with_tool_mappings_from(profile)),
+            observer: self.observer.clone(),
+            logical_turn: self.logical_turn,
+            session_transport: Arc::clone(&self.session_transport),
+        }
+    }
+
     /// Reconstructs retained request content on the current event and transport owner.
     #[doc(hidden)]
     pub fn with_request_content(

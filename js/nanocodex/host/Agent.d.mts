@@ -7,6 +7,7 @@ import type {
   ExecutionEnvironment,
   McpServers,
   ToolConfiguration,
+  ToolProvider,
 } from "../types.mjs";
 import type { ManagedTransport, ResponsesTransport } from "../browser/Transport.mjs";
 import type { Tool as SubagentTool } from "../runtime/subagents.mjs";
@@ -32,6 +33,8 @@ export declare namespace create {
     /** Disable the legacy list/read/write workspace functions when a shell owns filesystem access. */
     filesystemTools?: boolean | undefined;
     module?: unknown;
+    /** Dynamic tools refreshed by the current execution-context callback. */
+    toolProviders?: readonly ToolProvider[];
     /** Fixed workspace facts, including its AGENTS.md snapshot. */
     executionEnvironment?: ExecutionEnvironment | undefined;
     /** Optional CSP-compatible Code Mode evaluator, such as createQuickJsEvaluator(). */

@@ -1,6 +1,7 @@
 import type {
   CompactionInstructionResolver,
   CompactionResolver,
+  ExecutionContextResolver,
   CodeEvaluator,
   McpServers,
   MppSession,
@@ -73,6 +74,8 @@ export function createBrowserHost(options?: {
   resolveCompactionInstruction?: CompactionInstructionResolver;
   /** Selects the complete replacement history in the current isolate for each compaction operation. */
   resolveCompaction?: CompactionResolver;
+  /** Resolves current execution context in the current browser isolate. */
+  resolveContext?: ExecutionContextResolver;
   toolMode?: "code" | "direct";
   /** @internal Durable host lifecycle for Rust-owned subagent descriptors. */
   subagentSessions?: {

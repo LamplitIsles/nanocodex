@@ -18,7 +18,8 @@ use nanocodex::{
     agent::{
         AgentHandle, CompactionContext, CompactionDecision, CompactionFuture,
         CompactionInstructionContext, CompactionInstructionFuture, CompactionInstructionResolver,
-        CompactionResolver, ExecutionEnvironment, PromptRequest, SpawnOptions,
+        CompactionResolver, ExecutionContext, ExecutionContextFuture, ExecutionContextRequest,
+        ExecutionContextResolver, ExecutionEnvironment, PromptRequest, SpawnOptions,
         durability::{
             OwnedState, OwnerId, OwnerToken, StateStore, StoreError, StoreFuture, StoredState,
         },
@@ -153,6 +154,12 @@ extern "C" {
 
     #[wasm_bindgen(catch, js_namespace = ["globalThis", "nanocodexHost"], js_name = resolveCompactionInstruction)]
     fn host_resolve_compaction_instruction(
+        definition_host_id: u32,
+        context_json: &str,
+    ) -> Result<Promise, JsValue>;
+
+    #[wasm_bindgen(catch, js_namespace = ["globalThis", "nanocodexHost"], js_name = resolveContext)]
+    fn host_resolve_context(
         definition_host_id: u32,
         context_json: &str,
     ) -> Result<Promise, JsValue>;
@@ -296,6 +303,86 @@ impl CompactionInstructionResolver for JavaScriptCompactionInstructionResolver {
 
 struct JavaScriptCompactionResolver {
     definition_host_id: u32,
+}
+
+struct JavaScriptExecutionContextResolver {
+    definition_host_id: u32,
+}
+
+struct JavaScriptExecutionContextFuture {
+    future: JsFuture,
+    cancel: Option<Function>,
+}
+
+impl Future for JavaScriptExecutionContextFuture {
+    type Output = Result<ExecutionContext, NanocodexError>;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        match Pin::new(&mut self.future).poll(context) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(value)) => Poll::Ready(
+                value
+                    .as_string()
+                    .ok_or_else(|| {
+                        NanocodexError::InvalidRequest(
+                            "execution context resolver returned a non-string".to_owned(),
+                        )
+                    })
+                    .and_then(|encoded| {
+                        serde_json::from_str(&encoded).map_err(|error| {
+                            NanocodexError::InvalidRequest(format!(
+                                "execution context resolver returned an invalid replacement: {error}"
+                            ))
+                        })
+                    }),
+            ),
+            Poll::Ready(Err(error)) => Poll::Ready(Err(NanocodexError::InvalidRequest(format!(
+                "execution context resolution failed: {}",
+                host_error_message(&error)
+            )))),
+        }
+    }
+}
+
+impl Drop for JavaScriptExecutionContextFuture {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.call0(&JsValue::UNDEFINED);
+        }
+    }
+}
+
+impl ExecutionContextResolver for JavaScriptExecutionContextResolver {
+    fn resolve(&self, context: ExecutionContextRequest) -> ExecutionContextFuture<'_> {
+        let context_json = match serde_json::to_string(&context) {
+            Ok(context_json) => context_json,
+            Err(error) => {
+                return Box::pin(async move {
+                    Err(NanocodexError::InvalidRequest(format!(
+                        "failed to encode execution context: {error}"
+                    )))
+                });
+            }
+        };
+        let promise = match host_resolve_context(self.definition_host_id, &context_json) {
+            Ok(promise) => promise,
+            Err(error) => {
+                return Box::pin(async move {
+                    Err(NanocodexError::InvalidRequest(format!(
+                        "failed to start execution context resolution: {}",
+                        host_error_message(&error)
+                    )))
+                });
+            }
+        };
+        let cancel = Reflect::get(&promise, &JsValue::from_str("cancel"))
+            .ok()
+            .and_then(|value| value.dyn_into::<Function>().ok());
+        Box::pin(JavaScriptExecutionContextFuture {
+            future: JsFuture::from(promise),
+            cancel,
+        })
+    }
 }
 
 struct JavaScriptCompactionFuture {
@@ -972,6 +1059,8 @@ struct WasmConfig {
     #[serde(default)]
     dynamic_compaction: bool,
     #[serde(default)]
+    dynamic_context: bool,
+    #[serde(default)]
     session_id: Option<String>,
     #[serde(default)]
     workspace: Option<String>,
@@ -1472,6 +1561,12 @@ impl WasmNanocodex {
             builder = builder.compaction_resolver(Arc::new(JavaScriptCompactionResolver {
                 definition_host_id: host_definition_id,
             }));
+        }
+        if config.dynamic_context {
+            builder =
+                builder.execution_context_resolver(Arc::new(JavaScriptExecutionContextResolver {
+                    definition_host_id: host_definition_id,
+                }));
         }
         if let Some(session_id) = config.session_id {
             builder = builder.session_id(session_id.parse::<SessionId>().map_err(js_error)?);
@@ -1978,6 +2073,36 @@ impl WasmNanocodex {
     pub async fn snapshot(&self) -> Result<String, JsValue> {
         let snapshot = self.inner.snapshot().await.map_err(js_error)?;
         serde_json::to_string(&snapshot).map_err(js_error)
+    }
+
+    /// Serializes the bounded engine-owned accepted-work state.
+    ///
+    /// Every unfinished operation is retained in the view. Older terminal
+    /// receipts may be omitted when the reconciliation window is truncated.
+    #[wasm_bindgen(js_name = executionSnapshot)]
+    pub async fn execution_snapshot(&self) -> Result<String, JsValue> {
+        let snapshot = self.inner.execution_snapshot().await.map_err(js_error)?;
+        serde_json::to_string(&snapshot).map_err(js_error)
+    }
+
+    /// Recovers retained prompt work without requiring its input from the caller.
+    #[wasm_bindgen(js_name = resumeOperation)]
+    pub async fn resume_operation(&self, operation_id: &str) -> Result<WasmTurn, JsValue> {
+        validate_operation_id(Some(operation_id))?;
+        self.inner
+            .resume_operation(operation_id.to_owned())
+            .await
+            .map(WasmTurn::started)
+            .map_err(|error| js_turn_error(turn_failure(&error)))
+    }
+
+    /// Cancels one unfinished execution by its stable operation identity.
+    #[wasm_bindgen(js_name = cancelOperation)]
+    pub async fn cancel_operation(&self, operation_id: &str) -> Result<(), JsValue> {
+        self.inner
+            .cancel_operation(operation_id.to_owned())
+            .await
+            .map_err(js_error)
     }
 
     /// Appends adapter-owned developer context at the next safe model boundary.

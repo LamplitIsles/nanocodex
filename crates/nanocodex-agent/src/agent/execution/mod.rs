@@ -8,6 +8,7 @@ mod platform;
 
 use std::{future::Future, pin::Pin, sync::Arc};
 
+use nanocodex_oai_api::{Model, Prompt};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{
@@ -79,6 +80,100 @@ pub struct ExecutionOutput {
     pub usage: TurnUsage,
 }
 
+/// Settlement state exposed for one accepted execution.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionStatus {
+    /// The operation was accepted but has not started its active attempt.
+    Pending,
+    /// The operation is currently being processed by the agent driver.
+    Active,
+    /// The operation completed successfully.
+    Completed,
+    /// The operation reached a terminal failure.
+    Failed,
+    /// The operation was explicitly cancelled.
+    Cancelled,
+}
+
+impl ExecutionStatus {
+    /// Returns whether this status is terminal.
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+    }
+}
+
+/// One bounded, identity-keyed execution state entry.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionState {
+    /// Stable caller or engine-generated operation identity.
+    pub operation_id: String,
+    /// Current engine-owned settlement state.
+    pub status: ExecutionStatus,
+    /// Monotonic acceptance order within the durable execution state.
+    #[serde(with = "nanocodex_oai_api::events::decimal_u64")]
+    pub accepted_order: u64,
+}
+
+/// Bounded execution state used to reconcile accepted work after reconnects.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionSnapshot {
+    /// Durable state revision observed with this snapshot.
+    #[serde(with = "nanocodex_oai_api::events::decimal_u64")]
+    pub revision: u64,
+    /// Current accepted operations and the newest retained terminal receipts.
+    pub operations: Vec<ExecutionState>,
+    /// Whether older terminal receipts were omitted from this view.
+    pub truncated: bool,
+}
+
+/// Input made available to a current-context resolver at a model boundary.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExecutionContextRequest {
+    /// Stable accepted operation identity.
+    pub operation_id: String,
+    /// Model selected for this logical turn.
+    pub model: Model,
+    /// Workspace resolved by the engine for this turn.
+    pub workspace: Option<String>,
+    /// Exact prompt waiting at this execution boundary.
+    pub input: Prompt,
+    /// Supplementary context submitted with the prompt, when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supplementary_context: Option<String>,
+}
+
+/// Explicit current-context replacement returned by a host resolver.
+///
+/// An omitted field preserves the engine's configured value. A present empty
+/// string clears that value; it does not select a built-in or stale default.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExecutionContext {
+    /// Complete product instruction replacement, when supplied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+    /// Private host context passed to tool invocations, when supplied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_context: Option<String>,
+    /// Supplementary context replacement, when supplied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supplementary_context: Option<String>,
+}
+
+/// Future returned by an execution current-context resolver.
+pub type ExecutionContextFuture<'a> = ExecutionFuture<'a, Result<ExecutionContext>>;
+
+/// Resolves current host-owned context immediately before a model turn runs.
+pub trait ExecutionContextResolver: Send + Sync {
+    /// Returns explicit replacements for the current model boundary.
+    fn resolve<'a>(&'a self, context: ExecutionContextRequest) -> ExecutionContextFuture<'a>;
+}
+
 /// Optional higher-layer policy for admitting executions and intercepting effects.
 ///
 /// The core agent invokes this interface at its existing transactional
@@ -87,6 +182,20 @@ pub struct ExecutionOutput {
 /// without becoming a dependency of `nanocodex-agent`.
 #[cfg(not(target_family = "wasm"))]
 pub trait ExecutionPolicy: Send + Sync {
+    /// Returns a bounded, race-safe view of accepted work.
+    fn observe<'a>(&'a self) -> ExecutionFuture<'a, Result<ExecutionSnapshot>> {
+        Box::pin(async { Ok(ExecutionSnapshot::default()) })
+    }
+
+    /// Loads retained input for explicit recovery without a Host resubmission.
+    fn operation_input<'a>(&'a self, _operation_id: String) -> ExecutionFuture<'a, Result<String>> {
+        Box::pin(async {
+            Err(NanocodexError::InvalidRequest(
+                "execution input recovery is not supported by this policy".to_owned(),
+            ))
+        })
+    }
+
     /// Resolves a failed attempt against the authoritative operation state.
     /// A pending operation must return a retry/reopen disposition, even when
     /// its original failure was not a transport or storage error.
@@ -251,6 +360,20 @@ pub trait ExecutionPolicy: Send + Sync {
 /// guarantees on every target.
 #[cfg(target_family = "wasm")]
 pub trait ExecutionPolicy: Send + Sync {
+    /// Returns a bounded, race-safe view of accepted work.
+    fn observe<'a>(&'a self) -> ExecutionFuture<'a, Result<ExecutionSnapshot>> {
+        Box::pin(async { Ok(ExecutionSnapshot::default()) })
+    }
+
+    /// Loads retained input for explicit recovery without a Host resubmission.
+    fn operation_input<'a>(&'a self, _operation_id: String) -> ExecutionFuture<'a, Result<String>> {
+        Box::pin(async {
+            Err(NanocodexError::InvalidRequest(
+                "execution input recovery is not supported by this policy".to_owned(),
+            ))
+        })
+    }
+
     /// Resolves a failed attempt against the authoritative operation state.
     /// Pending work must remain recoverable regardless of the original error.
     fn recover_failure<'a>(
@@ -397,6 +520,7 @@ pub(crate) struct ExecutionConfig {
     platform: platform::Config,
     policy: Option<ExecutionPolicyRecipe>,
     spawned_policy: Option<SpawnedExecutionPolicyFactory>,
+    context_resolver: Option<Arc<dyn ExecutionContextResolver>>,
 }
 
 type SpawnedExecutionPolicyFactory =
@@ -440,6 +564,14 @@ impl ExecutionConfig {
         self.spawned_policy = Some(factory);
     }
 
+    pub(crate) fn set_context_resolver(&mut self, resolver: Arc<dyn ExecutionContextResolver>) {
+        self.context_resolver = Some(resolver);
+    }
+
+    pub(crate) fn context_resolver(&self) -> Option<Arc<dyn ExecutionContextResolver>> {
+        self.context_resolver.as_ref().map(Arc::clone)
+    }
+
     // The WASM platform configuration is const, while native rollout cloning is not.
     #[cfg_attr(target_family = "wasm", allow(clippy::missing_const_for_fn))]
     pub(crate) fn for_new_thread(&self, operation: &'static str) -> Result<Self> {
@@ -455,6 +587,7 @@ impl ExecutionConfig {
                 .as_ref()
                 .map(|factory| ExecutionPolicyRecipe::Spawned(Arc::clone(factory))),
             spawned_policy: self.spawned_policy.as_ref().map(Arc::clone),
+            context_resolver: self.context_resolver.as_ref().map(Arc::clone),
         })
     }
 
@@ -525,6 +658,21 @@ struct StandaloneCompactionBase {
 }
 
 impl Execution {
+    pub(crate) async fn operation_input(&self, operation_id: String) -> Result<String> {
+        self.policy
+            .as_ref()
+            .ok_or(NanocodexError::ExecutionPolicyNotConfigured)?
+            .operation_input(operation_id)
+            .await
+    }
+
+    pub(crate) async fn observe(&self) -> Result<ExecutionSnapshot> {
+        match &self.policy {
+            Some(policy) => policy.observe().await,
+            None => Ok(ExecutionSnapshot::default()),
+        }
+    }
+
     pub(crate) async fn recover_failure<T>(
         &self,
         operation_id: Option<&str>,
@@ -598,6 +746,7 @@ impl Execution {
     pub(crate) fn start_turn(
         &self,
         prompt: &nanocodex_oai_api::Prompt,
+        supplementary_context: Option<&str>,
         effort: nanocodex_oai_api::Thinking,
         operation_id: Option<String>,
     ) -> ExecutionTurn {
@@ -605,7 +754,10 @@ impl Execution {
             platform: self.platform.start_turn(prompt, effort),
             policy: self.policy.clone(),
             operation_id,
-            operation_input: Some(ExecutionInput::Prompt(prompt.clone())),
+            operation_input: Some(ExecutionInput::Prompt(AcceptedPrompt::new(
+                prompt,
+                supplementary_context,
+            ))),
             outcome: ExecutionOutcome::Started,
         }
     }
@@ -846,8 +998,24 @@ enum ExecutionOutcome {
     Failed { error: String, retryable: bool },
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AcceptedPrompt {
+    pub prompt: nanocodex_oai_api::Prompt,
+    pub supplementary_context: Option<String>,
+}
+
+impl AcceptedPrompt {
+    pub(crate) fn new(prompt: &nanocodex_oai_api::Prompt, context: Option<&str>) -> Self {
+        Self {
+            prompt: prompt.clone(),
+            supplementary_context: context.map(str::to_owned),
+        }
+    }
+}
+
 enum ExecutionInput {
-    Prompt(nanocodex_oai_api::Prompt),
+    Prompt(AcceptedPrompt),
     Encoded(String),
 }
 
@@ -1077,4 +1245,32 @@ fn encode<T: Serialize + ?Sized>(value: &T) -> Result<String> {
 
 fn decode<T: DeserializeOwned>(value: &str) -> Result<T> {
     serde_json::from_str(value).map_err(NanocodexError::ExecutionPayload)
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+
+    #[test]
+    fn execution_snapshot_counters_are_lossless_decimal_strings() {
+        let snapshot = ExecutionSnapshot {
+            revision: 9_007_199_254_740_993,
+            operations: vec![ExecutionState {
+                operation_id: "large-counter".into(),
+                status: ExecutionStatus::Pending,
+                accepted_order: u64::MAX,
+            }],
+            truncated: false,
+        };
+        let encoded = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(encoded["revision"], "9007199254740993");
+        assert_eq!(
+            encoded["operations"][0]["accepted_order"],
+            "18446744073709551615"
+        );
+        assert_eq!(
+            serde_json::from_value::<ExecutionSnapshot>(encoded).unwrap(),
+            snapshot
+        );
+    }
 }

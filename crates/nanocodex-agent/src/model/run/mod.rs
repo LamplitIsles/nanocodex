@@ -90,6 +90,7 @@ pub(crate) struct ModelRun<S> {
     prompt_cache: ModelPromptCache,
     context_source: ContextSource,
     host_context: Option<Arc<str>>,
+    instruction_override: Option<Arc<str>>,
     global_instructions: Option<Arc<str>>,
     force_compaction: bool,
     pending_developer_messages: Vec<ResponseItem>,
@@ -270,6 +271,7 @@ impl<S> ModelRun<S> {
             prompt_cache,
             context_source,
             host_context,
+            instruction_override: None,
             global_instructions,
             force_compaction: false,
             pending_developer_messages: Vec::new(),
@@ -352,6 +354,7 @@ impl<S> ModelRun<S> {
             prompt_cache,
             context_source,
             host_context,
+            instruction_override: None,
             global_instructions,
             force_compaction: false,
             pending_developer_messages: Vec::new(),
@@ -363,6 +366,49 @@ impl<S> ModelRun<S> {
 
     pub(crate) fn set_host_context(&mut self, host_context: Option<Arc<str>>) {
         self.host_context = host_context;
+    }
+
+    pub(crate) fn apply_execution_instructions(
+        &mut self,
+        instructions: Option<String>,
+    ) -> Result<()> {
+        let instruction_override = instructions.map(Arc::from);
+        let effective = instruction_override
+            .as_deref()
+            .map_or_else(|| self.config.system_prompt().into_owned(), str::to_owned);
+        let Some(session) = &mut self.session else {
+            self.instruction_override = instruction_override;
+            return Ok(());
+        };
+        let (tool_specs, code_mode_tool_names) =
+            model_tool_contract(&session.tools, self.events.request_id());
+        let profile = request_profile(
+            session.factory.profile().session_id(),
+            session.factory.profile().prompt_cache_key(),
+            tool_specs,
+            code_mode_tool_names,
+            &effective,
+        )?;
+        let previous_prefix = serde_json::to_vec(session.factory.profile().prefix())
+            .map_err(NanocodexError::SerializePromptPrefix)?;
+        let next_prefix =
+            serde_json::to_vec(profile.prefix()).map_err(NanocodexError::SerializePromptPrefix)?;
+        let prefix_changed = previous_prefix != next_prefix;
+        session.factory = session
+            .factory
+            .with_tool_mappings_from(&profile)
+            .with_request_content(
+                profile.prompt_cache_key().to_owned(),
+                profile.shared_prefix(),
+                self.config.model_id_prefix.as_deref().map(str::to_owned),
+                self.config.reasoning_mode,
+                self.config.store_responses,
+            );
+        if prefix_changed {
+            session.conversation.reset_for_full_request();
+        }
+        self.instruction_override = instruction_override;
+        Ok(())
     }
 
     pub(crate) fn set_events(&mut self, events: EventSink) {
@@ -453,13 +499,17 @@ impl<S> ModelRun<S> {
     }
 
     fn attempt_factory(&self, tools: &ToolRuntime) -> Result<ResponsesAttemptFactory> {
+        let effective_instructions = self
+            .instruction_override
+            .as_deref()
+            .map_or_else(|| self.config.system_prompt().into_owned(), str::to_owned);
         attempt_factory(
             &self.events,
             &self.transport_stats,
             &self.provider_session_id,
             self.prompt_cache.key(),
             tools,
-            &self.config.system_prompt(),
+            &effective_instructions,
         )
     }
 

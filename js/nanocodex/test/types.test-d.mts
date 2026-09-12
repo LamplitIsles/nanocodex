@@ -16,6 +16,7 @@ import {
   type SessionSnapshot,
   type Tool,
   type ToolDefinition,
+  type ToolProvider,
   Transport,
   type Turn,
   type TurnResult,
@@ -165,6 +166,30 @@ type BrowserDurabilityStore = BrowserPublicTypes.DurabilityStore;
 type HostDurabilityStore = HostPublicTypes.DurabilityStore;
 // @ts-expect-error durability-only types are exported from nanocodex/durability.
 type NodeDurabilityStore = NodePublicTypes.DurabilityStore;
+
+const executionStatus: RootPublicTypes.ExecutionStatus = "active";
+const executionState: RootPublicTypes.ExecutionState = {
+  operation_id: "turn-1",
+  status: executionStatus,
+  accepted_order: "1",
+};
+const executionSnapshot: RootPublicTypes.ExecutionSnapshot = {
+  revision: "1",
+  operations: [executionState],
+  truncated: false,
+};
+const resolveContext: RootPublicTypes.ExecutionContextResolver = async (context, signal) => {
+  context.operationId;
+  context.input.instruction;
+  signal.aborted;
+  return { instructions: "" };
+};
+const browserExecutionSnapshot: BrowserPublicTypes.ExecutionSnapshot = executionSnapshot;
+const hostExecutionState: HostPublicTypes.ExecutionState = executionState;
+const nodeExecutionResolver: NodePublicTypes.ExecutionContextResolver = resolveContext;
+void browserExecutionSnapshot;
+void hostExecutionState;
+void nodeExecutionResolver;
 
 async function check() {
   const connectClient = ConnectClient.create({ appId: "typed-connect" });
@@ -688,6 +713,18 @@ async function check() {
     transport: Transport.openAi({ apiKey }),
     resume: rolloutSnapshot,
   });
+
+  const recoveredTurn: Turn = await agent.execution.resume("retained-operation");
+  await recoveredTurn.accepted();
+  const provider: ToolProvider = {
+    definitions: () => [{ type: "function", name: "current_tool", description: "Current tool",
+      strict: false, parameters: { type: "object", properties: {}, additionalProperties: false } }],
+    resolve: name => name === "current_tool" ? { name, handler: () => "done" } : undefined,
+  };
+  await Agent.create({ transport: Transport.openAi({ apiKey }), toolProviders: [provider] });
+  await HostAgent.create({ transport: HostTransport.openAi({ apiKey }), toolProviders: [provider] });
+  // @ts-expect-error Dynamic providers must be constructed inside the Worker isolate.
+  await BrowserAgent.create({ transport: BrowserTransport.openAi({ apiKey }), toolProviders: [provider] });
 
   // @ts-expect-error actions are domain-grouped on the decorated Agent.
   agent.prompt("hello");

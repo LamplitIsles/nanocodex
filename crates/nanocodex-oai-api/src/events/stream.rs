@@ -146,6 +146,9 @@ pub enum AgentEventKind {
     /// Turn terminated with an error.
     #[serde(rename = "run.failed")]
     RunFailed,
+    /// Engine-owned execution state changed.
+    #[serde(rename = "execution.state")]
+    ExecutionState,
     /// Tool invocation started.
     #[serde(rename = "tool.call")]
     ToolCall,
@@ -341,6 +344,7 @@ impl AgentEvent {
             AgentEventKind::RunFailed => {
                 AgentEventData::Run(RunEvent::Failed(Box::new(self.decode_payload()?)))
             }
+            AgentEventKind::ExecutionState => AgentEventData::Execution(self.decode_payload()?),
             AgentEventKind::ToolCall => {
                 AgentEventData::Tool(ToolEvent::Call(self.decode_payload()?))
             }
@@ -850,7 +854,9 @@ mod tests {
     use serde_json::value::RawValue;
 
     #[cfg(feature = "client")]
-    use super::super::{AgentEventData, AssistantEvent, ToolEvent, TransportEvent};
+    use super::super::{
+        AgentEventData, AssistantEvent, ExecutionStateChanged, ToolEvent, TransportEvent,
+    };
     #[cfg(feature = "client")]
     use super::EventSink;
     use super::{
@@ -879,6 +885,36 @@ mod tests {
         );
         drop(receiver);
         events.emit(AgentEventKind::RunFailed, json!({})).unwrap();
+    }
+
+    #[cfg(feature = "client")]
+    #[test]
+    fn execution_state_events_have_a_typed_projection() {
+        let (events, mut receiver) = EventSink::channel("request-1".to_owned());
+        events
+            .emit(
+                AgentEventKind::ExecutionState,
+                ExecutionStateChanged {
+                    revision: 9_007_199_254_740_993,
+                    operation_id: "turn-2".to_owned(),
+                    status: "active".to_owned(),
+                    accepted_order: u64::MAX,
+                },
+            )
+            .unwrap();
+
+        let event = receiver.receiver.try_recv().unwrap().event;
+        assert_eq!(event.kind, AgentEventKind::ExecutionState);
+        let AgentEventData::Execution(state) = event.data().unwrap() else {
+            panic!("execution state event did not decode to its typed projection");
+        };
+        assert_eq!(state.revision, 9_007_199_254_740_993);
+        let wire: serde_json::Value = serde_json::from_str(event.payload.get()).unwrap();
+        assert_eq!(wire["revision"], "9007199254740993");
+        assert_eq!(wire["accepted_order"], "18446744073709551615");
+        assert_eq!(state.operation_id, "turn-2");
+        assert_eq!(state.status, "active");
+        assert_eq!(state.accepted_order, u64::MAX);
     }
 
     #[cfg(feature = "client")]

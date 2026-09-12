@@ -41,6 +41,12 @@ pub mod backend {
 
 #[cfg(feature = "openai")]
 #[cfg_attr(docsrs, doc(cfg(feature = "openai")))]
+pub use agent::execution::{
+    ExecutionContext, ExecutionContextFuture, ExecutionContextRequest, ExecutionContextResolver,
+    ExecutionSnapshot, ExecutionState, ExecutionStatus,
+};
+#[cfg(feature = "openai")]
+#[cfg_attr(docsrs, doc(cfg(feature = "openai")))]
 pub use agent::{AgentHandle, ExecutionEnvironment, NanocodexBuilder};
 pub use agent::{
     AgentSessionContext, BuilderBackend, Nanocodex, PromptRequest, PromptRoute, SpawnOptions, Turn,
@@ -81,11 +87,11 @@ pub mod events {
     pub use nanocodex_oai_api::events::{
         AgentEventData, AssistantDelta, AssistantEvent, AssistantMessage, CompactionCompleted,
         CompactionFailed, CompactionInstalledItem, CompactionItemIdentity, CompactionReplaced,
-        CompactionSessionContext, CompactionStarted, ContextEvent, EventUsage, ModelCallCompleted,
-        ModelCallFailed, ModelCallStarted, ModelEvent, ModelWarmupCompleted, ModelWarmupFailed,
-        ModelWarmupStarted, ReasoningEvent, ReasoningSummaryDelta, RunError, RunEvent, RunMetrics,
-        RunStarted, RunStatus, RunSteered, RunTerminal, ToolCall, ToolEvent, ToolResultEvent,
-        ToolStatus, TransportEvent,
+        CompactionSessionContext, CompactionStarted, ContextEvent, EventUsage,
+        ExecutionStateChanged, ModelCallCompleted, ModelCallFailed, ModelCallStarted, ModelEvent,
+        ModelWarmupCompleted, ModelWarmupFailed, ModelWarmupStarted, ReasoningEvent,
+        ReasoningSummaryDelta, RunError, RunEvent, RunMetrics, RunStarted, RunStatus, RunSteered,
+        RunTerminal, ToolCall, ToolEvent, ToolResultEvent, ToolStatus, TransportEvent,
     };
     pub use nanocodex_oai_api::responses::AgentMessageContent;
 }

@@ -516,3 +516,241 @@ test("manual compaction and historical forks preserve exact committed boundaries
     await server.close();
   }
 });
+
+test("execution owner cancels a waiting resolver and queued work while retaining the next accepted input", { timeout: 15000 }, async () => {
+  const server = await startResponsesServer();
+  const started = deferred();
+  const storeId = "owner-context-queue";
+  const durability = createMemoryDurabilityStore(storeId);
+  let current = "old context";
+  let cancelledSignal;
+  const contexts = [];
+  const agent = await Agent.create({
+    model: "gpt-5.6-sol",
+    thinking: "low",
+    transport: Transport.openAi({ apiKey: "test-key", websocketUrl: server.url, websocketWarmup: false }),
+    durability,
+    durabilityId: storeId,
+    resolveContext(context, signal) {
+      contexts.push(context.operationId);
+      if (context.operationId === "A") {
+        cancelledSignal = signal;
+        started.resolve();
+        return new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+      }
+      return { instructions: current };
+    },
+  });
+  const events = [];
+  const watcher = agent.events.watch();
+  watcher.onEvent(event => { if (event.type === "execution.state") events.push(event); });
+  try {
+    const a = agent.turn.prompt({ id: "A", input: "waiting A" });
+    const aResult = a.result().catch(error => error);
+    assert.equal(await a.accepted(), "A");
+    await started.promise;
+    const b = agent.turn.prompt({ id: "B", input: "retained B" });
+    assert.equal(await b.accepted(), "B");
+    const c = agent.turn.prompt({ id: "C", input: "cancelled C" });
+    const cResult = c.result().catch(error => error);
+    assert.equal(await c.accepted(), "C");
+    assert.deepEqual((await agent.execution.snapshot()).operations.map(x => [x.operation_id, x.status]),
+      [["A", "active"], ["B", "pending"], ["C", "pending"]]);
+    await a.steer({ input: "steer the waiting A" });
+    await agent.execution.cancel("C");
+    assert.equal((await agent.execution.state("C")).status, "cancelled");
+    current = "latest host context for B";
+    const provider = (async () => {
+      const socket = await server.nextConnection();
+      const request = await messageReader(socket).next();
+      assert.equal(request.input[1].content[0].text, current);
+      assert.match(JSON.stringify(request.input), /retained B/);
+      assert.doesNotMatch(JSON.stringify(request.input), /cancelled C/);
+      sendFinal(socket, "owned-B", "B completed");
+    })();
+    await agent.execution.cancel("A");
+    assert.equal(cancelledSignal.aborted, true);
+    assert.ok(await aResult instanceof Error);
+    assert.equal((await b.result()).finalMessage, "B completed");
+    assert.ok(await cResult instanceof Error);
+    await provider;
+    assert.deepEqual(contexts, ["A", "B"]);
+    assert.deepEqual((await agent.execution.snapshot()).operations.map(x => [x.operation_id, x.status]),
+      [["A", "cancelled"], ["B", "completed"], ["C", "cancelled"]]);
+    assert.ok(events.some(e => e.payload.operation_id === "B" && e.payload.status === "pending"));
+  } finally {
+    watcher.off();
+    await agent.session.shutdown().catch(() => {});
+    agent.dispose();
+    await server.close();
+  }
+});
+
+test("execution recovery loads accepted input by identity after losing handles", { timeout: 15000 }, async () => {
+  const server = await startResponsesServer();
+  const durabilityId = "owner-resume-by-id";
+  const store = createMemoryDurabilityStore(durabilityId);
+  const started = deferred();
+  const options = {
+    model: "gpt-5.6-sol",
+    thinking: "low",
+    transport: Transport.openAi({ apiKey: "test-key", websocketUrl: server.url, websocketWarmup: false }),
+    durabilityId,
+  };
+  const original = await Agent.create({
+    ...options,
+    durability: store,
+    resolveContext(_context, signal) {
+      started.resolve();
+      return new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+    },
+  });
+  let saved;
+  try {
+    const a = original.turn.prompt({ id: "recover-A", input: "saved original A" });
+    a.result().catch(() => {});
+    await a.accepted();
+    await started.promise;
+    const b = original.turn.prompt({ id: "recover-B", input: "saved original B", supplementaryContext: "retained B context" });
+    b.result().catch(() => {});
+    await b.accepted();
+    const c = original.turn.prompt({ id: "recover-C", input: "never dispatch recovered C" });
+    c.result().catch(() => {});
+    await c.accepted();
+    saved = store.snapshot(); // Test-owned crash image, captured before orderly cleanup.
+  } finally {
+    await original.session.shutdown();
+    original.dispose();
+  }
+  const recovered = await Agent.create({
+    ...options,
+    durability: createMemoryDurabilityStore(durabilityId, saved),
+    resolveContext: () => ({ instructions: "current recovered host persona" }),
+  });
+  try {
+    assert.deepEqual((await recovered.execution.snapshot()).operations.map(x => [x.operation_id, x.status]),
+      [["recover-A", "pending"], ["recover-B", "pending"], ["recover-C", "pending"]]);
+    await recovered.execution.cancel("recover-C");
+    assert.equal((await recovered.execution.state("recover-C")).status, "cancelled");
+    const provider = (async () => {
+      const socket = await server.nextConnection();
+      const reader = messageReader(socket);
+      for (const [id, input] of [["A", "saved original A"], ["B", "saved original B"]]) {
+        const request = await reader.next();
+        assert.match(JSON.stringify(request.input), new RegExp(input));
+        if (id === "B") assert.match(JSON.stringify(request.input), /retained B context/);
+        if (id === "A") assert.equal(request.input[1].content[0].text, "current recovered host persona");
+        sendFinal(socket, `recover-${id}`, `${id} complete`);
+      }
+    })();
+    for (const id of ["A", "B"]) {
+      const turn = await recovered.execution.resume(`recover-${id}`);
+      assert.equal(await turn.accepted(), `recover-${id}`);
+      assert.equal((await turn.result()).finalMessage, `${id} complete`);
+    }
+    await provider;
+    const replay = await recovered.execution.resume("recover-B");
+    assert.equal((await replay.result()).finalMessage, "B complete");
+    await assert.rejects(recovered.execution.resume("missing"), /unknown|retained/);
+    assert.equal(server.connections, 1);
+  } finally {
+    await recovered.session.shutdown();
+    recovered.dispose();
+    await server.close();
+  }
+});
+
+
+test("queued turns refresh both the provider catalog and dispatch after compaction", { timeout: 15000 }, async () => {
+  const server = await startResponsesServer();
+  const firstRequest = deferred();
+  let currentName = "old_tool";
+  let calls = 0;
+  let closed = 0;
+  const provider = {
+    definitions: () => [{ type: "function", name: currentName, description: "Current test tool",
+      parameters: { type: "object", properties: {}, additionalProperties: false }, strict: false }],
+    resolve: name => name === currentName ? { name, handler: () => { calls++; return "current result"; } } : undefined,
+    close: () => { closed++; },
+  };
+  const agent = await Agent.create({
+    model: "gpt-5.6-sol", thinking: "low", subagents: false,
+    transport: Transport.openAi({ apiKey: "test-key", websocketUrl: server.url, websocketWarmup: false }),
+    toolProviders: [provider],
+    resolveContext(context) {
+      if (context.input.instruction === "B after compact") currentName = "new_tool";
+      return { instructions: `current context ${currentName}` };
+    },
+  });
+  const peer = (async () => {
+    const socket = await server.nextConnection();
+    const reader = messageReader(socket);
+    const a = await reader.next();
+    assert.match(JSON.stringify(a.input), /old_tool/);
+    firstRequest.resolve();
+    sendFinal(socket, "catalog-A", "A complete");
+    const compact = await reader.next();
+    assert.ok(compact);
+    sendCompaction(socket, "catalog-compacted");
+    const b = await reader.next();
+    assert.match(JSON.stringify(b.input), /new_tool/);
+    // Historical text may mention old tools; the current tool contract must not.
+    assert.match(JSON.stringify(b.input[0]), /new_tool/);
+    assert.doesNotMatch(JSON.stringify(b.input[0]), /old_tool/);
+    send(socket, { type: "response.completed", response: { id: "catalog-tools", output: [{
+      type: "custom_tool_call", call_id: "catalog-call", name: "exec",
+      input: 'text(typeof tools.old_tool); text(await tools.new_tool({}));',
+    }] } });
+    const result = await reader.next();
+    assert.match(JSON.stringify(result.input), /undefined/);
+    assert.match(JSON.stringify(result.input), /current result/);
+    sendFinal(socket, "catalog-B", "B complete");
+  })();
+  try {
+    const a = agent.turn.prompt({ input: "A before compact" });
+    await firstRequest.promise;
+    await a.result();
+    const compact = agent.session.compact();
+    const b = agent.turn.prompt({ input: "B after compact" });
+    await compact;
+    assert.equal((await b.result()).finalMessage, "B complete");
+    await peer;
+    assert.equal(calls, 1);
+  } finally {
+    await agent.session.shutdown().catch(() => {});
+    agent.dispose();
+    await server.close();
+  }
+  assert.equal(closed, 1);
+});
+
+
+test("context failure never dispatches stale instructions and the next turn resolves afresh", { timeout: 15000 }, async () => {
+  const server = await startResponsesServer();
+  let fail = true;
+  const agent = await Agent.create({
+    model: "gpt-5.6-sol", thinking: "low", instructions: "stale configured context",
+    transport: Transport.openAi({ apiKey: "test-key", websocketUrl: server.url, websocketWarmup: false }),
+    resolveContext() {
+      if (fail) throw new Error("current context unavailable");
+      return { instructions: "fresh context" };
+    },
+  });
+  try {
+    await assert.rejects(agent.turn.prompt({ input: "fail before dispatch" }).result(), /current context unavailable/);
+    assert.equal(server.connections, 0);
+    fail = false;
+    const peer = (async () => {
+      const socket = await server.nextConnection();
+      const request = await messageReader(socket).next();
+      assert.equal(request.input[1].content[0].text, "fresh context");
+      sendFinal(socket, "context-recovered", "done");
+    })();
+    assert.equal((await agent.turn.prompt({ input: "try current context" }).result()).finalMessage, "done");
+    await peer;
+  } finally {
+    await agent.session.shutdown().catch(() => {});
+    agent.dispose();
+    await server.close();
+  }
+});

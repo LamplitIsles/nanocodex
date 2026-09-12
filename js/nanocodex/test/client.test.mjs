@@ -14,7 +14,9 @@ import {
   createAgentClient,
   defineRuntime,
   parseSubagentAgentId,
+  registerDefinitionHost,
   releaseHostSession,
+  releaseDefinitionHost,
   toWasmConfig,
 } from "../internal.mjs";
 import {
@@ -508,6 +510,36 @@ test("turn acceptance forwards durable IDs and remains optional for custom runti
   agent.dispose();
 });
 
+test("execution actions project bounded state and validate stable cancellation IDs", async () => {
+  const calls = [];
+  const raw = rawAgent("execution-actions");
+  raw.executionSnapshot = async () => JSON.stringify({
+    revision: "9007199254740993",
+    operations: [{ operation_id: "turn-7", status: "active", accepted_order: "18446744073709551615" }],
+    truncated: false,
+  });
+  raw.cancelOperation = async (operationId) => { calls.push(operationId); };
+  const runtime = defineRuntime({
+    create: () => raw,
+    decorate: (agent) => agent.extend(Actions.agentActions()),
+  });
+  const agent = await createAgentClient(runtime);
+
+  const snapshot = await agent.execution.snapshot();
+  assert.equal(snapshot.revision, "9007199254740993");
+  assert.equal(snapshot.operations[0].accepted_order, "18446744073709551615");
+  assert.equal(snapshot.operations[0].status, "active");
+  assert.equal(Object.isFrozen(snapshot), true);
+  assert.equal(Object.isFrozen(snapshot.operations), true);
+  assert.deepEqual(await agent.execution.state("turn-7"), snapshot.operations[0]);
+  assert.equal(await agent.execution.state("missing"), null);
+  await agent.execution.cancel("turn-7");
+  assert.deepEqual(calls, ["turn-7"]);
+  await assert.rejects(agent.execution.state(""), /operationId must be a non-empty string/);
+  assert.throws(() => agent.execution.cancel(""), /operationId must be a non-empty string/);
+  agent.dispose();
+});
+
 test("turn prompt forwards atomic cancellation through the WASM boundary", async () => {
   const calls = [];
   const raw = rawAgent("cancel-on-admission");
@@ -563,6 +595,62 @@ test("the WASM config distinguishes prompt replacement from host additions", () 
     instructions: "caller replacement",
     additional_instructions: "host additions",
   });
+});
+
+test("the WASM host bridge preserves omitted and explicit empty context replacements", async () => {
+  const calls = [];
+  const host = {
+    connect() {},
+    resolveContext(context, signal) {
+      calls.push({ context, signal });
+      return context.operationId === "clear" ? { instructions: "" } : {};
+    },
+  };
+  const definitionHostId = registerDefinitionHost(host);
+  activateHost(host);
+  try {
+    const omitted = JSON.parse(await globalThis.nanocodexHost.resolveContext(
+      definitionHostId,
+      JSON.stringify({ operationId: "default", input: { instruction: "prompt" } }),
+    ));
+    const cleared = JSON.parse(await globalThis.nanocodexHost.resolveContext(
+      definitionHostId,
+      JSON.stringify({ operationId: "clear", input: { instruction: "prompt" } }),
+    ));
+    assert.deepEqual(omitted, {});
+    assert.deepEqual(cleared, { instructions: "" });
+    assert.equal(Object.isFrozen(calls[0].context), true);
+    assert.equal(calls[0].signal.aborted, false);
+  } finally {
+    releaseDefinitionHost(definitionHostId);
+  }
+});
+
+test("the WASM host bridge aborts a pending current-context resolver on release", async () => {
+  let signal;
+  const host = {
+    connect() {},
+    resolveContext(_context, contextSignal) {
+      signal = contextSignal;
+      return new Promise((_resolve, reject) => {
+        contextSignal.addEventListener("abort", () => reject(contextSignal.reason), { once: true });
+      });
+    },
+  };
+  const definitionHostId = registerDefinitionHost(host);
+  activateHost(host);
+  try {
+    const pending = globalThis.nanocodexHost.resolveContext(
+      definitionHostId,
+      JSON.stringify({ operationId: "pending", input: { instruction: "prompt" } }),
+    );
+    assert.equal(signal.aborted, false);
+    releaseDefinitionHost(definitionHostId);
+    await assert.rejects(pending, /execution context resolution was cancelled/);
+    assert.equal(signal.aborted, true);
+  } finally {
+    releaseDefinitionHost(definitionHostId);
+  }
 });
 
 test("the WASM config enables custom instruction and host replacement independently", () => {

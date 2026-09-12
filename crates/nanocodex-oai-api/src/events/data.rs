@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, value::RawValue};
 
 use super::stream::AgentEventKind;
@@ -29,6 +29,8 @@ pub enum AgentEventData {
     Reasoning(ReasoningEvent),
     /// Agent-turn lifecycle state.
     Run(RunEvent),
+    /// Engine-owned accepted-work state.
+    Execution(ExecutionStateChanged),
     /// Tool invocation lifecycle state.
     Tool(ToolEvent),
     /// Logical model-call lifecycle state.
@@ -150,6 +152,21 @@ pub struct RunStarted {
     pub workspace: Option<String>,
     /// Bytes in the accepted user instruction.
     pub instruction_bytes: usize,
+}
+
+/// One engine-owned execution state transition.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ExecutionStateChanged {
+    /// Durable execution-state revision associated with the transition.
+    #[serde(with = "super::decimal_u64")]
+    pub revision: u64,
+    /// Stable operation identity.
+    pub operation_id: String,
+    /// New execution status.
+    pub status: String,
+    /// Monotonic acceptance order of the operation.
+    #[serde(with = "super::decimal_u64")]
+    pub accepted_order: u64,
 }
 
 /// A steering input accepted by the active turn.

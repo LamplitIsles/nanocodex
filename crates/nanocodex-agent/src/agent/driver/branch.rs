@@ -1,4 +1,5 @@
 use super::*;
+use crate::agent::execution::ExecutionContextResolver;
 
 pub(in crate::agent) struct BranchSpawner<S> {
     pub(in crate::agent) config: Arc<ModelConfig>,
@@ -11,6 +12,7 @@ pub(in crate::agent) struct BranchSpawner<S> {
     pub(in crate::agent) context_source: ContextSource,
     pub(in crate::agent) depth: u32,
     pub(in crate::agent) execution: ExecutionConfig,
+    pub(in crate::agent) context_resolver: Option<Arc<dyn ExecutionContextResolver>>,
     pub(in crate::agent) host_context: Option<Arc<str>>,
     pub(in crate::agent) compaction_instruction_resolver:
         Option<Arc<dyn CompactionInstructionResolver + Send + Sync>>,
@@ -38,6 +40,7 @@ impl<S> BranchSpawner<S> {
             context_source: self.context_source.clone(),
             depth: self.depth,
             execution: self.execution.for_new_thread(operation)?,
+            context_resolver: self.context_resolver.as_ref().map(Arc::clone),
             host_context: self.host_context.as_ref().map(Arc::clone),
             compaction_instruction_resolver: self
                 .compaction_instruction_resolver
@@ -121,6 +124,7 @@ where
             context_source: self.context_config.build(),
             depth,
             execution: self.execution.for_new_thread("spawn")?,
+            context_resolver: self.context_resolver.as_ref().map(Arc::clone),
             host_context,
             compaction_instruction_resolver: self
                 .compaction_instruction_resolver

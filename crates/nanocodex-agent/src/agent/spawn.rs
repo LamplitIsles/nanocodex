@@ -105,6 +105,7 @@ where
     };
     let service = service_factory(Arc::clone(&config));
     let provider_session_id = Arc::clone(&lineage_id);
+    let context_resolver = codex.execution.context_resolver();
     spawn_agent_driver(
         BranchSpawner {
             config,
@@ -117,6 +118,7 @@ where
             context_source,
             depth: 0,
             execution: codex.execution,
+            context_resolver,
             host_context: None,
             compaction_instruction_resolver,
             compaction_resolver,

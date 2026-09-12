@@ -81,11 +81,59 @@ export type AgentEvent = {
   payload: Record<string, unknown>;
 };
 
+export type ExecutionStatus = "pending" | "active" | "completed" | "failed" | "cancelled";
+
+export type ExecutionState = Readonly<{
+  operation_id: string;
+  status: ExecutionStatus;
+  /** Canonical decimal u64; preserve snapshot order or compare using BigInt. */
+  accepted_order: string;
+}>;
+
+export type ExecutionSnapshot = Readonly<{
+  /** Canonical decimal u64, matching the durable store revision contract. */
+  revision: string;
+  operations: readonly ExecutionState[];
+  truncated: boolean;
+}>;
+
+export type ExecutionContextInput = Readonly<{
+  instruction: PromptInput;
+  transcript?: readonly Readonly<{
+    role: "user" | "assistant";
+    content: string;
+  }>[];
+}>;
+
+export type ExecutionContextRequest = Readonly<{
+  operationId: string;
+  model: Model;
+  workspace: string | null;
+  input: ExecutionContextInput;
+  supplementaryContext?: string;
+}>;
+
+export type ExecutionContext = Readonly<{
+  /** Complete product prompt replacement; omission retains SDK configuration. */
+  instructions?: string;
+  /** Private context passed to tool invocations; omission retains the engine context. */
+  hostContext?: string;
+  /** Prompt supplementary-context replacement; omission retains submitted context. */
+  supplementaryContext?: string;
+}>;
+
+export type ExecutionContextResolver = (
+  context: ExecutionContextRequest,
+  signal: AbortSignal,
+) => ExecutionContext | PromiseLike<ExecutionContext>;
+
 export type AgentOptions = {
   /** Replaces the selected model's built-in instructions. */
   instructions?: string | undefined;
   /** Appends host instructions while retaining the selected model's prompt. */
   additionalInstructions?: string | undefined;
+  /** Resolves current execution context at the model boundary in this isolate. */
+  resolveContext?: ExecutionContextResolver | undefined;
   /** Selects the instruction used before each custom compaction summary request. */
   resolveCompactionInstruction?: CompactionInstructionResolver | undefined;
   /** Selects the complete replacement history for each compaction operation. */
@@ -461,6 +509,12 @@ export type AgentActions = {
   events: {
     watch(options?: WatchEventsOptions): EventWatcher;
   };
+  execution: {
+    snapshot(): Promise<ExecutionSnapshot>;
+    state(operationId: string): Promise<ExecutionState | null>;
+    cancel(operationId: string): Promise<void>;
+    resume(operationId: string): Promise<Turn>;
+  };
   session: {
     appendDeveloperMessage(text: string): Promise<AgentSessionContext>;
     /** Returns the exact custom replacement, or null for provider-default compaction. */
@@ -589,7 +643,7 @@ export type TurnResult = Readonly<{
   dispose(): void;
 }>;
 
-import type { NamedTool, ToolMap } from "nanocodex-tools";
+import type { NamedTool, ToolMap, ToolDefinition, Tool } from "nanocodex-tools";
 export type {
   CustomToolFormat,
   NamedTool,
@@ -600,6 +654,14 @@ export type {
   ToolJson,
   ToolMap,
 } from "nanocodex-tools";
+
+/** Caller-owned dynamic catalog. Update it before resolveContext returns. */
+export type ToolProvider = {
+  definitions(): readonly ToolDefinition[];
+  resolve(name: string): ({ name: string; handler: Tool["handler"]; parallelSafe?: boolean } | undefined);
+  settled?(): void | Promise<void>;
+  close?(): void | Promise<void>;
+};
 
 /** Static JavaScript tools, optionally composed with Rust-backed extensions. */
 export type ToolConfiguration<Extension = never> =

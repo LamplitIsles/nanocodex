@@ -29,6 +29,18 @@ async function evaluateInTestRealm(source, environment) {
   );
 }
 
+test("browser host validates the current-context resolver boundary", async () => {
+  assert.throws(
+    () => createProductionBrowserHost({ resolveContext: null }),
+    /resolveContext must be a function/,
+  );
+  const host = createProductionBrowserHost({
+    WebSocketImpl: FakeWebSocket,
+    resolveContext: () => ({}),
+  });
+  await host.dispose();
+});
+
 test("browser Code Mode fails closed when an evaluator Worker is unavailable", async () => {
   assert.equal(typeof globalThis.Worker, "undefined");
   const host = createProductionBrowserHost({ WebSocketImpl: FakeWebSocket });

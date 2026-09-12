@@ -49,6 +49,7 @@ export async function create(options = {}) {
     additionalInstructions,
     resolveCompactionInstruction,
     resolveCompaction,
+    resolveContext,
     historySeed,
     sessionId,
     workspace,
@@ -64,7 +65,7 @@ export async function create(options = {}) {
     executionEnvironment,
     codeEvaluator,
   } = options;
-  const toolProviders = internalRuntime?.toolProviders;
+  const toolProviders = options.toolProviders ?? internalRuntime?.toolProviders;
   const subagentSessions = internalRuntime?.subagentSessions;
   const cloudflareReservation = internalRuntime?.[CLOUDFLARE_SESSION_RESERVATION];
   const stableSessionId = sessionId ?? createSessionId();
@@ -113,6 +114,7 @@ export async function create(options = {}) {
     filesystemTools,
     tools: hostTools,
     toolProviders,
+    publicToolProviders: options.toolProviders !== undefined,
     subagentSessions,
     toolMode,
     mcp: mcp === false
@@ -121,6 +123,7 @@ export async function create(options = {}) {
     codeEvaluator,
     resolveCompactionInstruction,
     resolveCompaction,
+    resolveContext,
     applyPatch: applyBrowserPatch,
     websocketPreconnect,
     websocketUrl,
@@ -241,6 +244,7 @@ export async function create(options = {}) {
       additionalInstructions,
       resolveCompactionInstruction,
       resolveCompaction,
+      resolveContext,
       historySeed,
       sessionId: stableSessionId,
       workspace: workspace ?? filesystem?.root,

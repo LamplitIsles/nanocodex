@@ -1,6 +1,8 @@
 use super::backend::{
     BackendPrompt, BackendPromptRoute, BackendTurn, BackendTurnKey, LifecycleBackend,
 };
+#[cfg(feature = "openai")]
+use super::execution::ExecutionSnapshot;
 use super::*;
 
 #[cfg(all(feature = "openai", not(target_family = "wasm")))]
@@ -229,6 +231,48 @@ impl Nanocodex {
     /// Returns the backend's local resource cleanup failure.
     pub async fn disconnect(&self) -> Result<()> {
         self.backend.disconnect().await
+    }
+
+    /// Returns the bounded engine-owned state for accepted executions.
+    ///
+    /// Every unfinished operation is included. The finite terminal portion
+    /// contains the newest retained receipts, so callers must treat a
+    /// truncated snapshot as a reconciliation window rather than an
+    /// indefinite operation registry.
+    #[cfg(feature = "openai")]
+    pub async fn execution_snapshot(&self) -> Result<ExecutionSnapshot> {
+        self.backend.execution_snapshot().await
+    }
+
+    /// Resumes retained prompt work by identity, using the existing admission and effect guards.
+    ///
+    /// Terminal operations replay their outcome; missing/pruned identities and
+    /// non-prompt maintenance operations fail explicitly.
+    #[cfg(feature = "openai")]
+    pub async fn resume_operation(&self, operation_id: impl Into<String>) -> Result<Turn> {
+        let operation_id = operation_id.into();
+        let encoded = self.backend.execution_input(operation_id.clone()).await?;
+        let input: super::execution::AcceptedPrompt =
+            serde_json::from_str(&encoded).map_err(NanocodexError::ExecutionPayload)?;
+        let mut request = PromptRequest::new(input.prompt).request_id(operation_id);
+        request.supplementary_context = input.supplementary_context.map(Arc::from);
+        self.prompt(request).await
+    }
+
+    /// Cancels one unfinished execution by its stable operation identity.
+    ///
+    /// The request is handled by the same driver that owns the accepted queue;
+    /// cancelling a queued operation therefore cannot dispatch its model
+    /// request or disturb earlier and later queue entries.
+    #[cfg(feature = "openai")]
+    pub async fn cancel_operation(&self, operation_id: impl Into<String>) -> Result<()> {
+        let operation_id = operation_id.into();
+        if operation_id.trim().is_empty() {
+            return Err(NanocodexError::InvalidRequest(
+                "operation ID must not be empty".to_owned(),
+            ));
+        }
+        self.backend.cancel_operation(operation_id).await
     }
 
     /// Gracefully stops this agent and waits for all owned resources to close.

@@ -23,6 +23,10 @@ export function createBrowserHost(options = {}) {
     && typeof options.resolveCompaction !== "function") {
     throw new TypeError("resolveCompaction must be a function");
   }
+  if (options.resolveContext !== undefined
+    && typeof options.resolveContext !== "function") {
+    throw new TypeError("resolveContext must be a function");
+  }
   const toolMode = options.toolMode ?? "code";
   if (toolMode !== "code" && toolMode !== "direct") {
     throw new TypeError("toolMode must be code or direct");
@@ -73,9 +77,9 @@ export function createBrowserHost(options = {}) {
   for (const [index, provider] of toolProviders.entries()) {
     const sourceOptions = {
       id: provider.sourceId ?? `attached:${String(index).padStart(8, "0")}`,
-      kind: "attached",
-      mode: "attached-over-cloud",
-      deferred: true,
+      kind: options.publicToolProviders ? "cloud" : "attached",
+      mode: options.publicToolProviders ? "union" : "attached-over-cloud",
+      deferred: !options.publicToolProviders,
     };
     const sourceId = code.addProvider(provider, sourceOptions);
     provider.setCatalogValidator?.((definitions) =>
@@ -546,6 +550,12 @@ export function createBrowserHost(options = {}) {
         throw new Error("resolveCompactionInstruction is not configured");
       }
       return options.resolveCompactionInstruction(context, signal);
+    },
+    resolveContext: (context, signal) => {
+      if (typeof options.resolveContext !== "function") {
+        throw new Error("resolveContext is not configured");
+      }
+      return options.resolveContext(context, signal);
     },
     releaseSession: code.releaseSession,
     emitEvent: onEvent,

@@ -31,6 +31,14 @@ test("the package Worker rejects function-valued compaction resolvers", async ()
     }),
     /supported in Node and current-isolate WASM hosts/,
   );
+  await assert.rejects(
+    createWorkerAgent({ harness: false, resolveContext: null }),
+    /resolveContext must be a function/,
+  );
+  await assert.rejects(
+    createWorkerAgent({ harness: false, resolveContext: () => ({}) }),
+    /supported in Node and current-isolate WASM hosts/,
+  );
 });
 
 test("Worker Agent preserves synchronous prompt handles, independent results, and ordered events", async () => {
@@ -1776,6 +1784,10 @@ function createFixture(options = {}) {
           free() { log.push(["turn-dispose", sessionId]); },
         };
       },
+      async resumeOperation(id) {
+        log.push(["resume", sessionId, id]);
+        return agent.prompt("retained input", id);
+      },
       promptContent(input, id) { return agent.prompt(JSON.parse(input)[0].text, id); },
       async fork() { log.push(["fork", sessionId]); return branch(`${sessionId}-fork`); },
       async forkFrom(at) { log.push([at ? "fork-at" : "fork", sessionId]); return branch(`${sessionId}-fork`); },
@@ -1929,3 +1941,24 @@ async function waitFor(predicate) {
   }
   throw new Error("condition did not become true");
 }
+
+
+test("Worker resumes a retained operation by ID through the ordinary Turn contract", async () => {
+  const fixture = createFixture();
+  const worker = new LoopbackWorker(fixture.createAgent);
+  const agent = await createWorkerAgent({ sessionId: "resume-root", harness: false,
+    transport: Transport.openAi({ apiKey: "test-key" }) }, { worker });
+  try {
+    const turn = await agent.execution.resume("retained-operation");
+    assert.equal(await turn.accepted(), "retained-operation");
+    assert.deepEqual(fixture.log.slice(0, 2), [
+      ["resume", "resume-root", "retained-operation"],
+      ["prompt", "resume-root", "retained input", "retained-operation"],
+    ]);
+    fixture.complete("resume-root", "resumed");
+    const result = await turn.result();
+    assert.equal(result.finalMessage, "resumed");
+    result.dispose();
+    turn.dispose();
+  } finally { agent.dispose(); }
+});

@@ -15,6 +15,7 @@ const hostConnections = new Map();
 const definitionHosts = new Map();
 const pendingCompactionInstructions = new Set();
 const pendingCompactions = new Set();
+const pendingContexts = new Set();
 let nextHostConnection = 1;
 let nextDefinitionHost = 1;
 let nextAgentUid = 1;
@@ -168,6 +169,41 @@ export function steer(turn, options) {
 
 export function cancel(turn) {
   return turnState(turn).raw.cancel();
+}
+
+export async function executionSnapshot(agent) {
+  const raw = agentState(agent).raw;
+  if (typeof raw.executionSnapshot !== "function") {
+    throw new Error("this Nanocodex runtime does not expose execution state");
+  }
+  const encoded = await raw.executionSnapshot();
+  return freezeJson(JSON.parse(encoded));
+}
+
+export async function executionState(agent, operationId) {
+  if (typeof operationId !== "string" || !operationId.trim()) {
+    throw new TypeError("operationId must be a non-empty string");
+  }
+  const snapshot = await executionSnapshot(agent);
+  return snapshot.operations.find((operation) => operation.operation_id === operationId) ?? null;
+}
+
+export async function resumeExecution(agent, operationId) {
+  if (typeof operationId !== "string" || !operationId.trim()) {
+    throw new TypeError("operationId must be a non-empty string");
+  }
+  return createTurn(await agentState(agent).raw.resumeOperation(operationId), agent);
+}
+
+export function cancelExecution(agent, operationId) {
+  if (typeof operationId !== "string" || !operationId.trim()) {
+    throw new TypeError("operationId must be a non-empty string");
+  }
+  const raw = agentState(agent).raw;
+  if (typeof raw.cancelOperation !== "function") {
+    throw new Error("this Nanocodex runtime does not expose execution cancellation");
+  }
+  return raw.cancelOperation(operationId);
 }
 
 export async function fork(agent, options) {
@@ -339,6 +375,9 @@ export function toWasmConfig(options = {}) {
   if (options.resolveCompaction !== undefined) {
     config.dynamic_compaction = true;
   }
+  if (options.resolveContext !== undefined) {
+    config.dynamic_context = true;
+  }
   if (options.historySeed !== undefined) {
     const seed = options.historySeed;
     if (!seed || typeof seed !== "object" || Array.isArray(seed)
@@ -474,6 +513,9 @@ export function releaseDefinitionHost(id) {
     if (pending.definitionHostId === id) pending.cancel();
   }
   for (const pending of [...pendingCompactions]) {
+    if (pending.definitionHostId === id) pending.cancel();
+  }
+  for (const pending of [...pendingContexts]) {
     if (pending.definitionHostId === id) pending.cancel();
   }
   definitionHosts.delete(id);
@@ -753,6 +795,57 @@ const hostBridge = Object.freeze({
     result.cancel = pending.cancel;
     // A dropped WASM JsFuture still owns this promise. Keep cancellation
     // rejections observed when the host's resolver is abort-aware.
+    result.catch(() => {});
+    return result;
+  },
+  resolveContext(definitionHostId, contextJson) {
+    const host = requiredDefinitionHost(definitionHostId);
+    const context = deepFreeze(JSON.parse(contextJson));
+    const controller = new AbortController();
+    const pending = {
+      definitionHostId,
+      active: true,
+      cancel() {
+        if (!pending.active) return;
+        pending.active = false;
+        pendingContexts.delete(pending);
+        controller.abort(new Error("execution context resolution was cancelled"));
+      },
+    };
+    pendingContexts.add(pending);
+    let result;
+    try {
+      if (typeof host.resolveContext !== "function") {
+        throw new Error("the Nanocodex host does not provide execution context resolution");
+      }
+      result = Promise.resolve(host.resolveContext(context, controller.signal))
+        .then((replacement) => {
+          if (!replacement || typeof replacement !== "object" || Array.isArray(replacement)) {
+            throw new TypeError("execution context resolver must return an object");
+          }
+          for (const [key, value] of Object.entries(replacement)) {
+            if (key !== "instructions" && key !== "hostContext" && key !== "supplementaryContext") {
+              throw new TypeError(`execution context resolver returned an unknown field: ${key}`);
+            }
+            if (typeof value !== "string") {
+              throw new TypeError(`execution context resolver field ${key} must be a string`);
+            }
+          }
+          const encoded = JSON.stringify(replacement);
+          if (typeof encoded !== "string") {
+            throw new TypeError("execution context resolver returned a non-JSON object");
+          }
+          return encoded;
+        })
+        .finally(() => {
+          pending.active = false;
+          pendingContexts.delete(pending);
+        });
+    } catch (error) {
+      pending.cancel();
+      result = Promise.reject(error);
+    }
+    result.cancel = pending.cancel;
     result.catch(() => {});
     return result;
   },

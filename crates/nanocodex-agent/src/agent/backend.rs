@@ -1,4 +1,6 @@
 #[cfg(feature = "openai")]
+use super::execution::ExecutionSnapshot;
+#[cfg(feature = "openai")]
 use super::handle::{request_fork, request_spawn};
 use super::*;
 
@@ -80,6 +82,9 @@ pub trait LifecycleBackend: Send + Sync + 'static {
     /// Cancels one exact unfinished turn.
     fn cancel(&self, key: BackendTurnKey) -> BackendFuture<Result<()>>;
 
+    /// Cancels one unfinished execution by its stable operation identity.
+    fn cancel_operation(&self, operation_id: String) -> BackendFuture<Result<()>>;
+
     /// Changes the model before the first turn is accepted.
     fn set_model(&self, model: Model) -> BackendFuture<Result<()>>;
 
@@ -103,6 +108,12 @@ pub trait LifecycleBackend: Send + Sync + 'static {
 
     /// Reads the latest safe model-visible context.
     fn context(&self) -> BackendFuture<Result<AgentSessionContext>>;
+
+    /// Returns the bounded engine-owned execution state.
+    fn execution_snapshot(&self) -> BackendFuture<Result<ExecutionSnapshot>>;
+
+    /// Loads retained operation input through its owning execution policy.
+    fn execution_input(&self, operation_id: String) -> BackendFuture<Result<String>>;
 
     /// Starts a clean sibling lifecycle.
     fn spawn(&self, options: SpawnOptions) -> BackendFuture<Result<(Nanocodex, AgentEvents)>>;
@@ -369,6 +380,18 @@ impl LifecycleBackend for LocalLifecycle {
         })
     }
 
+    fn cancel_operation(&self, operation_id: String) -> BackendFuture<Result<()>> {
+        let commands = self.commands.clone();
+        let shutdown = self.shutdown.clone();
+        Box::pin(async move {
+            request_command(&commands, &shutdown, |result| Command::CancelOperation {
+                operation_id,
+                result,
+            })
+            .await
+        })
+    }
+
     fn set_model(&self, model: Model) -> BackendFuture<Result<()>> {
         let commands = self.commands.clone();
         let shutdown = self.shutdown.clone();
@@ -459,6 +482,16 @@ impl LifecycleBackend for LocalLifecycle {
         Box::pin(async move {
             request_command(&commands, &shutdown, |result| Command::Context { result }).await
         })
+    }
+
+    fn execution_input(&self, operation_id: String) -> BackendFuture<Result<String>> {
+        let execution = self.execution.clone();
+        Box::pin(async move { execution.operation_input(operation_id).await })
+    }
+
+    fn execution_snapshot(&self) -> BackendFuture<Result<ExecutionSnapshot>> {
+        let execution = self.execution.clone();
+        Box::pin(async move { execution.observe().await })
     }
 
     fn spawn(&self, options: SpawnOptions) -> BackendFuture<Result<(Nanocodex, AgentEvents)>> {

@@ -19,7 +19,11 @@ test("durable subagent messaging survives a WASM heap beyond the Worker subarray
   // Reserve address space without filling it. This puts subsequent allocations
   // above 128 MiB without launching a delegation storm or contacting a model.
   const size = 144 * 1024 * 1024;
-  const padding = engine.__wbindgen_malloc(size, 1);
+  // wasm-bindgen's optimized build mangles these allocator exports; both
+  // names below come from the current development/release generated bindings.
+  const allocate = engine.__wbindgen_malloc ?? engine.__wbindgen_export;
+  const release = engine.__wbindgen_free ?? engine.__wbindgen_export5;
+  const padding = allocate(size, 1);
   const nativeSubarray = Uint8Array.prototype.subarray;
   const store = createMemoryDurabilityStore("high-memory-messaging");
   const writes = [];
@@ -69,6 +73,6 @@ test("durable subagent messaging survives a WASM heap beyond the Worker subarray
   } finally {
     Uint8Array.prototype.subarray = nativeSubarray;
     try { await agent?.session.shutdown(); }
-    finally { engine.__wbindgen_free(padding, size, 1); }
+    finally { release(padding, size, 1); }
   }
 });

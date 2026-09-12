@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex};
 use nanocodex_agent::{
     ExecutionPolicyDisposition, NanocodexBuilder, NanocodexError, Result as AgentResult,
     execution::{
-        ExecutionAdmission, ExecutionFuture, ExecutionOutput, ExecutionPolicy, ExecutionSteer,
-        ExecutionStepAdmission,
+        ExecutionAdmission, ExecutionFuture, ExecutionOutput, ExecutionPolicy, ExecutionSnapshot,
+        ExecutionSteer, ExecutionStepAdmission,
     },
     session::SessionSnapshot,
 };
@@ -142,6 +142,29 @@ impl DurableExecution {
 }
 
 impl ExecutionPolicy for DurableExecution {
+    fn operation_input<'a>(
+        &'a self,
+        operation_id: String,
+    ) -> ExecutionFuture<'a, AgentResult<String>> {
+        Box::pin(async move {
+            self.owner()
+                .await?
+                .operation_input(operation_id)
+                .await
+                .map_err(agent_error)
+        })
+    }
+
+    fn observe<'a>(&'a self) -> ExecutionFuture<'a, AgentResult<ExecutionSnapshot>> {
+        Box::pin(async move {
+            self.owner()
+                .await?
+                .execution_snapshot()
+                .await
+                .map_err(agent_error)
+        })
+    }
+
     fn recover_failure<'a>(
         &'a self,
         operation_id: String,

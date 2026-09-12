@@ -248,6 +248,22 @@ ships from repository source; read the
 [durability guide](crates/nanocodex-durability/README.md) and pin a Git revision
 when adopting it outside this workspace.
 
+Accepted work is observable through the same Rust-owned boundary: the bounded
+execution snapshot retains every unfinished identity and the newest terminal
+receipts, while `truncated` identifies the finite terminal reconciliation
+window. Ordered `execution.state` events carry the observed revision. Durable
+admission commits before acknowledgement, and cancellation by operation ID is
+handled by the driver's queue, so cancelling one pending or active operation
+does not move or erase neighboring accepted work. A store or ownership failure
+is surfaced as recoverable/reopen-required state; it is never converted into a
+silent retry or fabricated success.
+
+The current execution model preserves existing staging data. Automatic
+migration and long-lived compatibility reads are deliberately absent. Any
+deployment that needs to transform existing durable records requires a separate
+one-time migration proposal with approval, backup, verification, and rollback
+steps. That migration boundary is not part of this implementation.
+
 ### Tools, Code Mode, and MCP
 
 Tools are caller-owned capabilities, not callbacks hidden behind a global

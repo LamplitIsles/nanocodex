@@ -39,6 +39,7 @@ export function create(options = {}) {
     additionalInstructions,
     resolveCompactionInstruction,
     resolveCompaction,
+    resolveContext,
     historySeed,
     sessionId,
     workspace,
@@ -51,6 +52,7 @@ export function create(options = {}) {
     tools,
     subagents = true,
     toolMode,
+    toolProviders,
     mcp,
     codeEvaluator,
   } = options;
@@ -87,10 +89,12 @@ export function create(options = {}) {
     filesystem,
     tools: hostTools,
     toolMode,
+    toolProviders,
     workspace: workspace ?? filesystem?.root ?? resume?.workspace,
     codeEvaluator,
     resolveCompactionInstruction,
     resolveCompaction,
+    resolveContext,
     onDispose: () => releaseDefinitionHost(hostDefinitionId),
   });
   let durabilityOwner;
@@ -176,6 +180,7 @@ export function create(options = {}) {
     additionalInstructions,
     resolveCompactionInstruction,
     resolveCompaction,
+    resolveContext,
     historySeed,
     sessionId: stableSessionId,
     workspace: workspace ?? filesystem?.root,

@@ -412,6 +412,10 @@ pub(super) enum Command {
         key: TurnKey,
         result: oneshot::Sender<Result<()>>,
     },
+    CancelOperation {
+        operation_id: String,
+        result: oneshot::Sender<Result<()>>,
+    },
     Fork {
         checkpoint: Option<Arc<CommittedSession>>,
         result: oneshot::Sender<Result<(Nanocodex, AgentEvents)>>,
@@ -495,6 +499,7 @@ pub(super) enum QueuedTurn {
     },
     Cancelled {
         prompt: Prompt,
+        supplementary_context: Option<Arc<str>>,
         execution_operation: Option<String>,
         cancellation_committed: bool,
         thinking: Thinking,

@@ -15,10 +15,11 @@ use tokio::{
 use tokio_tungstenite::{WebSocketStream, accept_async, tungstenite::Message};
 
 use nanocodex_agent::{
-    AgentHandle, ExecutionEnvironment, Model, Nanocodex, NanocodexError, OpenAi, PromptRoute,
-    ReasoningMode, ResponseError, SpawnOptions, Thinking, Tools,
+    AgentHandle, ExecutionContext, ExecutionContextFuture, ExecutionContextRequest,
+    ExecutionContextResolver, ExecutionEnvironment, Model, Nanocodex, NanocodexError, OpenAi,
+    PromptRoute, ReasoningMode, ResponseError, SpawnOptions, Thinking, Tools,
     events::{AgentEvent, AgentEventData, RunEvent},
-    input::Prompt,
+    input::{Prompt, PromptInput},
     rollout::RolloutConfig,
     session::SessionSnapshot,
     transport::{ResponsesError, ResponsesHistory, ResponsesTransport},

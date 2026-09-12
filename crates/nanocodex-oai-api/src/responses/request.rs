@@ -114,6 +114,11 @@ impl RequestProfile {
         self
     }
 
+    pub(crate) fn with_tool_mappings_from(mut self, profile: &Self) -> Self {
+        self.code_mode_tool_names = Arc::clone(&profile.code_mode_tool_names);
+        self
+    }
+
     pub(crate) fn with_request_content(
         mut self,
         prompt_cache_key: String,

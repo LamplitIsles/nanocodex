@@ -60,6 +60,15 @@ const PACKAGE_VERSION = JSON.parse(
   await readFile(new URL("../package.json", import.meta.url), "utf8"),
 ).version;
 
+test("Node host validates the current-context resolver boundary", () => {
+  assert.throws(
+    () => createNodeHost({ resolveContext: null }),
+    /resolveContext must be a function/,
+  );
+  const host = createNodeHost({ resolveContext: () => ({}) });
+  return host.dispose();
+});
+
 async function waitForToolDefinition(host, name) {
   const deadline = performance.now() + 1_000;
   while (performance.now() < deadline) {
@@ -2055,6 +2064,76 @@ test("Node Astra sends its model prompt with additive host rules and preserves r
       await agent.session.shutdown();
       await server.close();
     }
+  }
+});
+
+test("Node WASM resolves current instructions once per turn and preserves omission semantics", async () => {
+  const server = await startServer();
+  const contexts = [];
+  const systemPrompt = await readFile(
+    new URL("../../../crates/nanocodex-oai-api/prompts/system.md", import.meta.url),
+    "utf8",
+  );
+  const agent = await createWarmAgent({
+    apiKey: "test-key",
+    websocketUrl: server.url,
+    thinking: "none",
+    additionalInstructions: "static host additions",
+    resolveContext: (context, signal) => {
+      assert.equal(signal.aborted, false);
+      contexts.push(context);
+      if (context.input.instruction === "replace") {
+        return { instructions: "dynamic replacement" };
+      }
+      if (context.input.instruction === "clear") {
+        return { instructions: "" };
+      }
+      return {};
+    },
+  });
+  try {
+    const scenario = (async () => {
+      const socket = await bounded(server.connection, "dynamic context connection");
+      const reader = messageReader(socket);
+      const warmup = await bounded(reader.next(), "dynamic context warmup");
+      assert.equal(warmup.input[1].content[0].text, "dynamic replacement");
+      sendWarmup(socket, "dynamic-context-warmup");
+
+      for (const [responseId, expected] of [
+        ["dynamic-context-replace", "dynamic replacement"],
+        ["dynamic-context-clear", ""],
+        ["dynamic-context-default", `${systemPrompt}\n\nstatic host additions`],
+      ]) {
+        const request = await bounded(reader.next(), "dynamic context turn");
+        if (responseId === "dynamic-context-replace") {
+          assert.equal(request.previous_response_id, "dynamic-context-warmup");
+        } else {
+          assert.equal(request.previous_response_id, undefined);
+          assert.equal(request.input[0].type, "additional_tools");
+          assert.equal(request.input[1].role, "developer");
+          assert.equal(request.input[1].content[0].text, expected);
+        }
+        sendFinal(socket, responseId, "done");
+      }
+    })();
+
+    for (const input of ["replace", "clear", "default"]) {
+      assert.equal(
+        (await bounded(agent.turn.prompt({ input }).result(), "dynamic context result"))
+          .finalMessage,
+        "done",
+      );
+    }
+    await bounded(scenario, "dynamic context scenario");
+    assert.deepEqual(contexts.map((context) => context.operationId), [
+      "turn-1",
+      "turn-2",
+      "turn-3",
+    ]);
+    assert.equal(contexts.every((context) => Object.isFrozen(context)), true);
+  } finally {
+    agent.dispose();
+    await server.close();
   }
 });
 

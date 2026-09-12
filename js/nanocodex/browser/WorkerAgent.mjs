@@ -487,9 +487,12 @@ export function installWorkerAgentRuntime(scope = globalThis, options = {}) {
 async function dispatch(message, state) {
   const { agents, turns, results, voices } = state;
   switch (message.type) {
+    case "resume":
     case "prompt": {
       const agent = required(agents, message.agentId, "agent");
-      const turn = agent.turn.prompt(message.options);
+      const turn = message.type === "resume"
+        ? await agent.execution.resume(message.operationId)
+        : agent.turn.prompt(message.options);
       if (turns.has(message.turnId)) throw new Error(`duplicate Worker Agent turn: ${message.turnId}`);
       turns.set(message.turnId, turn);
       try {
@@ -596,6 +599,8 @@ async function dispatch(message, state) {
   if (method === "agent.compact") return agent.session.compact();
   if (method === "agent.context") return agent.session.context();
   if (method === "agent.snapshot") return agent.session.snapshot();
+  if (method === "agent.execution") return agent.execution.snapshot();
+  if (method === "agent.execution.cancel") return agent.execution.cancel(args[1]);
   if (method === "agent.setModel") return agent.session.setModel(args[1]);
   if (method === "agent.setThinking") return agent.session.setThinking(args[1]);
   if (method === "agent.setFastMode") return agent.session.setFastMode(args[1]);
@@ -762,8 +767,22 @@ class WorkerConnection {
       agentId,
       sessionId: descriptor.sessionId,
       released: false,
-      prompt(input, id) { return connection.prompt(handleId, { input, ...(id === undefined ? {} : { id }) }); },
-      promptContent(input, id) { return connection.prompt(handleId, { input: JSON.parse(input), ...(id === undefined ? {} : { id }) }); },
+      prompt(input, id, cancelOnAdmission, supplementaryContext) {
+        return connection.prompt(handleId, {
+          input,
+          ...(id === undefined ? {} : { id }),
+          ...(cancelOnAdmission === true ? { cancelOnAdmission: true } : {}),
+          ...(supplementaryContext === undefined ? {} : { supplementaryContext }),
+        });
+      },
+      promptContent(input, id, cancelOnAdmission, supplementaryContext) {
+        return connection.prompt(handleId, {
+          input: JSON.parse(input),
+          ...(id === undefined ? {} : { id }),
+          ...(cancelOnAdmission === true ? { cancelOnAdmission: true } : {}),
+          ...(supplementaryContext === undefined ? {} : { supplementaryContext }),
+        });
+      },
       fork: async () => connection.rawAgent(await connection.rpc("agent.fork", [handleId])),
       forkFrom: async (result) => {
         if (result?.connection !== connection) {
@@ -775,6 +794,9 @@ class WorkerConnection {
       compact: () => connection.rpc("agent.compact", [handleId]),
       context: async () => JSON.stringify(await connection.rpc("agent.context", [handleId])),
       snapshot: async () => JSON.stringify(await connection.rpc("agent.snapshot", [handleId])),
+      executionSnapshot: async () => JSON.stringify(await connection.rpc("agent.execution", [handleId])),
+      cancelOperation: (operationId) => connection.rpc("agent.execution.cancel", [handleId, operationId]),
+      resumeOperation: (operationId) => connection.prompt(handleId, undefined, operationId),
       setModel: (value) => connection.rpc("agent.setModel", [handleId, value]),
       setThinking: (value) => connection.rpc("agent.setThinking", [handleId, value]),
       setFastMode: (value) => connection.rpc("agent.setFastMode", [handleId, value]),
@@ -839,7 +861,7 @@ class WorkerConnection {
     };
   }
 
-  prompt(agentId, options) {
+  prompt(agentId, options, operationId) {
     this.assertOpen();
     const connection = this;
     assertCloneable(options, "turn prompt");
@@ -847,7 +869,7 @@ class WorkerConnection {
     const accepted = this.pendingCall(turnId);
     void accepted.catch(() => {});
     this.turns += 1;
-    try { this.send({ type: "prompt", id: turnId, agentId, turnId, options }); }
+    try { this.send({ type: operationId === undefined ? "prompt" : "resume", id: turnId, agentId, turnId, options, operationId }); }
     catch (error) { this.rejectPending(turnId, error); }
     let result;
     let disposed = false;
@@ -1301,6 +1323,17 @@ function serializeConfig(options) {
     throw new TypeError(
       "compaction resolvers are supported in Node and current-isolate WASM hosts, not the default browser Worker API",
     );
+  }
+  if (config.resolveContext !== undefined && typeof config.resolveContext !== "function") {
+    throw new TypeError("resolveContext must be a function");
+  }
+  if (typeof config.resolveContext === "function") {
+    throw new TypeError(
+      "resolveContext is supported in Node and current-isolate WASM hosts, not the default browser Worker API",
+    );
+  }
+  if (config.toolProviders !== undefined) {
+    throw new TypeError("toolProviders are supported in Node and current-isolate WASM hosts, not the default browser Worker API");
   }
   const workerDurability = config.durability !== false;
   if (!workerDurability) delete config.durability;

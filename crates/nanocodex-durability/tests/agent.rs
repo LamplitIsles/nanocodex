@@ -2187,13 +2187,23 @@ async fn durable_terminal_replays_emit_one_terminal_without_model_execution() ->
     drop((seed, seed_events));
 
     let failed_prompt = Prompt::from("failed replay");
-    state.admit("failed-replay", &failed_prompt).await?;
+    state
+        .admit(
+            "failed-replay",
+            &json!({ "prompt": failed_prompt, "supplementary_context": null }),
+        )
+        .await?;
     state.begin_attempt("failed-replay").await?;
     state
         .fail("failed-replay", &snapshot, "retained failure")
         .await?;
     let cancelled_prompt = Prompt::from("cancelled replay");
-    state.admit("cancelled-replay", &cancelled_prompt).await?;
+    state
+        .admit(
+            "cancelled-replay",
+            &json!({ "prompt": cancelled_prompt, "supplementary_context": null }),
+        )
+        .await?;
     state.cancel("cancelled-replay").await?;
 
     let (resumed, mut events) = Nanocodex::builder(openai()?)

@@ -1,4 +1,7 @@
 use super::*;
+use crate::agent::execution::{
+    ExecutionContext, ExecutionContextRequest, ExecutionContextResolver,
+};
 
 impl<S> ModelRun<S>
 where
@@ -311,6 +314,8 @@ where
         mut cancel: tokio::sync::oneshot::Receiver<()>,
         fork_snapshots: watch::Sender<Option<ModelCheckpoint>>,
         execution_steps: Option<ExecutionSteps>,
+        context_resolver: Option<Arc<dyn ExecutionContextResolver>>,
+        context_request: ExecutionContextRequest,
     ) -> Result<ModelTurnOutcome> {
         self.execution_steps = execution_steps;
         self.thinking = thinking;
@@ -336,17 +341,37 @@ where
             },
         )?;
 
-        let outcome = self
-            .execute_task(
+        let outcome = async {
+            // Resolve inside the active execution future so the existing driver
+            // continues accepting/cancelling work while a Host callback waits.
+            let context = match context_resolver {
+                Some(resolver) => tokio::select! {
+                    biased;
+                    _ = &mut cancel => return Ok(ModelTaskOutcome::Cancelled),
+                    context = resolver.resolve(context_request) => context?,
+                },
+                None => ExecutionContext::default(),
+            };
+            self.apply_execution_instructions(context.instructions)?;
+            if let Some(host_context) = context.host_context {
+                self.set_host_context(Some(Arc::from(host_context)));
+            }
+            let supplementary_context = context
+                .supplementary_context
+                .map(Arc::from)
+                .or(supplementary_context);
+            self.execute_task(
                 task,
                 supplementary_context,
-                workspace,
+                workspace.clone(),
                 logical_turn,
                 steering,
                 &mut cancel,
                 &fork_snapshots,
             )
-            .await;
+            .await
+        }
+        .await;
         match outcome {
             Ok(ModelTaskOutcome::Completed(message)) => {
                 self.stats
@@ -361,6 +386,9 @@ where
                 }))
             }
             Ok(ModelTaskOutcome::Cancelled) => {
+                if self.session.is_none() {
+                    self.session = Some(self.empty_session(workspace.as_deref())?);
+                }
                 if let Some(tools) = &self.active_tools {
                     tools.cancel_turn().await;
                 }

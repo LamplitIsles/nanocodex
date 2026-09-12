@@ -84,6 +84,35 @@ orchestrator that assigns separate tree-local IDs, mailboxes, roles, or status
 must persist that topology independently and map those IDs to agent session
 IDs when it needs cold tree reconstruction.
 
+## Accepted-work reconciliation
+
+`DurableSession::execution_snapshot` is the authoritative bounded view for
+accepted work. It is linearized by the Rust state driver and returns every
+unfinished operation plus the newest retained terminal receipts, ordered by
+acceptance. The view reports `pending`, `active`, `completed`, `failed`, or
+`cancelled`; `truncated` means older terminal identities have fallen outside
+the finite reconciliation window. Subscribe to `execution.state` before the
+initial snapshot and refresh authoritative snapshots serially on notifications.
+The revision identifies durable state; pending and active may share it. Do not
+apply buffered event statuses over a newer snapshot.
+The snapshot is not an indefinite operation registry, and an ordinary
+`SessionSnapshot` should not be treated as a queue.
+
+Durable prompt admission persists the accepted operation before the
+acknowledgement handoff is allowed to complete. If the store result is
+unconfirmed, the caller receives a recovery-required error rather than a false
+acceptance. Repeating an accepted operation identity with different input is a
+conflict; repeating it with the same input reopens or replays according to the
+authoritative durable state. An interrupted active operation remains subject to
+the existing recovery ambiguity and at-least-once effect rules: the SDK does
+not silently claim that an uncertain external effect completed.
+
+The implementation preserves existing staging data. It contains no automatic
+state migration and no long-lived compatibility-read path. A separate,
+approved one-time migration proposal must precede any deployment that needs
+to transform existing durable records; backup, verification, and rollback are
+part of that proposal and outside this crate's implementation boundary.
+
 Small retained states use the existing format-2 JSON representation. Once a
 serialized state crosses 256 KiB, the Rust encoder streams it through gzip and
 base64 under the `nanocodex-durable-state-gzip-v1:` prefix. Recovery accepts both
@@ -158,3 +187,10 @@ terminals atomically carry their checkpoint and replay receipt.
 Unlike a store that stages an output separately from source-ordered transcript
 placement, this store owns one opaque total state. A second materialization
 write would add latency without adding a recovery boundary.
+
+Agent prompt recovery uses `Nanocodex::resume_operation(id)` to load the retained
+prompt/context envelope by identity. It reuses the journal's admission and effect
+rules; it does not interpret a conversation snapshot as accepted work. The state
+owner can also cancel retained pending identities before a local turn handle
+exists. Existing durable input payloads require the separately approved deployment
+cutover; this implementation does not read or migrate staging data.

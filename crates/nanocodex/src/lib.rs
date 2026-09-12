@@ -14,6 +14,12 @@ pub use nanocodex_agent::{
     NanocodexError, PromptRequest, PromptRoute, ReportedTurnUsage, ServiceTier, SessionSnapshot,
     Turn, TurnControl, TurnResult, TurnUsage, UsdAmount,
 };
+#[cfg(feature = "openai")]
+#[cfg_attr(docsrs, doc(cfg(feature = "openai")))]
+pub use nanocodex_agent::{
+    ExecutionContext, ExecutionContextFuture, ExecutionContextRequest, ExecutionContextResolver,
+    ExecutionSnapshot, ExecutionState, ExecutionStatus,
+};
 #[cfg(feature = "durability")]
 #[cfg_attr(docsrs, doc(cfg(feature = "durability")))]
 pub use nanocodex_durability::DurableAgentExt;
@@ -56,7 +62,11 @@ pub mod agent {
     };
     #[cfg(feature = "openai")]
     #[cfg_attr(docsrs, doc(cfg(feature = "openai")))]
-    pub use nanocodex_agent::{AgentHandle, ExecutionEnvironment, NanocodexBuilder, execution};
+    pub use nanocodex_agent::{
+        AgentHandle, ExecutionContext, ExecutionContextFuture, ExecutionContextRequest,
+        ExecutionContextResolver, ExecutionEnvironment, ExecutionSnapshot, ExecutionState,
+        ExecutionStatus, NanocodexBuilder, execution,
+    };
     #[cfg(feature = "openai")]
     #[cfg_attr(docsrs, doc(cfg(feature = "openai")))]
     pub use nanocodex_agent::{

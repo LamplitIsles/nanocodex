@@ -1,14 +1,21 @@
 import * as events from "./events.mjs";
+import * as execution from "./execution.mjs";
 import * as session from "./session.mjs";
 import * as turn from "./turn.mjs";
 import * as voice from "./voice.mjs";
 
-export { events, session, turn, voice };
+export { events, execution, session, turn, voice };
 
 export function agentActions() {
   return (agent) => ({
     events: {
       watch: (options) => events.watch(agent, options),
+    },
+    execution: {
+      snapshot: () => execution.snapshot(agent),
+      state: (operationId) => execution.state(agent, operationId),
+      cancel: (operationId) => execution.cancel(agent, operationId),
+      resume: (operationId) => execution.resume(agent, operationId),
     },
     session: {
       appendDeveloperMessage: (text) => session.appendDeveloperMessage(agent, text),

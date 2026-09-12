@@ -107,7 +107,9 @@ agent.shutdown().await?;
 - [`session`](nanocodex_agent::session) contains session identities and
   serializable resume snapshots.
 - [`execution`](nanocodex_agent::execution) is the neutral model/tool/checkpoint
-  interception seam implemented by optional higher-layer policies.
+  interception seam implemented by optional higher-layer policies. It also
+  carries the bounded accepted-work observation types and the current-context
+  resolver used at the driver's model boundary.
 - [`usage`](nanocodex_agent::usage) contains token accounting and USD estimates.
 - [`rollout`](nanocodex_agent::rollout) records and restores Codex-compatible
   sessions.
@@ -124,3 +126,48 @@ that optional layer. An attached execution policy is owned by exactly one
 agent. A clean `spawn` deliberately creates an ordinary in-memory child without
 that policy; `fork` returns an explicit error because inherited committed context
 requires an independently owned policy.
+
+## Execution observation and current context
+
+The driver remains the sole owner of accepted work. When an execution policy
+is attached, `Nanocodex::execution_snapshot` reports a bounded, ordered view
+keyed by stable operation identity. Every unfinished operation is retained;
+the finite terminal portion contains only the newest retained receipts and is
+marked with `truncated` when older terminals are omitted. The snapshot's
+revision identifies durable storage state, not each activity transition.
+Subscribe to `execution.state` before the initial snapshot and refresh snapshots
+serially on notifications. Do not overwrite a newer snapshot with buffered event
+status; a delayed notification then cannot make terminal work active again.
+Without a policy the observation is an empty view, because ordinary in-memory
+turns do not promise durable operation identities.
+
+`Nanocodex::cancel_operation` sends cancellation through the same driver that
+owns the queue. It can cancel an active or queued accepted operation by
+identity; a queued cancellation removes only that operation and cannot dispatch
+its model request or discard neighboring work. Durable policies persist the
+terminal transition before the cancellation completes. Reconnecting consumers
+must treat the bounded snapshot as a finite terminal reconciliation window,
+not an indefinite operation registry.
+
+`Nanocodex::resume_operation(id)` retrieves the retained prompt and its submitted
+supplementary context, then returns the ordinary `Turn` through the same admission
+and effect guards. Recover unfinished prompts in acceptance order. Missing or
+pruned identities and non-prompt maintenance inputs fail explicitly; ambiguous
+external effects retain the existing recovery requirement. Cancellation by ID
+also applies to retained pending work before it has been resumed in this process.
+The retained prompt payload is an envelope containing both fields; converting
+previous deployment data is a separate approved cutover, not an automatic SDK read.
+
+`NanocodexBuilder::execution_context_resolver` is a generic host seam, not a
+product prompt policy. The driver calls it once after a queued prompt reaches
+the safe model boundary. An omitted `instructions` field restores the builder's
+configured replacement or selected model default; a supplied string replaces
+the complete product instruction, and a supplied empty string clears it.
+Omitted host or supplementary context preserves the current configured or
+submitted value, while an explicitly empty string clears it. Resolver failures
+are returned before model dispatch and never reuse a stale callback result.
+Changing the effective replacement resets the provider continuation and causes
+a full retained-history replay when necessary. Required runtime/tool protocol
+items remain separate from this product instruction item. The independent
+compaction instruction/replacement hooks retain their existing ownership and
+semantics.

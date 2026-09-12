@@ -71,6 +71,83 @@ async fn model_prompt_selection_preserves_explicit_and_additional_instructions()
     Ok(())
 }
 
+struct DynamicPromptResolver;
+
+impl ExecutionContextResolver for DynamicPromptResolver {
+    fn resolve<'a>(&'a self, context: ExecutionContextRequest) -> ExecutionContextFuture<'a> {
+        Box::pin(async move {
+            let instruction = match context.input.instruction {
+                PromptInput::Text(instruction) => instruction,
+                PromptInput::Content(_) => String::new(),
+            };
+            Ok(ExecutionContext {
+                instructions: match instruction.as_str() {
+                    "replace" => Some("assembled product prompt".to_owned()),
+                    "clear" => Some(String::new()),
+                    _ => None,
+                },
+                ..ExecutionContext::default()
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn dynamic_instructions_replace_clear_and_restore_configured_prompt_once() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("ws://{}", listener.local_addr()?);
+    let expected_default = format!(
+        "{}\n\nstatic host instructions",
+        include_str!("../../../../nanocodex-oai-api/prompts/system.md")
+    );
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        let mut socket = accept_async(stream).await?;
+        for (response_id, expected) in [
+            ("resp-replace", "assembled product prompt"),
+            ("resp-clear", ""),
+            ("resp-default", expected_default.as_str()),
+        ] {
+            let generation = next_json(&mut socket).await?;
+            assert_eq!(generation["input"][0]["type"], "additional_tools");
+            assert_eq!(generation["input"][1]["role"], "developer");
+            assert_eq!(generation["input"][1]["content"][0]["text"], expected);
+            assert_eq!(
+                generation["input"][1]["content"].as_array().map(Vec::len),
+                Some(1)
+            );
+            send_final(&mut socket, response_id).await?;
+        }
+        Result::<()>::Ok(())
+    });
+
+    let openai = OpenAi::builder("test-key")
+        .model(Model::Sol)
+        .websocket_warmup(false)
+        .websocket_url(endpoint)
+        .build()?;
+    let (agent, events) = Nanocodex::builder(openai)
+        .thinking(Thinking::Low)
+        .additional_instructions("static host instructions")
+        .execution_context_resolver(Arc::new(DynamicPromptResolver))
+        .build()?;
+    for instruction in ["replace", "clear", "default"] {
+        assert_eq!(
+            agent
+                .prompt(instruction)
+                .await?
+                .result()
+                .await?
+                .final_message(),
+            "done"
+        );
+    }
+    agent.shutdown().await?;
+    drop((agent, events));
+    timeout(std::time::Duration::from_secs(5), server).await???;
+    Ok(())
+}
+
 #[tokio::test]
 async fn astra_prompt_is_restored_from_the_retained_model() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -233,5 +310,71 @@ async fn run_global_instructions_case(
     timeout(std::time::Duration::from_secs(5), server)
         .await
         .map_err(|_| eyre!("mock Responses server did not finish"))???;
+    Ok(())
+}
+
+struct WaitingContextResolver {
+    started: tokio::sync::Notify,
+    dropped: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ExecutionContextResolver for WaitingContextResolver {
+    fn resolve<'a>(&'a self, _: ExecutionContextRequest) -> ExecutionContextFuture<'a> {
+        Box::pin(async move {
+            struct Dropped(Arc<std::sync::atomic::AtomicBool>);
+            impl Drop for Dropped {
+                fn drop(&mut self) {
+                    self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            let _guard = Dropped(Arc::clone(&self.dropped));
+            self.started.notify_one();
+            std::future::pending().await
+        })
+    }
+}
+
+#[tokio::test]
+async fn cancelling_or_shutting_down_drops_pending_context_before_provider_dispatch() -> Result<()>
+{
+    for shutdown in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let resolver = Arc::new(WaitingContextResolver {
+            started: tokio::sync::Notify::new(),
+            dropped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        let openai = OpenAi::builder("test-key")
+            .websocket_warmup(false)
+            .websocket_url(format!("ws://{}", listener.local_addr()?))
+            .build()?;
+        let (agent, _events) = Nanocodex::builder(openai)
+            .execution_context_resolver(resolver.clone())
+            .build()?;
+        let turn = agent.prompt("waiting for current context").await?;
+        timeout(
+            std::time::Duration::from_secs(5),
+            resolver.started.notified(),
+        )
+        .await?;
+        if shutdown {
+            timeout(std::time::Duration::from_secs(5), agent.shutdown()).await??;
+        } else {
+            timeout(std::time::Duration::from_secs(5), turn.cancel()).await??;
+        }
+        assert!(
+            timeout(std::time::Duration::from_secs(5), turn.result())
+                .await?
+                .is_err()
+        );
+        assert!(resolver.dropped.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            timeout(std::time::Duration::from_millis(50), listener.accept())
+                .await
+                .is_err()
+        );
+        if !shutdown {
+            agent.shutdown().await?;
+        }
+    }
     Ok(())
 }

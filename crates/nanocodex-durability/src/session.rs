@@ -6,6 +6,8 @@ use std::{
     },
 };
 
+use nanocodex_agent::execution::{ExecutionSnapshot, ExecutionState, ExecutionStatus};
+
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::{mpsc, oneshot};
 
@@ -150,6 +152,13 @@ enum Command {
     State {
         result: oneshot::Sender<DurableState>,
     },
+    Observe {
+        result: oneshot::Sender<ExecutionSnapshot>,
+    },
+    OperationInput {
+        operation_id: String,
+        result: oneshot::Sender<Result<String>>,
+    },
     LatestCheckpoint {
         result: oneshot::Sender<Option<EncodedPayload>>,
     },
@@ -274,6 +283,8 @@ struct Driver {
     releases: mpsc::UnboundedReceiver<ReleaseSignal>,
 }
 
+const EXECUTION_SNAPSHOT_LIMIT: usize = 256;
+
 const OWNER_ACTIVE: u8 = 0;
 const OWNER_RELEASING: u8 = 1;
 const OWNER_RELEASED: u8 = 2;
@@ -361,6 +372,23 @@ impl Driver {
                     drop(result.send(outcome));
                 }
                 Command::State { result } => drop(result.send(self.state.clone())),
+                Command::Observe { result } => drop(result.send(self.execution_snapshot())),
+                Command::OperationInput {
+                    operation_id,
+                    result,
+                } => {
+                    let input = self
+                        .state
+                        .operations()
+                        .get(&operation_id)
+                        .map(|operation| operation.input.json().to_owned())
+                        .ok_or_else(|| {
+                            Error::InvalidState(format!(
+                                "operation {operation_id} is unknown or no longer retained"
+                            ))
+                        });
+                    drop(result.send(input));
+                }
                 Command::LatestCheckpoint { result } => {
                     drop(result.send(self.state.latest_checkpoint().cloned()));
                 }
@@ -708,6 +736,49 @@ impl Driver {
                     self.running.remove(&operation_id);
                 }
             }
+        }
+    }
+
+    fn execution_snapshot(&self) -> ExecutionSnapshot {
+        let mut operations = self
+            .state
+            .operations()
+            .iter()
+            .map(|(operation_id, operation)| ExecutionState {
+                operation_id: operation_id.clone(),
+                status: if self.running.contains(operation_id) {
+                    ExecutionStatus::Active
+                } else {
+                    match &operation.status {
+                        OperationStatus::Pending => ExecutionStatus::Pending,
+                        OperationStatus::Completed { .. } => ExecutionStatus::Completed,
+                        OperationStatus::Failed { .. } => ExecutionStatus::Failed,
+                        OperationStatus::Cancelled { .. } => ExecutionStatus::Cancelled,
+                    }
+                },
+                accepted_order: operation.accepted_order,
+            })
+            .collect::<Vec<_>>();
+        operations.sort_by_key(|operation| operation.accepted_order);
+
+        let terminal_count = operations
+            .iter()
+            .filter(|operation| operation.status.is_terminal())
+            .count();
+        let truncated = terminal_count > EXECUTION_SNAPSHOT_LIMIT;
+        let mut skip_terminals = terminal_count.saturating_sub(EXECUTION_SNAPSHOT_LIMIT);
+        operations.retain(|operation| {
+            if operation.status.is_terminal() && skip_terminals > 0 {
+                skip_terminals -= 1;
+                false
+            } else {
+                true
+            }
+        });
+        ExecutionSnapshot {
+            revision: self.state.revision(),
+            operations,
+            truncated,
         }
     }
 
@@ -1360,6 +1431,17 @@ impl DurableSession {
         receiver.await.map_err(|_| Error::DriverStopped)
     }
 
+    /// Returns a bounded view of accepted, active, and terminal execution state.
+    ///
+    /// The view is linearized by the durable-state driver. Unfinished
+    /// operations are always retained; at most the newest 256 terminal
+    /// receipts are included.
+    pub async fn execution_snapshot(&self) -> Result<ExecutionSnapshot> {
+        let (result, receiver) = oneshot::channel();
+        self.send(Command::Observe { result }).await?;
+        receiver.await.map_err(|_| Error::DriverStopped)
+    }
+
     /// Copies the latest terminal checkpoint from the owning driver without
     /// cloning the rest of the reduced state.
     pub async fn latest_checkpoint(&self) -> Result<Option<EncodedPayload>> {
@@ -1750,6 +1832,22 @@ pub(crate) struct DurableOwner {
 }
 
 impl DurableOwner {
+    pub(crate) async fn operation_input(&self, operation_id: String) -> Result<String> {
+        let (result, receiver) = oneshot::channel();
+        self.send(Command::OperationInput {
+            operation_id,
+            result,
+        })
+        .await?;
+        receiver.await.map_err(|_| Error::DriverStopped)?
+    }
+
+    pub(crate) async fn execution_snapshot(&self) -> Result<ExecutionSnapshot> {
+        let (result, receiver) = oneshot::channel();
+        self.send(Command::Observe { result }).await?;
+        receiver.await.map_err(|_| Error::DriverStopped)
+    }
+
     pub(crate) async fn recover_failure(
         &self,
         operation_id: String,
@@ -2384,6 +2482,89 @@ mod tests {
         let state = session.state().await.unwrap();
         assert_eq!(state.revision(), revision);
         claimant.complete("turn-1", &1, &"done").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn execution_snapshot_tracks_pending_active_and_terminal_state() {
+        let store = MemoryStore::new().unwrap();
+        let session = DurableSession::open(store, "execution-snapshot-lifecycle")
+            .await
+            .unwrap();
+
+        let empty = session.execution_snapshot().await.unwrap();
+        assert_eq!(empty.revision, 0);
+        assert!(empty.operations.is_empty());
+        assert!(!empty.truncated);
+
+        session.admit("turn-1", &"prompt").await.unwrap();
+        let pending = session.execution_snapshot().await.unwrap();
+        assert_eq!(pending.operations.len(), 1);
+        assert_eq!(pending.operations[0].operation_id, "turn-1");
+        assert_eq!(pending.operations[0].status, ExecutionStatus::Pending);
+        assert_eq!(pending.operations[0].accepted_order, 1);
+
+        session.begin_attempt("turn-1").await.unwrap();
+        let active = session.execution_snapshot().await.unwrap();
+        assert_eq!(active.operations[0].status, ExecutionStatus::Active);
+        assert_eq!(active.revision, pending.revision);
+
+        session.complete("turn-1", &1_u32, &"done").await.unwrap();
+        let completed = session.execution_snapshot().await.unwrap();
+        assert_eq!(completed.operations[0].status, ExecutionStatus::Completed);
+        assert!(completed.operations[0].status.is_terminal());
+        assert!(completed.revision > active.revision);
+    }
+
+    #[tokio::test]
+    async fn execution_snapshot_retains_unfinished_and_newest_terminal_operations() {
+        let store = MemoryStore::new().unwrap();
+        let session = DurableSession::open(store, "execution-snapshot-bound")
+            .await
+            .unwrap();
+
+        for index in 0..(EXECUTION_SNAPSHOT_LIMIT + 4) {
+            let operation_id = format!("turn-{index}");
+            session.admit(&operation_id, &index).await.unwrap();
+            session.begin_attempt(&operation_id).await.unwrap();
+            session
+                .complete(&operation_id, &index, &"done")
+                .await
+                .unwrap();
+        }
+        session.admit("turn-pending", &"pending").await.unwrap();
+
+        let snapshot = session.execution_snapshot().await.unwrap();
+        assert!(snapshot.truncated);
+        assert_eq!(snapshot.operations.len(), EXECUTION_SNAPSHOT_LIMIT + 1);
+        assert_eq!(
+            snapshot.operations.last().unwrap().operation_id,
+            "turn-pending"
+        );
+        assert_eq!(
+            snapshot.operations.last().unwrap().status,
+            ExecutionStatus::Pending
+        );
+        assert!(
+            !snapshot
+                .operations
+                .iter()
+                .any(|operation| operation.operation_id == "turn-0")
+        );
+        assert!(
+            snapshot
+                .operations
+                .iter()
+                .any(|operation| operation.operation_id == "turn-4")
+        );
+        assert_eq!(
+            snapshot.operations[..EXECUTION_SNAPSHOT_LIMIT]
+                .iter()
+                .map(|operation| operation.operation_id.clone())
+                .collect::<Vec<_>>(),
+            (4..(EXECUTION_SNAPSHOT_LIMIT + 4))
+                .map(|i| format!("turn-{i}"))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]

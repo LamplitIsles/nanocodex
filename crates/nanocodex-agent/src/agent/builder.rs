@@ -1,3 +1,4 @@
+use super::execution::ExecutionContextResolver;
 use super::spawn::{validate_model_reasoning_mode, validate_model_thinking};
 use super::*;
 
@@ -84,6 +85,20 @@ impl<F> NanocodexBuilder<F> {
     #[must_use]
     pub fn additional_instructions(mut self, instructions: impl Into<Arc<str>>) -> Self {
         self.config.additional_instructions = Some(instructions.into());
+        self
+    }
+
+    /// Resolves current host-owned context immediately before each model turn.
+    ///
+    /// The result may replace the complete product instructions, private tool
+    /// host context, and prompt supplementary context. Omitted fields preserve
+    /// the configured value; an explicitly empty string clears it.
+    #[must_use]
+    pub fn execution_context_resolver(
+        mut self,
+        resolver: Arc<dyn ExecutionContextResolver>,
+    ) -> Self {
+        self.codex.execution.set_context_resolver(resolver);
         self
     }
 

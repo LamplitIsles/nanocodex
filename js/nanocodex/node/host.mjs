@@ -33,6 +33,10 @@ export function createNodeHost(options = {}) {
     && typeof options.resolveCompaction !== "function") {
     throw new TypeError("resolveCompaction must be a function");
   }
+  if (options.resolveContext !== undefined
+    && typeof options.resolveContext !== "function") {
+    throw new TypeError("resolveContext must be a function");
+  }
   const toolMode = options.toolMode ?? "code";
   if (toolMode !== "code" && toolMode !== "direct") {
     throw new TypeError("toolMode must be code or direct");
@@ -66,6 +70,12 @@ export function createNodeHost(options = {}) {
     ? createMcpRuntime(options.mcpServers, { clientName: "nanocodex-node" })
     : undefined;
   let disposal;
+  const toolProviders = options.toolProviders ?? [];
+  if (!Array.isArray(toolProviders)) throw new TypeError("toolProviders must be an array");
+  for (const [index, provider] of toolProviders.entries()) {
+    code.addProvider(provider, { id: `host:${index}`, kind: "cloud", deferred: false });
+  }
+  const toolProvidersReady = Promise.all(toolProviders.map(provider => provider.settled?.()));
   const mcpInstalled = mcp?.then(async (provider) => {
     if (disposal) {
       await provider.close();
@@ -600,7 +610,7 @@ export function createNodeHost(options = {}) {
 
   toolsLifecycle?.claim();
   return Object.freeze({
-    ready: async () => { await Promise.all([filesystem, mcpInstalled]); },
+    ready: async () => { await Promise.all([filesystem, mcpInstalled, toolProvidersReady]); },
     retain() {
       if (disposal) throw new Error("Nanocodex host is already disposed");
       references += 1;
@@ -637,6 +647,12 @@ export function createNodeHost(options = {}) {
         throw new Error("resolveCompactionInstruction is not configured");
       }
       return options.resolveCompactionInstruction(context, signal);
+    },
+    resolveContext: (context, signal) => {
+      if (typeof options.resolveContext !== "function") {
+        throw new Error("resolveContext is not configured");
+      }
+      return options.resolveContext(context, signal);
     },
     releaseSession: code.releaseSession,
     emitEvent: onEvent,

@@ -6,6 +6,7 @@ import type {
   DurabilityStore,
   McpServers,
   ToolConfiguration,
+  ToolProvider,
 } from "../types.mjs";
 import type { ManagedTransport, ResponsesTransport } from "./Transport.mjs";
 import type { Tool as SubagentTool } from "../runtime/subagents.mjs";
@@ -32,6 +33,8 @@ export declare namespace create {
     /** Caller-owned rooted filesystem mounted through standard workspace tools. */
     filesystem?: Workspace | undefined;
     module?: unknown;
+    /** Dynamic tools refreshed by the current execution-context callback. */
+    toolProviders?: readonly ToolProvider[];
     transport: ResponsesTransport;
   } & (
     | {

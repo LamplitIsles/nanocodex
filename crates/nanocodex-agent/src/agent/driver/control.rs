@@ -109,14 +109,37 @@ impl DriverShutdown {
 pub(super) fn queued_execution_operation(
     queued_turns: &VecDeque<QueuedTurn>,
     target: TurnKey,
-) -> Option<(Option<String>, Prompt)> {
+) -> Option<(Option<String>, AcceptedPrompt)> {
     queued_turns.iter().find_map(|queued| match queued {
         QueuedTurn::Pending {
             key,
             execution_operation,
             prompt,
+            supplementary_context,
             ..
-        } if *key == target => Some((execution_operation.clone(), prompt.clone())),
+        } if *key == target => Some((
+            execution_operation.clone(),
+            AcceptedPrompt::new(prompt, supplementary_context.as_deref()),
+        )),
+        _ => None,
+    })
+}
+
+pub(super) fn queued_execution_operation_by_id(
+    queued_turns: &VecDeque<QueuedTurn>,
+    operation_id: &str,
+) -> Option<(TurnKey, AcceptedPrompt)> {
+    queued_turns.iter().find_map(|queued| match queued {
+        QueuedTurn::Pending {
+            key,
+            execution_operation: Some(queued_operation_id),
+            prompt,
+            supplementary_context,
+            ..
+        } if queued_operation_id == operation_id => Some((
+            *key,
+            AcceptedPrompt::new(prompt, supplementary_context.as_deref()),
+        )),
         _ => None,
     })
 }
@@ -137,6 +160,7 @@ pub(super) fn queued_prompt(
     if cancel_on_admission {
         QueuedTurn::Cancelled {
             prompt,
+            supplementary_context,
             execution_operation,
             cancellation_committed: false,
             thinking,
@@ -176,7 +200,7 @@ pub(super) fn cancel_queued_turn(
     };
     let QueuedTurn::Pending {
         prompt,
-        supplementary_context: _,
+        supplementary_context,
         execution_operation,
         thinking,
         fast_mode,
@@ -192,6 +216,7 @@ pub(super) fn cancel_queued_turn(
         position,
         QueuedTurn::Cancelled {
             prompt,
+            supplementary_context,
             execution_operation,
             cancellation_committed,
             thinking,
@@ -209,7 +234,7 @@ pub(super) fn mark_all_queued_turns_cancelled(queued_turns: &mut VecDeque<Queued
     queued_turns.extend(accepted.into_iter().map(|queued| match queued {
         QueuedTurn::Pending {
             prompt,
-            supplementary_context: _,
+            supplementary_context,
             execution_operation,
             thinking,
             fast_mode,
@@ -219,6 +244,7 @@ pub(super) fn mark_all_queued_turns_cancelled(queued_turns: &mut VecDeque<Queued
             ..
         } => QueuedTurn::Cancelled {
             prompt,
+            supplementary_context,
             execution_operation,
             cancellation_committed: false,
             thinking,
@@ -303,6 +329,7 @@ pub(super) async fn begin_shutdown(
             }
             Command::Steer { result, .. }
             | Command::Cancel { result, .. }
+            | Command::CancelOperation { result, .. }
             | Command::SetModel { result, .. }
             | Command::SetThinking { result, .. }
             | Command::SetFastMode { result, .. } => {
@@ -400,6 +427,9 @@ pub(super) fn handle_idle_command<S>(
             drop(turn_result);
         }
         Command::Cancel { result, .. } => {
+            drop(result.send(Err(NanocodexError::TurnNotCancellable)));
+        }
+        Command::CancelOperation { result, .. } => {
             drop(result.send(Err(NanocodexError::TurnNotCancellable)));
         }
         Command::SetThinking { result, .. } | Command::SetFastMode { result, .. } => {
